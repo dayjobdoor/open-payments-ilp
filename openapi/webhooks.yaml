@@ -1,0 +1,416 @@
+openapi: 3.1.0
+info:
+  title: Rafiki Webhooks
+  version: 1.1.0
+  description: 'Webhook events fired by Rafiki'
+  contact:
+    email: tech@interledger.org
+servers:
+  - url: 'https://account-servicing-entity.com/webhooks'
+webhooks:
+  incomingPaymentCreated:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity that an incoming payment was created.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/incomingPaymentEvent'
+      responses:
+        '200':
+          description: Data received successfully
+  incomingPaymentCompleted:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity that an incoming payment was completed and funds should be withdrawn.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/incomingPaymentEvent'
+      responses:
+        '200':
+          description: Data was received successfully
+  incomingPaymentExpired:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity that an incoming payment has expired and funds should be withdrawn.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/incomingPaymentEvent'
+      responses:
+        '200':
+          description: Data was received successfully
+  incomingPaymentPartialPaymentReceived:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity that an incoming payment has received partial payment. May contain data that the ASE should handle before accepting the rest of the payment.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/incomingPaymentEvent'
+  outgoingPaymentCreated:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity that an outgoing payment was created and is awaiting funding.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/outgoingPaymentEvent'
+      responses:
+        '200':
+          description: Data was received successfully
+  outgoingPaymentCompleted:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity that an outgoing payment completed and any remaining funds should be withdrawn.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/outgoingPaymentEvent'
+      responses:
+        '200':
+          description: Data was received successfully
+  outgoingPaymentFailed:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity that an outgoing payment failed, the retry was unsuccessful, and funds should be withdrawn.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/outgoingPaymentEvent'
+      responses:
+        '200':
+          description: Data was received successfully
+  outgoingPaymentFunded:
+    post:
+      requestBody:
+        description: Notifies the card service that an outgoing payment has been funded by the ASE.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/outgoingPaymentEvent'
+      responses:
+        '200':
+          description: Data was received successfully
+  outgoingPaymentCancelled:
+    post:
+      requestBody:
+        description: Notifies the card service that an outgoing payment has been cancelled by the ASE.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/outgoingPaymentEvent'
+      responses:
+        '200':
+          description: Data was received successfully
+  walletAddressNotFound:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity to create a wallet address for the associated account in their system.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/walletAddressNotFound'
+      responses:
+        '200':
+          description: Data was received successfully
+  webMonetization:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity that a Web Monetization payment was received and funds should be withdrawn.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/webMonetizationEvent'
+      responses:
+        '200':
+          description: Data was received successfully
+  assetLiquidity:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity that the liquidity for a specific asset is low.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/liquidityEvent'
+      responses:
+        '200':
+          description: Data was received successfully
+  peerLiquidity:
+    post:
+      requestBody:
+        description: Notifies the account servicing entity that the liquidity for a specific peer is low.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/liquidityEvent'
+      responses:
+        '200':
+          description: Data was received successfully
+
+components:
+  schemas:
+    incomingPaymentEvent:
+      required:
+        - id
+        - type
+        - data
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum:
+            - incoming_payment.created
+            - incoming_payment.completed
+            - incoming_payment.expired
+            - incoming_payment.partial_payment_received
+        data:
+          type: object
+          required:
+            - id
+            - walletAddressId
+            - createdAt
+            - expiresAt
+            - receivedAmount
+            - completed
+          properties:
+            id:
+              type: string
+              format: uuid
+            walletAddressId:
+              type: string
+              format: uuid
+            client:
+              type: string
+              format: url
+            completed:
+              type: boolean
+            incomingAmount:
+              $ref: '#/components/schemas/amount'
+            receivedAmount:
+              $ref: '#/components/schemas/amount'
+            metadata:
+              type: object
+              additionalProperties: true
+            createdAt:
+              type: string
+              format: date-time
+            expiresAt:
+              type: string
+              format: date-time
+            partialIncomingPaymentId:
+              type: string
+              format: uuid
+              description: Identifier for the partial payment associated with this webhook event.
+            dataFromSender:
+              type: string
+              description: Data transmitted by the sending Account Servicing Entity during this partial payment.
+      additionalProperties: false
+    outgoingPaymentEvent:
+      required:
+        - id
+        - type
+        - data
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum:
+            - outgoing_payment.created
+            - outgoing_payment.completed
+            - outgoing_payment.failed
+            - outgoing_payment.funded
+            - outgoing_payment.cancelled
+        data:
+          type: object
+          required:
+            - id
+            - walletAddressId
+            - createdAt
+            - expiresAt
+            - debitAmount
+            - receiveAmount
+            - state
+            - stateAttempts
+            - balance
+            - receiver
+          properties:
+            id:
+              type: string
+              format: uuid
+            walletAddressId:
+              type: string
+              format: uuid
+            client:
+              type: string
+              format: url
+            state:
+              type: string
+              enum:
+                - FUNDING
+                - SENDING
+                - FAILED
+                - COMPLETED
+            receiver:
+              type: string
+              format: uri
+            debitAmount:
+              $ref: '#/components/schemas/amount'
+            sentAmount:
+              $ref: '#/components/schemas/amount'
+            metadata:
+              type: object
+              additionalProperties: true
+            createdAt:
+              type: string
+              format: date-time
+            expiresAt:
+              type: string
+              format: date-time
+            error:
+              type: string
+            stateAttempts:
+              type: integer
+            balance:
+              type: string
+              format: uint64
+            grantId:
+              type: string
+              format: uuid
+            cardDetails:
+              type: object
+              properties:
+                data:
+                  type: object
+                requestId:
+                  type: string
+                initiatedAt:
+                  type: string
+                  format: date-time
+      additionalProperties: false
+    walletAddressNotFound:
+      required:
+        - id
+        - type
+        - data
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum:
+            - wallet_address.not_found
+        data:
+          type: object
+          required:
+            - walletAddressUrl
+          properties:
+            walletAddressUrl:
+              type: string
+      additionalProperties: false
+    webMonetizationEvent:
+      required:
+        - id
+        - type
+        - data
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum:
+            - wallet_address.web_monetization
+        data:
+          type: object
+          required:
+            - walletAddress
+          properties:
+            walletAddress:
+              type: object
+              required:
+                - id
+                - createdAt
+                - received
+              properties:
+                id:
+                  type: string
+                  format: uuid
+                createdAt:
+                  type: string
+                  format: date-time
+                receivedAmount:
+                  $ref: '#/components/schemas/amount'
+      additionalProperties: false
+    liquidityEvent:
+      required:
+        - id
+        - type
+        - data
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum:
+            - asset.liquidity_low
+            - peer.liquidity_low
+        data:
+          type: object
+          required:
+            - id
+            - asset
+            - liquidityThreshold
+            - balance
+          properties:
+            id:
+              type: string
+              format: uuid
+            asset:
+              $ref: '#/components/schemas/asset'
+            liquidityThreshold:
+              type: string
+            balance:
+              type: string
+      additionalProperties: false
+    asset:
+      required:
+        - id
+        - code
+        - scale
+      properties:
+        id:
+          type: string
+          format: uuid
+        code:
+          type: string
+        scale:
+          type: number
+      additionalProperties: false
+    amount:
+      type: object
+      properties:
+        value:
+          type: string
+          format: uint64
+          description: 'An unsigned 64-bit integer amount, represented as a string.'
+        assetCode:
+          type: string
+          description: A code, generally an ISO 4217 currency code where available, representing the underlying asset
+        assetScale:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: The scale of amounts denoted in the corresponding asset code.
+      required:
+        - value
+        - assetCode
+        - assetScale
+      additionalProperties: false

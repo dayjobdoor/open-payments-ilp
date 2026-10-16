@@ -1,0 +1,18 @@
+[tools]
+node = "24"
+bun = "1.4"
+
+[tasks.check]
+description = "Everything CI runs, in order"
+run = [
+    "npx tsc -p tsconfig.json --noEmit",
+    "npx tsc -p tsconfig.test.json",
+    "bunx vp test run",
+    "bunx vp pack",
+    "node scripts/smoke-dist.mjs",
+]
+
+[tasks.dryrun]
+description = "What `npm publish` would upload (no login, no upload)"
+depends = ["check"]
+run = "npm publish --dry-run"

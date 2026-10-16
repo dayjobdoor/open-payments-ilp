@@ -1,0 +1,130 @@
+{
+  "name": "open-payments-ilp",
+  "version": "0.1.0-alpha.0",
+  "description": "Web Standards toolkit for Open Payments and Interledger: ILP/STREAM codecs, HTTP message signatures, GNAP, and a Better Auth GNAP plugin. Effect-native.",
+  "keywords": [
+    "better-auth",
+    "effect",
+    "gnap",
+    "hono",
+    "http-message-signatures",
+    "ilp",
+    "interledger",
+    "open-payments",
+    "stream"
+  ],
+  "homepage": "https://github.com/dayjobdoor/open-payments-ilp#readme",
+  "bugs": "https://github.com/dayjobdoor/open-payments-ilp/issues",
+  "license": "Apache-2.0",
+  "author": "dayjobdoor <dayjobdoor@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dayjobdoor/open-payments-ilp.git"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    "./ilp": {
+      "types": "./dist/ilp/index.d.ts",
+      "default": "./dist/ilp/index.js"
+    },
+    "./ildcp": {
+      "types": "./dist/ildcp/index.d.ts",
+      "default": "./dist/ildcp/index.js"
+    },
+    "./stream": {
+      "types": "./dist/stream/index.d.ts",
+      "default": "./dist/stream/index.js"
+    },
+    "./http-signatures": {
+      "types": "./dist/http-signatures/index.d.ts",
+      "default": "./dist/http-signatures/index.js"
+    },
+    "./open-payments": {
+      "types": "./dist/open-payments/index.d.ts",
+      "default": "./dist/open-payments/index.js"
+    },
+    "./gnap": {
+      "types": "./dist/gnap/index.d.ts",
+      "default": "./dist/gnap/index.js"
+    },
+    "./gnap/server": {
+      "types": "./dist/gnap/server/index.d.ts",
+      "default": "./dist/gnap/server/index.js"
+    },
+    "./gnap/server/testing": {
+      "types": "./dist/gnap/server/testing/index.d.ts",
+      "default": "./dist/gnap/server/testing/index.js"
+    },
+    "./webhooks": {
+      "types": "./dist/webhooks/index.d.ts",
+      "default": "./dist/webhooks/index.js"
+    },
+    "./better-auth": {
+      "types": "./dist/better-auth/index.d.ts",
+      "default": "./dist/better-auth/index.js"
+    },
+    "./better-auth/client": {
+      "types": "./dist/better-auth/client.d.ts",
+      "default": "./dist/better-auth/client.js"
+    },
+    "./hono": {
+      "types": "./dist/hono/index.d.ts",
+      "default": "./dist/hono/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "vp pack",
+    "generate:types": "bun scripts/generate-types.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepublishOnly": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json && vp test run && vp pack"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/core": "^0.18.5",
+    "@interledger/http-signature-utils": "2.0.3",
+    "@interledger/open-payments": "^7.4.0",
+    "@interledger/openapi": "2.0.4",
+    "@interledger/stream-receiver": "^0.3.3-alpha.4",
+    "@types/node": "^26.6.5",
+    "better-auth": "^1.7.7",
+    "effect": "^4.0.2",
+    "hono": "^4.13.12",
+    "ilp-packet": "^3.1.4-alpha.2",
+    "ilp-protocol-ildcp": "^2.2.4-alpha.2",
+    "ilp-protocol-stream": "^2.7.2-alpha.3",
+    "json-canonicalize": "3.0.1",
+    "openapi-typescript": "7.13.0",
+    "publint": "^0.3.25",
+    "typescript": "^7.0.2",
+    "vite-plus": "1.0.0",
+    "vitest": "5.0.3"
+  },
+  "peerDependencies": {
+    "better-auth": "^1.6.19",
+    "effect": "^4.0.0",
+    "hono": "^4.7.11"
+  },
+  "peerDependenciesMeta": {
+    "better-auth": {
+      "optional": true
+    },
+    "hono": {
+      "optional": true
+    }
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.0.0",
+    "vitest": "5.0.3"
+  }
+}

@@ -1,0 +1,113 @@
+# Keyless npm release (npm trusted publishing over OIDC: no NPM_TOKEN anywhere). Active only in the standalone repo
+# (dayjobdoor/open-payments-ilp). Release = bump "version" in package.json and add its CHANGELOG.md heading, push to
+# main. The `plan` job publishes only when npm does not have that exact version yet, so re-runs and ordinary pushes
+# are no-ops. The `npm-publish` environment's required reviewers gate the publish job, after the tests passed.
+# Setup: docs/operations.md §12.1 (first publish by hand, then `npm trust github`). The workflow file name must stay
+# `publish.yml`: it is part of the trust configuration on npmjs.com.
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - id: plan
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          grep -q "^## $version " CHANGELOG.md || { echo "CHANGELOG.md has no entry for $version"; exit 1; }
+          # A prerelease never goes to latest: 0.1.0-alpha.1 -> dist-tag alpha; any other prerelease id (0-, RC.1, 1.beta) -> next.
+          case "$version" in
+            *-*)
+              alpha=$(printf '%s' "$version" | sed -nE 's/^[^-]+-([a-z]+)([.-].*)?$/\1/p')
+              tag=${alpha:-next}
+              ;;
+            *) tag=latest ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Exact-version check: comparing against `latest` alone would mis-skip prereleases and re-runs.
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "npm already has $name@$version: nothing to publish"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "will publish $name@$version"
+          fi
+
+  verify:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: bun install --frozen-lockfile
+      - run: npx tsc -p tsconfig.json --noEmit
+      - run: npx tsc -p tsconfig.test.json
+      - run: bunx vp test run
+        env:
+          CI: "true"
+      - run: bunx vp pack
+      - run: node scripts/smoke-dist.mjs
+
+  publish:
+    needs: [plan, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm-publish
+    permissions:
+      contents: write # push the release tag
+      id-token: write # npm trusted publishing (OIDC) and provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false # never cache in a release build
+      - run: bun install --frozen-lockfile
+      - run: bunx vp pack
+      - run: node scripts/smoke-dist.mjs
+      # Trusted publishing needs npm >= 11.5.1 (npm trust / stage publish: >= 11.15); Node 24 may bundle an older one.
+      - run: npm install -g npm@^11.15.0
+      - name: Publish
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: npm publish --tag "$TAG" # provenance is automatic with trusted publishing from a public repo
+      - name: Tag the release
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "open-payments-ilp v$VERSION"
+          git push origin "refs/tags/v$VERSION"
