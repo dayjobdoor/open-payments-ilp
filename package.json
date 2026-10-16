@@ -1,6 +1,6 @@
 {
   "name": "open-payments-ilp",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Web Standards toolkit for Open Payments and Interledger: ILP/STREAM codecs, HTTP message signatures, GNAP, and a Better Auth GNAP plugin. Effect-native.",
   "keywords": [
     "better-auth",
@@ -97,9 +97,9 @@
     "@interledger/openapi": "2.0.4",
     "@interledger/stream-receiver": "^0.3.3-alpha.4",
     "@types/node": "^26.6.5",
-    "better-auth": "^1.7.7",
-    "effect": "^4.0.2",
-    "hono": "^4.13.12",
+    "better-auth": "^1.7.10",
+    "effect": "^4.0.5",
+    "hono": "^4.13.13",
     "ilp-packet": "^3.1.4-alpha.2",
     "ilp-protocol-ildcp": "^2.2.4-alpha.2",
     "ilp-protocol-stream": "^2.7.2-alpha.3",

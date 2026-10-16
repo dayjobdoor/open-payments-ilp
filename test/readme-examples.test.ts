@@ -34,7 +34,7 @@ import {
 } from "../src/hono/index";
 import { generateEd25519KeyPair, signRequest, verifyRequest } from "../src/http-signatures/index";
 import { deserializeIldcpResponse, serializeIldcpRequest, serveIldcp } from "../src/ildcp/index";
-import { deserializePrepare, serializePrepare, serializeReply } from "../src/ilp/index";
+import { deserializePrepare, deserializeReply, postPrepare, serializePrepare, serializeReply } from "../src/ilp/index";
 import { addAmounts, createUnauthenticatedClient, parseAmountValue } from "../src/open-payments/index";
 import { buildStreamPrepare, createStreamReply, generateStreamCredentials } from "../src/stream/index";
 import { signWebhook, verifyWebhookSignature } from "../src/webhooks/index";
@@ -72,6 +72,36 @@ describe("README examples", () => {
     const prepare = deserializePrepare(wire.success);
 
     expect(Result.isSuccess(prepare) && prepare.success.amount).toBe(100n);
+  });
+
+  it("ilp over http", async () => {
+    const wire = serializePrepare({
+      amount: 100n,
+      expiresAt: new Date("2030-01-01T00:00:00Z"),
+      executionCondition: new Uint8Array(32),
+      destination: "g.example.alice",
+      data: new Uint8Array(),
+    });
+
+    if (Result.isFailure(wire)) throw wire.failure;
+    const token = "secret";
+    const realFetch = globalThis.fetch;
+
+    globalThis.fetch = async () =>
+      new Response(
+        Result.getOrThrow(
+          serializeReply({ code: "F99", triggeredBy: "g.example", message: "", data: new Uint8Array() }),
+        ),
+      );
+
+    try {
+      const reply = await Effect.runPromise(postPrepare(wire.success, { url: "https://peer.example/ilp", token }));
+      const packet = deserializeReply(reply);
+
+      expect(Result.isSuccess(packet) && "code" in packet.success && packet.success.code).toBe("F99");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   it("ildcp", () => {

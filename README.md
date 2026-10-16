@@ -54,7 +54,7 @@ are untested. `engines` is not set because the requirement is a runtime feature,
 
 ### `open-payments-ilp/ilp`
 
-RFC 27 packets (Prepare, Fulfill, Reject), the OER subset of RFC 30, ILP addresses, fulfillment/condition helpers.
+RFC 27 packets (Prepare, Fulfill, Reject), the OER subset of RFC 30, ILP addresses, fulfillment/condition helpers, and an ILP-over-HTTP (RFC 35) client.
 
 ```ts
 import * as Result from "effect/Result";
@@ -70,6 +70,16 @@ const wire = serializePrepare({
 
 if (Result.isFailure(wire)) throw wire.failure;
 const prepare = deserializePrepare(wire.success);
+```
+
+`postPrepare` POSTs a serialized Prepare to a peer and resolves with the reply bytes (a Fulfill or a Reject; parse them with `deserializeReply`). It fails with `IlpHttpError` (`reason`: `status`, `too-large`, `timeout`, `network`); the reply is capped (`maxReplyBytes`, default 64 KiB) and `timeoutMs` defaults to 30 s.
+
+```ts
+import * as Effect from "effect/Effect";
+import { deserializeReply, postPrepare } from "open-payments-ilp/ilp";
+
+const reply = await Effect.runPromise(postPrepare(wire.success, { url: "https://peer.example/ilp", token }));
+const packet = deserializeReply(reply);
 ```
 
 ### `open-payments-ilp/ildcp`
