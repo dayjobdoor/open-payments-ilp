@@ -3,6 +3,10 @@
 This project follows [semantic versioning](https://semver.org/). While the major version is `0`, minor
 releases may contain breaking changes.
 
+## 0.1.0-alpha.1 (2026-10-16)
+
+First release published keylessly from GitHub Actions (npm trusted publishing, with provenance). No code changes since 0.1.0-alpha.0.
+
 ## 0.1.0-alpha.0 (2026-10-16)
 
 Pre-release: install with `npm i open-payments-ilp@alpha` to get the newest alpha.
