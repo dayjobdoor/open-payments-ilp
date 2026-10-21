@@ -1,0 +1,10 @@
+name: Feature request
+description: Propose a change or addition
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What do you need, and what do you do today instead?
+    validations:
+      required: true

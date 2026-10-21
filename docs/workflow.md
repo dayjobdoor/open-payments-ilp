@@ -42,7 +42,9 @@ Releases are keyless: `.github/workflows/publish.yml` runs on every push to `mai
 
 1. Bump `version` in `package.json` and add a `## <version> (date)` heading to `CHANGELOG.md`. The dist-tag follows the version: `x.y.z-alpha.N` → `alpha`, `-beta.N` → `beta`, another prerelease id → `next`, a plain version → `latest`.
 2. `mise run check`, commit, push to `main`.
-3. The `plan` and `verify` jobs run; the `publish` job waits for the maintainer's approval in the `npm-publish` GitHub environment (required reviewers). After approval it publishes with provenance and pushes the tag `v<version>`.
+3. The `plan` and `verify` jobs run; the `publish` job waits for the maintainer's approval in the `npm-publish` GitHub environment (required reviewers). After approval it publishes with provenance, pushes the tag `v<version>` and creates a GitHub Release from that version's CHANGELOG section (a prerelease for any non-`latest` dist-tag).
 4. Check: `npm view open-payments-ilp dist-tags versions --json`; `npm view open-payments-ilp@<version> dist.attestations`.
 
 The first publish of a name, `npm trust`, `npm deprecate`, `npm owner`, `npm access` and token management need the maintainer's interactive 2FA login; they are never run from CI or by an agent. Trust configuration expires if no publish succeeds within two days. `latest` cannot be removed from a package; it moves when the first stable version ships.
+
+Branch rules: a ruleset on `main` blocks force-push and deletion and requires the `check` CI job (the repository admin bypasses it, so direct pushes keep working); `v*` tags cannot be moved or deleted. Dependabot (`.github/dependabot.yml`) opens weekly PRs for Actions and bun dependencies; merge them after CI passes.

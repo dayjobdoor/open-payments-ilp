@@ -1,8 +1,8 @@
-# Keyless npm release (npm trusted publishing over OIDC: no NPM_TOKEN anywhere). Active only in the standalone repo
-# (dayjobdoor/open-payments-ilp). Release = bump "version" in package.json and add its CHANGELOG.md heading, push to
+# Keyless npm release (npm trusted publishing over OIDC: no NPM_TOKEN anywhere). Release = bump "version" in
+# package.json and add its CHANGELOG.md heading, push to
 # main. The `plan` job publishes only when npm does not have that exact version yet, so re-runs and ordinary pushes
 # are no-ops. The `npm-publish` environment's required reviewers gate the publish job, after the tests passed.
-# Setup: docs/operations.md §12.1 (first publish by hand, then `npm trust github`). The workflow file name must stay
+# Setup: docs/workflow.md#releasing (first publish by hand, then `npm trust github`). The workflow file name must stay
 # `publish.yml`: it is part of the trust configuration on npmjs.com.
 name: Publish
 
@@ -65,6 +65,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.x
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
@@ -77,6 +79,13 @@ jobs:
           CI: "true"
       - run: bunx vp pack
       - run: node scripts/smoke-dist.mjs
+      - run: mkdir -p "$RUNNER_TEMP/pack" && npm pack --pack-destination "$RUNNER_TEMP/pack"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-tarball
+          path: ${{ runner.temp }}/pack/*.tgz
+          if-no-files-found: error
+          retention-days: 1
 
   publish:
     needs: [plan, verify]
@@ -87,27 +96,36 @@ jobs:
       contents: write # push the release tag
       id-token: write # npm trusted publishing (OIDC) and provenance
     steps:
+      # No install, no build, no repo code run: the job holds the OIDC token and publishes the exact tarball `verify`
+      # built and smoke-tested. Checkout is only for pushing the tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-tarball
+          path: pack
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false # never cache in a release build
-      - run: bun install --frozen-lockfile
-      - run: bunx vp pack
-      - run: node scripts/smoke-dist.mjs
       # Trusted publishing needs npm >= 11.5.1 (npm trust / stage publish: >= 11.15); Node 24 may bundle an older one.
-      - run: npm install -g npm@^11.15.0
+      - run: npm install -g npm@11.21.1
       - name: Publish
         env:
           TAG: ${{ needs.plan.outputs.tag }}
-        run: npm publish --tag "$TAG" # provenance is automatic with trusted publishing from a public repo
-      - name: Tag the release
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: npm publish "./pack/open-payments-ilp-$VERSION.tgz" --tag "$TAG" # provenance is automatic with trusted publishing from a public repo
+      - name: Tag and release
         env:
           VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "v$VERSION" -m "open-payments-ilp v$VERSION"
           git push origin "refs/tags/v$VERSION"
+          # Notes = this version's CHANGELOG section; a prerelease is flagged so it never shows as "Latest".
+          awk -v h="## $VERSION " 'index($0,h)==1{f=1;next} /^## /{f=0} f' CHANGELOG.md > notes.md
+          [ "$TAG" = latest ] && flag="" || flag="--prerelease"
+          gh release create "v$VERSION" --verify-tag --title "open-payments-ilp v$VERSION" --notes-file notes.md $flag

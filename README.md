@@ -24,7 +24,7 @@ Only Web Standards are used: `fetch`, `Request`/`Response`/`Headers`, `URL`, `Te
 Deno, Bun, browsers, and Node.
 
 HTTP signatures need **Ed25519 in WebCrypto**. In Node it is stable since 20.19.3, 22.13.0 and 23.5.0 (experimental
-before that); Workers, Deno, Bun and current browsers support it. The test suite runs on Node 26; older Node versions
+before that); Workers, Deno, Bun and current browsers support it. CI runs the test suite on Node 24; older Node versions
 are untested. `engines` is not set because the requirement is a runtime feature, not a Node version.
 
 ## Design
