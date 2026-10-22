@@ -324,7 +324,7 @@ const createFakeAs = (options: AsOptions = {}) => {
 
 const createApp = async (
   options: AsOptions = {},
-  config: Partial<GnapAuthConfig> = {},
+  config: Partial<Omit<GnapAuthConfig, "externalUrl">> & { externalUrl?: string | undefined } = {},
   /** Stands between the middleware and the authorisation server. */
   wrap: (inner: typeof globalThis.fetch) => typeof globalThis.fetch = (inner) => inner,
 ) => {
@@ -332,17 +332,20 @@ const createApp = async (
   const { jwk } = await exportPrivateKey(key);
   const as = createFakeAs(options);
   const app = new Hono();
+  const { externalUrl, ...rest } = config;
+  const pinned = "externalUrl" in config ? externalUrl : APP;
 
   app.use(
     "*",
     initGnapAuthMiddleware({
       secret: SECRET,
+      ...(pinned !== undefined && { externalUrl: pinned }),
       grantEndpoint: ENDPOINT,
       access,
       keyId: KEY_ID,
       privateJwk: jwk,
       fetch: wrap(as.fetch),
-      ...config,
+      ...rest,
     }),
   );
 
@@ -629,6 +632,7 @@ describe("RFC 9635 authorisation server", () => {
     vi.stubEnv("GNAP_KEY_ID", "env-key");
     vi.stubEnv("GNAP_PRIVATE_JWK", JSON.stringify(jwk));
     vi.stubEnv("GNAP_REDIRECT_URI", "/back");
+    vi.stubEnv("GNAP_AUTH_EXTERNAL_URL", APP);
     app.use("*", initGnapAuthMiddleware({ access, fetch: h.as.fetch }));
     app.use("*", gnapAuthMiddleware());
 
@@ -644,8 +648,8 @@ describe("RFC 9635 authorisation server", () => {
 
 describe("front-channel URIs (RFC 9635 §2.5.2, §2.5.2.1, §4.1.1)", () => {
   it("refuses a callback URI that is not HTTPS or local to the browser, or has a fragment", async () => {
-    const insecure = await createApp();
-    const local = await createApp();
+    const insecure = await createApp({}, { externalUrl: undefined });
+    const local = await createApp({}, { externalUrl: undefined });
 
     // A fragment in a configured URI is refused when the middleware is created.
     await expect(createApp({}, { redirectUri: `${APP}/callback#x` })).rejects.toThrow("no fragment");
@@ -675,6 +679,7 @@ describe("front-channel URIs (RFC 9635 §2.5.2, §2.5.2.1, §4.1.1)", () => {
       "*",
       initGnapAuthMiddleware({
         secret: SECRET,
+        externalUrl: APP,
         grantEndpoint: ENDPOINT,
         access,
         keyId: KEY_ID,
@@ -1062,6 +1067,7 @@ describe("swapping the signing key of a server that binds the grant to its inlin
       "*",
       initGnapAuthMiddleware({
         secret: SECRET,
+        externalUrl: APP,
         grantEndpoint: ENDPOINT,
         access,
         keyId: "alice-key-2",

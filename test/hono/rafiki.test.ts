@@ -27,6 +27,7 @@ const buildApp = (h: Harness, pem: string, overrides: Partial<GnapAuthConfig> = 
     "*",
     initGnapAuthMiddleware({
       secret: SECRET,
+      externalUrl: APP,
       grantEndpoint: BASE_URL,
       access: [outgoing],
       client: h.wallet,
@@ -175,6 +176,7 @@ describe("Rafiki / Open Payments authorisation server", () => {
       "*",
       initGnapAuthMiddleware({
         secret: SECRET,
+        externalUrl: APP,
         grantEndpoint: BASE_URL,
         access: [outgoing],
         client: base.wallet,

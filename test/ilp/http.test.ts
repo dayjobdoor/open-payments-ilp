@@ -47,6 +47,7 @@ describe("postPrepare (ILP over HTTP, RFC 35)", () => {
         method: "POST",
         headers: { "Content-Type": "application/octet-stream", Authorization: "Bearer t0ken" },
         body: prepare,
+        redirect: "manual",
         signal: expect.any(AbortSignal),
       },
     ]);
@@ -69,6 +70,12 @@ describe("postPrepare (ILP over HTTP, RFC 35)", () => {
     const error = await failure(async () => new Response("nope", { status: 404 }));
 
     expect(error).toMatchObject({ reason: "status", status: 404, message: "ILP over HTTP failed: 404" });
+  });
+
+  it("does not follow a redirect", async () => {
+    const error = await failure(async () => new Response(null, { status: 302, headers: { location: "https://other.example" } }));
+
+    expect(error).toMatchObject({ reason: "network", message: "Redirects are not followed" });
   });
 
   it("fails with reason too-large for a reply over the cap, announced or streamed", async () => {

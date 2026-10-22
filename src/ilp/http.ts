@@ -86,8 +86,14 @@ export function postPrepare(
           ...(token !== undefined && { Authorization: `Bearer ${token}` }),
         },
         body: prepare,
+        redirect: "manual",
         signal,
       });
+
+      if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new IlpHttpError({ reason: "network", message: "Redirects are not followed" });
+      }
 
       if (!response.ok) {
         await response.body?.cancel().catch(() => undefined);

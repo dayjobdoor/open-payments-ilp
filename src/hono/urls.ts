@@ -4,16 +4,41 @@
  * @internal Not exported from the public entry point.
  */
 import type { Context } from "hono";
-import type { Resolved } from "./config";
+import { isLoopbackHost } from "../internal/url";
+import { httpError, type Resolved } from "./config";
+
+/**
+ * A relative callback is resolved against `externalUrl`, or against the request only when that host is loopback.
+ * A public request host is not the finish origin: a proxy that copies `Host` would register the attacker's URL.
+ */
+const configuredOrigin = (c: Context, config: Resolved): string => {
+  if (config.externalUrl !== undefined) return config.externalUrl;
+  const request = new URL(c.req.url);
+
+  if (!isLoopbackHost(request.hostname)) {
+    throw httpError(
+      500,
+      "Set externalUrl or an absolute redirectUri; the request host is not the GNAP finish origin",
+    );
+  }
+
+  return request.origin;
+};
 
 /** The URL the authorisation server sends the user back to: behind a proxy, below `externalUrl`. */
 export const publicRedirectUri = (c: Context, config: Resolved): string =>
-  config.externalUrl !== undefined && config.redirectUri.startsWith("/")
-    ? `${config.externalUrl.replace(/\/$/, "")}${config.redirectUri}`
-    : new URL(config.redirectUri, c.req.url).toString();
+  config.redirectUri.startsWith("/")
+    ? `${configuredOrigin(c, config).replace(/\/$/, "")}${config.redirectUri}`
+    : new URL(config.redirectUri).toString();
 
 /** The `Path` of the state cookie: that of the public callback URL, because that is where the browser sends it. */
-export const statePath = (c: Context, config: Resolved): string => new URL(publicRedirectUri(c, config)).pathname;
+export const statePath = (_c: Context, config: Resolved): string => {
+  const uri = config.redirectUri.startsWith("/")
+    ? `${(config.externalUrl ?? "https://localhost").replace(/\/$/, "")}${config.redirectUri}`
+    : config.redirectUri;
+
+  return new URL(uri).pathname;
+};
 
 /**
  * Whether the request is the redirect back from the authorisation server: on the public callback path, or on the
@@ -28,13 +53,21 @@ export const isCallbackRequest = (c: Context, config: Resolved): boolean => {
     // Without `externalUrl` the public and the served path are the same, so the first test already covered it.
     (config.externalUrl !== undefined &&
       config.redirectUri.startsWith("/") &&
-      pathname === new URL(config.redirectUri, c.req.url).pathname)
+      pathname === new URL(config.redirectUri, "https://localhost").pathname)
   );
 };
 
 /** The URL of the request as the user sees it. */
 export const publicRequestUrl = (c: Context, config: Resolved): string => {
-  if (config.externalUrl === undefined) return c.req.url;
+  if (config.externalUrl === undefined) {
+    const request = new URL(c.req.url);
+
+    if (!isLoopbackHost(request.hostname)) {
+      throw httpError(500, "Set externalUrl; the request host is not used as the public origin");
+    }
+
+    return c.req.url;
+  }
   const external = new URL(config.externalUrl);
   const original = new URL(c.req.url);
 

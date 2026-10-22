@@ -329,6 +329,9 @@ const permanent = (error: OpenPaymentsError): AttemptFailure => ({ error, transi
 /** Thrown inside an attempt when the body exceeds `maxResponseBytes`: repeating cannot help. */
 class ResponseTooLarge extends Error {}
 
+/** Thrown inside an attempt when the peer redirects: repeating the same URL cannot help. */
+class RedirectRefused extends Error {}
+
 /** One request/response exchange; a fresh signature, timeout and `fetch` every time it runs. */
 const attempt = (transport: Transport, call: Call): Effect.Effect<Response, AttemptFailure> =>
   Effect.gen(function* () {
@@ -371,8 +374,14 @@ const attempt = (transport: Transport, call: Call): Effect.Effect<Response, Atte
           method: call.method,
           headers,
           ...(body !== undefined && { body }),
+          redirect: "manual",
           signal: timeoutSignal,
         });
+
+        if (received.type === "opaqueredirect" || (received.status >= 300 && received.status < 400)) {
+          await received.body?.cancel().catch(() => undefined);
+          throw new RedirectRefused("Redirects are not followed");
+        }
 
         // The body is read under the same timeout: a peer that stalls mid-body is cut off like one that never answers.
         const buffered = await bufferResponse(received, maxBytes, timeoutSignal);
@@ -383,7 +392,7 @@ const attempt = (transport: Transport, call: Call): Effect.Effect<Response, Atte
       },
       catch: (cause): AttemptFailure => ({
         error: transportError(call, toError(cause)),
-        transient: !(cause instanceof ResponseTooLarge),
+        transient: !(cause instanceof ResponseTooLarge || cause instanceof RedirectRefused),
         retryAfter: null,
       }),
     });

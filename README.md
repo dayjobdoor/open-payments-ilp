@@ -541,6 +541,7 @@ app.use(
   "*",
   initGnapAuthMiddleware({
     secret: "a-session-secret-of-at-least-32-characters",
+    externalUrl: "https://app.example",
     grantEndpoint: "https://auth.wallet.example",
     access: [{ type: "incoming-payment", actions: ["create", "read"] }],
     client: "https://wallet.example/alice",
@@ -583,6 +584,7 @@ app.use(
   "*",
   initGnapAuthMiddleware({
     secret: "a-session-secret-of-at-least-32-characters",
+    externalUrl: "https://app.example",
     grantEndpoint: "https://as.example/gnap",
     access: [{ type: "outgoing-payment", actions: ["read"], identifier: "https://wallet.example/alice" }],
     keyId: "my-key-1",
@@ -599,7 +601,7 @@ and `GNAP_PRIVATE_JWK`): `GNAP_AUTH_SECRET` (random, at least 32 characters: nev
 `GNAP_GRANT_ENDPOINT`, `GNAP_KEY_ID`, `GNAP_PRIVATE_KEY` (PEM), `GNAP_PRIVATE_JWK` (JWK as JSON), `GNAP_CLIENT`,
 `GNAP_REDIRECT_URI` (default `/callback`), `GNAP_COOKIE_NAME` (`gnap-auth`), `GNAP_COOKIE_PATH` (`/`),
 `GNAP_COOKIE_DOMAIN`, `GNAP_AUTH_REFRESH_INTERVAL` (seconds, 900), `GNAP_AUTH_EXPIRES` (seconds, 86400, at most
-34 560 000) and `GNAP_AUTH_EXTERNAL_URL` (public base URL behind a reverse proxy). `access` and `grantEndpoint` may be
+34 560 000) and `GNAP_AUTH_EXTERNAL_URL` (public origin of this app; required on any host that is not loopback, unless `redirectUri` is absolute). `access` and `grantEndpoint` may be
 functions of the request context. `fetch`, `clock` and `requestTimeoutMs` (default 10 000 ms: it aborts every call to
 the authorisation server and the read of its answer, which is capped at 64 KiB) are set in the config (tests, Workers).
 
@@ -609,8 +611,7 @@ fewer than 32 characters, a negative or non-numeric `refreshInterval`, an `expir
 path nor URL (or that is known to be neither HTTPS/`localhost` nor free of a fragment), a `grantEndpoint` or `client`
 that is no http(s) URL, a `privateKey` that is no unencrypted PKCS #8 PEM and a `privateJwk` that is no Ed25519 key with
 `d` throw an `Error` at once (the message names the option, never the key). Values that come from the environment
-are checked by the same code on the first request they are seen in (`500`, same messages), as is a callback path on the
-origin of the request. The private key is imported once and reused for every grant, rotation and revocation (an
+are checked by the same code on the first request they are seen in (`500`, same messages), as is a relative callback on a public request host without `externalUrl`. The private key is imported once and reused for every grant, rotation and revocation (an
 environment key again only when its text changes).
 
 The middleware serves the callback itself when mounted on the `redirectUri` path; behind a path-prefixing proxy mount
@@ -654,8 +655,12 @@ Security notes:
   The `interact_ref` is one-time-use (§5.1): it is sent in the one first continue request, never again, and a
   `too_fast` answer is an error, not a retry.
 - `https:` or `localhost` only for the URIs a browser follows (RFC 9635 §2.5.2.1, §4.1.1): the callback URI (also
-  without fragment; a plain-`http` public URL behind a proxy needs `externalUrl`) and `interact.redirect`. The grant
-  endpoint and the `continue`/`manage` URIs are used as given, so serve the authorisation server over TLS (§11.1).
+  without fragment) and `interact.redirect`. A relative `redirectUri` is resolved against `externalUrl`, or against
+  the request URL only when that host is loopback. On any other host set `externalUrl` or an absolute `redirectUri`;
+  the request host is not registered as the finish origin and is not used as the post-login URL.
+- The grant endpoint, `continue` URI and `manage` URI must be http(s) URLs without userinfo. Redirects are not
+  followed. A `continue` or `manage` host other than the grant endpoint is the server's to name (RFC 9635), so serve
+  that server over TLS (§11.1).
 - The session is stateless: a copy of the signed cookie stays valid until the next rotation check, up to
   `refreshInterval` (900 s by default) after `revokeGnapSession`, so use a small `refreshInterval` for sensitive apps.
   Log out with a `POST` (`SameSite=Lax` sends the cookie on a cross-site `GET` navigation, so a `GET` logout can be

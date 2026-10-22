@@ -3,6 +3,12 @@
 This project follows [semantic versioning](https://semver.org/). While the major version is `0`, minor
 releases may contain breaking changes.
 
+## Unreleased
+
+- `/hono`: a relative redirect URI is resolved against `externalUrl`, or against the request only on loopback. A public request host is not the GNAP finish origin. Continuation and management URLs must be http(s) without userinfo. Grant requests do not follow redirects.
+- `/open-payments`, `/ilp`: client fetches do not follow redirects.
+- CI and `mise.toml` pin Node `24.22.0` and Bun `1.4.4`.
+
 ## 0.1.0-alpha.2 (2026-10-16)
 
 - `open-payments-ilp/ilp`: `postPrepare`, an ILP-over-HTTP (RFC 35) client with a reply cap, a timeout and `IlpHttpError`.

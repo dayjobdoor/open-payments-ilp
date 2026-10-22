@@ -46,6 +46,7 @@ const createApp = async (overrides: Partial<GnapAuthConfig> = {}, setup: Setup =
     "*",
     initGnapAuthMiddleware({
       secret: SECRET,
+      externalUrl: APP,
       grantEndpoint: BASE_URL,
       access: [outgoing],
       client: h.wallet,
@@ -865,6 +866,7 @@ describe("the signing key", () => {
     vi.stubEnv("GNAP_KEY_ID", KEY_ID);
     vi.stubEnv("GNAP_CLIENT", h.wallet);
     vi.stubEnv("GNAP_PRIVATE_JWK", JSON.stringify((await exportPrivateKey(h.clientKey)).jwk));
+    vi.stubEnv("GNAP_AUTH_EXTERNAL_URL", APP);
 
     const app = new Hono();
 

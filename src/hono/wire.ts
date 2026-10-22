@@ -148,12 +148,12 @@ const send = async (
 
   if (options.body !== undefined) headers.set("content-type", "application/json");
   const body = options.body === undefined ? null : JSON.stringify(options.body);
-  const signed = await sign(new Request(url, { method, headers, body }), wire);
+  const signed = await sign(new Request(url, { method, headers, body, redirect: "manual" }), wire);
   let response: Response | null;
 
   try {
     response = await bufferResponse(
-      await wire.fetch(signed, { signal: AbortSignal.timeout(wire.timeoutMs) }),
+      await wire.fetch(signed, { redirect: "manual", signal: AbortSignal.timeout(wire.timeoutMs) }),
       MAX_RESPONSE_BYTES,
     );
   } catch (error) {
@@ -165,6 +165,10 @@ const send = async (
   if (response === null)
     throw new GnapAuthError(502, `${method} ${url} answered with more than ${MAX_RESPONSE_BYTES} bytes`);
 
+  if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
+    throw new GnapAuthError(502, `${method} ${url} redirected`);
+  }
+
   if (response.ok) return response;
   const decoded = decodeError(await response.json().catch(() => undefined));
   const parsed = Result.isSuccess(decoded) ? decoded.success : {};
@@ -173,6 +177,18 @@ const send = async (
   const description = error === undefined || isString(error) ? parsed.error_description : error.description;
 
   throw new GnapAuthError(response.status, description ?? code ?? `${method} ${url} answered ${response.status}`, code);
+};
+
+/** An http(s) URL with no userinfo. Cross-origin is the authorisation server's to name (RFC 9635). */
+const credentialUrl = (uri: string, label: string): string => {
+  if (!URL.canParse(uri)) throw new GnapAuthError(502, `${label} is not a URL`);
+  const url = new URL(uri);
+
+  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username !== "" || url.password !== "") {
+    throw new GnapAuthError(502, `${label} must be an http(s) URL without credentials`);
+  }
+
+  return url.toString();
 };
 
 const parseGrant = async (response: Response, wire: Wire): Promise<GrantResponse> => {
@@ -198,8 +214,8 @@ const parseGrant = async (response: Response, wire: Wire): Promise<GrantResponse
     // Rafiki: the access token itself is the management credential. RFC 9635: a separate management token.
     if (manage !== undefined) {
       token.manage = isString(manage)
-        ? { uri: manage, token: issued.value }
-        : { uri: manage.uri, token: manage.access_token.value };
+        ? { uri: credentialUrl(manage, "Token management URL"), token: issued.value }
+        : { uri: credentialUrl(manage.uri, "Token management URL"), token: manage.access_token.value };
     }
 
     // Only Open Payments access items are understood; another server's `access` is not re-exposed.
@@ -209,7 +225,11 @@ const parseGrant = async (response: Response, wire: Wire): Promise<GrantResponse
 
   if (next !== undefined) {
     // RFC 9635 §3.1: omission of `wait` MUST be interpreted as five seconds.
-    result.continue = { uri: next.uri, token: next.access_token.value, wait: next.wait ?? DEFAULT_WAIT_SECONDS };
+    result.continue = {
+      uri: credentialUrl(next.uri, "Continuation URL"),
+      token: next.access_token.value,
+      wait: next.wait ?? DEFAULT_WAIT_SECONDS,
+    };
   }
 
   if (interact !== undefined) result.interact = interact;
