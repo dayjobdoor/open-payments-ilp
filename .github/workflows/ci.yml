@@ -1,10 +1,8 @@
-# Pull requests and pushes to main.
 name: CI
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  # manual only while GitHub billing blocks runs; restore pull_request / push (main) once it is fixed
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}

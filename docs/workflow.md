@@ -5,7 +5,7 @@ How changes get into `main` and onto npm. History is managed with [jj](https://j
 ## jj
 
 - The working copy `@` is always one commit; edits update it, no `git add`. `◆` is immutable (pushed), `○` is mutable. Bookmarks (git branches) do not move on their own.
-- git hooks do not run for jj commits: checks live in CI, and locally you run `mise run check` yourself before pushing.
+- git hooks do not run for jj commits: checks live in CI (`.github/workflows/ci.yml`, manual dispatch only while GitHub billing blocks runs: `gh workflow run ci.yml`), and locally you run `mise run check` yourself before pushing.
 - Commit messages: `feat:` `fix:` `test:` `docs:` `chore:`. A commit without a description cannot be pushed.
 
 ```sh
@@ -47,4 +47,4 @@ Releases are keyless: `.github/workflows/publish.yml` runs on every push to `mai
 
 The first publish of a name, `npm trust`, `npm deprecate`, `npm owner`, `npm access` and token management need the maintainer's interactive 2FA login; they are never run from CI or by an agent. Trust configuration expires if no publish succeeds within two days. `latest` cannot be removed from a package; it moves when the first stable version ships.
 
-Branch rules: a ruleset on `main` blocks force-push and deletion and requires the `check` CI job (the repository admin bypasses it, so direct pushes keep working); `v*` tags cannot be moved or deleted. Dependabot (`.github/dependabot.yml`) opens weekly PRs for Actions and bun dependencies; merge them after CI passes.
+Branch rules: a ruleset on `main` blocks force-push and deletion and requires the `check` CI job (the repository admin bypasses it, so direct pushes keep working); `v*` tags cannot be moved or deleted. CI runs only on manual dispatch for now, so a pull request never gets a `check` result on its own. Dependabot (`.github/dependabot.yml`) opens weekly PRs for Actions and bun dependencies; run CI by hand on the PR branch (`gh workflow run ci.yml --ref <branch>`) and merge after it passes.
