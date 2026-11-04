@@ -297,6 +297,7 @@ describe("README examples", () => {
       "*",
       initGnapAuthMiddleware({
         secret: "a-session-secret-of-at-least-32-characters",
+        externalUrl: "https://app.example",
         grantEndpoint: "https://auth.wallet.example",
         access: [{ type: "incoming-payment", actions: ["create", "read"] }],
         client: "https://wallet.example/alice",
@@ -332,6 +333,7 @@ describe("README examples", () => {
       "*",
       initGnapAuthMiddleware({
         secret: "a-session-secret-of-at-least-32-characters",
+        externalUrl: "https://app.example",
         grantEndpoint: "https://as.example/gnap",
         access: [{ type: "outgoing-payment", actions: ["read"], identifier: "https://wallet.example/alice" }],
         keyId: "my-key-1",
