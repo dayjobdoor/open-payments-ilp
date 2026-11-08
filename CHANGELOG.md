@@ -3,7 +3,7 @@
 This project follows [semantic versioning](https://semver.org/). While the major version is `0`, minor
 releases may contain breaking changes.
 
-## Unreleased
+## 0.1.0-alpha.3 (2026-11-08)
 
 - `/plain/ilp`, `/plain/ildcp`, `/plain/http-signatures`, `/plain/open-payments`: Promise and exception entry points over the Effect modules, shaped after `ilp-packet`, `ilp-protocol-ildcp` and `@interledger/open-payments` (`await createAuthenticatedClient({ walletAddressUrl, keyId, privateKey })`, `privateKey` as CryptoKey, JWK or PEM). `effect` stays a required peer dependency.
 - `/plain/stream`, `/plain/webhooks`, `/plain/gnap`, `/plain/gnap/server` (with `/plain/gnap/server/testing`) and `/plain/better-auth`: the same Promise and exception layer for STREAM, webhooks, GNAP and the Better Auth plugin. A Promise `GnapStore` and `async` hooks replace the Effect-returning ones.
