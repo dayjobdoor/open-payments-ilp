@@ -534,8 +534,10 @@ const auth = betterAuth({
 
 Run the Better Auth CLI migration to create the three tables (`gnapGrant` with a nullable `tenantId` and a nullable
 `interactBinding`, `gnapAccessToken` and `gnapNonce`; unique indexes on every lookup column). A database created by an
-earlier alpha needs the migration for the new `interactBinding` column before the plugin runs. `gnapNonce` gets a row for each signed request that carries a
-`nonce` (every request of this package's own client): delete the rows whose `expiresAt` has passed now and then.
+earlier alpha needs the migration for the new `interactBinding` column before the plugin runs. Deleting a user deletes the
+grants they approved and their tokens (`gnapGrant.userId` cascades); a `databaseHooks.user.delete.before` hook of the
+plugin also revokes them on adapters that do not cascade (`revokeUserGrants` is exported). `gnapNonce` gets a row for each signed request that carries a
+`nonce` (every request of this package's own client); `betterAuthGnapStore` deletes the rows whose `expiresAt` has passed itself, at most once a minute per process. It needs `deleteMany` on the adapter for that (every Better Auth adapter has it; a `GnapDb` without it just skips the cleanup).
 Endpoints live under the Better Auth base path (`/api/auth` by default) and delegate to
 [`open-payments-ilp/gnap/server`](#open-payments-ilpgnapserver) with a Better Auth `GnapStore`:
 
@@ -771,7 +773,7 @@ Security notes:
   `too_fast` answer is an error, not a retry.
 - `https:` or `localhost` only for the URIs a browser follows (RFC 9635 §2.5.2.1, §4.1.1): the callback URI (also
   without fragment) and `interact.redirect`. A relative `redirectUri` is resolved against `externalUrl`, or against
-  the request URL only when that host is loopback. On any other host set `externalUrl`;
+  the request URL only when that host is loopback and no proxy header (`X-Forwarded-For`, `-Host`, `-Proto`, `Forwarded`) came with it. On any other host set `externalUrl`;
   the request host is neither registered as the finish origin nor used as the post-login URL, and `externalUrl` is needed
   even with an absolute `redirectUri`, because the post-login URL is built from it.
 - The grant endpoint must be `https:` (`http:` only on loopback); the `continue` and `manage` URIs too, and all three are
