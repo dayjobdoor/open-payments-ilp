@@ -154,6 +154,21 @@ describe("outgoing-payment amount limits and intervals", () => {
     expect(currentAccessIntervalStart(new Date(0), interval, new Date("2020-01-01T00:00:00Z"))).toBeNull();
   });
 
+  it("rejects a payment without a receive amount when the grant limits the receive amount", () => {
+    const debit = { value: "100", assetCode: "USD", assetScale: 2 };
+    const limited = [
+      {
+        type: "outgoing-payment",
+        actions: ["create"],
+        limits: { debitAmount: debit, receiveAmount: { value: "90", assetCode: "USD", assetScale: 2 } },
+      },
+    ];
+    const unlimited = [{ type: "outgoing-payment", actions: ["create"], limits: { debitAmount: debit } }];
+
+    expect(validateOutgoingPaymentAmounts(limited, debit, undefined)).toBe(false);
+    expect(validateOutgoingPaymentAmounts(unlimited, debit, undefined)).toBe(true);
+  });
+
   it("rejects per-payment debit and receive amounts above grant caps", () => {
     const access = [
       {

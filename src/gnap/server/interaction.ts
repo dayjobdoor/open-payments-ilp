@@ -99,8 +99,9 @@ const approvedRedirect = (core: Core, grant: GrantRecord, finishUri: string): Ef
 
 /**
  * `finish.method: "push"` (RFC 9635 §4.2.2): hands the client the finish payload in one `POST`. A delivery that fails
- * is reported to `onError` and not retried: the owner's decision stands, but the client never receives its
- * `interact_ref` and cannot poll the grant (a grant with a finish URI is refused polling), so it starts a new grant.
+ * is reported to `onError`. The owner's decision stands; the client cannot poll the grant (a grant with a finish URI is
+ * refused polling), so with `interactionBinding` the bound browser's next visit to `/finish` delivers it again. Without
+ * a binding nothing repeats it, and the client starts a new grant.
  */
 const pushFinish = (core: Core, grant: GrantRecord, finishUri: string) =>
   Effect.gen(function* () {
@@ -266,7 +267,8 @@ const settle = (core: Core, grant: GrantRecord, from: "ACCEPTED" | "DENIED", to:
 
 /**
  * `GET /interact/:id/:nonce/finish`: sends the user back to the client (or answers `202` when the client polls or
- * is pushed the result, `finish.method: "push"`: the push is made once, by the visit that approved the grant).
+ * is pushed the result, `finish.method: "push"`: the visit that approved the grant pushes, and with `interactionBinding` so does
+ * every later visit of the bound browser until the client continues).
  */
 const finishInteraction = (core: Core, request: Request, { id, nonce }: InteractionParams) =>
   Effect.gen(function* () {
@@ -311,7 +313,11 @@ const finishInteraction = (core: Core, request: Request, { id, nonce }: Interact
 
     if (decision === "PENDING") return yield* fail(401, "invalid_interaction", "interaction is not active");
 
-    if (approvedNow && grant.finishUri !== null) yield* pushFinish(core, grant, grant.finishUri);
+    // A push that failed is never confirmed, so with a binding (nobody else can reach this point) every later visit of the
+    // bound browser repeats it until the client continues: `interact_ref` is single-use, a second delivery is harmless.
+    const resend = hasInteractionBinding(core) && grant.state === "APPROVED";
+
+    if ((approvedNow || resend) && grant.finishUri !== null) yield* pushFinish(core, grant, grant.finishUri);
 
     return new Response(null, { status: 202 });
   });

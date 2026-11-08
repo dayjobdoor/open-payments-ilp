@@ -17,6 +17,7 @@ import {
   legacyStore,
   outgoing,
   startGrant,
+  unboundStore,
   type HarnessOptions,
   type ServerHarness,
 } from "./support";
@@ -116,8 +117,55 @@ describe("interact.finish.method push (RFC 9635 §4.2.2)", () => {
     expect(client.pushes[0]?.init?.redirect).toBe("manual");
   });
 
-  it("pushes once: coming back to /finish again does not send it again", async () => {
+  it("pushes again when the bound browser comes back before the client continued, with the same payload", async () => {
     const { h, pending, client } = await withPush();
+    const { cookie } = await browserStart(h, pending);
+
+    await idp(h, pending, "accept");
+    await browserFinish(h, pending, cookie);
+    const again = await browserFinish(h, pending, cookie);
+
+    expect(again.status).toBe(202);
+    expect(client.pushes).toHaveLength(2);
+    expect(client.pushes[1]?.init?.body).toEqual(client.pushes[0]?.init?.body);
+  });
+
+  it("repeats a push that failed: the client gets its interact_ref on the next visit", async () => {
+    let up = false;
+    const answers: number[] = [];
+    const client = pushingClient(() => {
+      const status = up ? 204 : 503;
+
+      answers.push(status);
+
+      return new Response(null, { status });
+    });
+    const h = await createServerHarness({ unvalidated: true, outbound: client.outbound });
+    const pending = await startGrant(h, grantBody([outgoing], { interact: pushInteract() }));
+    const { cookie } = await browserStart(h, pending);
+
+    await idp(h, pending, "accept");
+    await browserFinish(h, pending, cookie);
+    up = true;
+    await browserFinish(h, pending, cookie);
+
+    expect(answers).toEqual([503, 204]);
+  });
+
+  it("does not push again for a browser that is not the bound one", async () => {
+    const { h, pending, client } = await withPush();
+    const { cookie } = await browserStart(h, pending);
+
+    await idp(h, pending, "accept");
+    await browserFinish(h, pending, cookie);
+    const stranger = await browserFinish(h, pending, `gnap-interaction-${pending.interactId}=${pending.nonce}`);
+
+    expect(stranger.status).toBe(401);
+    expect(client.pushes).toHaveLength(1);
+  });
+
+  it("pushes once for a store without interactionBinding: nobody is bound, so a visit alone does not resend", async () => {
+    const { h, pending, client } = await withPush({ store: unboundStore() });
     const { cookie } = await browserStart(h, pending);
 
     await idp(h, pending, "accept");
