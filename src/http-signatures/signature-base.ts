@@ -33,13 +33,19 @@ function invalid(reason: HttpSignatureError["reason"], message: string): Result.
 function derived(message: SignedMessage, name: string): Result.Result<string, HttpSignatureError> {
   if (name === "@method") return Result.succeed(message.method);
 
-  if (name === "@target-uri") return Result.succeed(message.url);
   let url: URL;
 
   try {
     url = new URL(message.url);
   } catch {
     return invalid("malformed", "Request URL is not absolute");
+  }
+
+  // A fragment is never sent (`fetch` drops it) but `Request.url` keeps it: signer and verifier must both leave it out.
+  if (name === "@target-uri") {
+    url.hash = "";
+
+    return Result.succeed(url.href);
   }
 
   switch (name) {
@@ -90,10 +96,11 @@ export const serializeSignatureParams: (
 
 /**
  * Builds the RFC 9421 signature base for `components` (lowercase names: `@method`, `@target-uri`, `@authority`,
- * `@scheme`, `@path`, `@query`, `@request-target`, or header field names) and `params`.
+ * `@scheme`, `@path`, `@query`, `@request-target`, or header field names) and `params`. `@target-uri` is the
+ * normalised URL (`URL.href`) without its fragment, the form `fetch` sends.
  *
  * Fails with `HttpSignatureError`: `missing` (covered header absent), `malformed` (bad name/value, duplicate or
- * uppercase component), `unsupported` (other derived components).
+ * uppercase component, a URL that is not absolute), `unsupported` (other derived components).
  *
  * @see https://www.rfc-editor.org/rfc/rfc9421#section-2.5
  */

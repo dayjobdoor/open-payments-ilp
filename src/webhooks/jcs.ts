@@ -5,68 +5,154 @@ import { WebhookError } from "./errors";
 /** A JSON value. */
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
-const unsupported = (message: string): Result.Result<never, WebhookError> =>
-  Result.fail(new WebhookError({ reason: "unsupported-value", message }));
+const unsupported = (message: string): WebhookError => new WebhookError({ reason: "unsupported-value", message });
 
-/** Deepest nesting serialised: deeper hostile input would overflow the stack. */
-const MAX_DEPTH = 256;
+/** An enclosing array or object whose members are still being written. */
+type Frame =
+  | {
+      readonly kind: "array";
+      readonly container: JsonValue[];
+      /** Index of the next element. */
+      next: number;
+    }
+  | {
+      readonly kind: "object";
+      readonly container: { [key: string]: JsonValue };
+      /** The sorted keys. */
+      readonly keys: string[];
+      /** Index of the next key. */
+      next: number;
+      /** Whether a member was already written, so the next one needs a comma. */
+      wrote: boolean;
+    };
 
-function serialize(value: JsonValue | undefined, ancestors: Set<object>): Result.Result<string, WebhookError> {
-  if (value === null || typeof value === "string" || typeof value === "boolean")
-    return Result.succeed(JSON.stringify(value));
+/**
+ * Writes a scalar to `out`, or the opening bracket of a container (which becomes the innermost frame). Returns the
+ * failure, if any.
+ */
+function open(
+  value: JsonValue | undefined,
+  out: string[],
+  stack: Frame[],
+  ancestors: Set<object>,
+): WebhookError | undefined {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    out.push(JSON.stringify(value));
+
+    return undefined;
+  }
 
   if (typeof value === "number") {
-    return Number.isFinite(value) ? Result.succeed(JSON.stringify(value)) : unsupported(`Non-finite number (${value})`);
+    if (!Number.isFinite(value)) return unsupported(`Non-finite number (${value})`);
+    out.push(JSON.stringify(value));
+
+    return undefined;
   }
 
   // `undefined` can only appear in untyped input: arrays carry null in its place and objects omit the member.
   if (typeof value !== "object") return unsupported(`Cannot serialise a value of type ${typeof value}`);
 
-  if (ancestors.has(value)) return unsupported("Circular reference");
+  // json-canonicalize hands every object with a non-null `toJSON` member (a `Date`, or a plain `{ toJSON: 1 }` that
+  // JSON.stringify ignores as a method) to JSON.stringify, which neither sorts keys nor follows the JCS rules.
+  // Rafiki signs that output, so verification must produce the same bytes.
+  if (Reflect.get(value, "toJSON") != null) {
+    let text: string | undefined;
 
-  // `ancestors` holds the chain of enclosing containers, so its size is the current depth.
-  if (ancestors.size >= MAX_DEPTH) return unsupported(`Nesting is deeper than ${MAX_DEPTH} levels`);
-
-  ancestors.add(value);
-  const parts: string[] = [];
-
-  if (Array.isArray(value)) {
-    for (const element of value) {
-      const part = serialize(element ?? null, ancestors);
-
-      if (Result.isFailure(part)) return part;
-      parts.push(part.success);
+    try {
+      text = JSON.stringify(value);
+    } catch (cause) {
+      return unsupported(`JSON.stringify failed on a value with a toJSON member: ${String(cause)}`);
     }
 
-    ancestors.delete(value);
+    if (text === undefined) return unsupported("A toJSON member produced no JSON value");
+    out.push(text);
 
-    return Result.succeed(`[${parts.join(",")}]`);
+    return undefined;
   }
 
-  // Keys sort by UTF-16 code units, which is `Array.prototype.sort`'s default order for strings.
-  for (const key of Object.keys(value).sort()) {
-    const member = value[key];
+  if (ancestors.has(value)) return unsupported("Circular reference");
 
-    if (member === undefined) continue;
-    const part = serialize(member, ancestors);
+  ancestors.add(value);
 
-    if (Result.isFailure(part)) return part;
-    parts.push(`${JSON.stringify(key)}:${part.success}`);
+  if (Array.isArray(value)) {
+    stack.push({ kind: "array", container: value, next: 0 });
+    out.push("[");
+  } else {
+    // Keys sort by UTF-16 code units, which is `Array.prototype.sort`'s default order for strings.
+    stack.push({ kind: "object", container: value, keys: Object.keys(value).sort(), next: 0, wrote: false });
+    out.push("{");
   }
 
-  ancestors.delete(value);
+  return undefined;
+}
 
-  return Result.succeed(`{${parts.join(",")}}`);
+/**
+ * Serialises without recursion: nesting depth is bounded by memory, not by the call stack, so hostile input
+ * (`JSON.parse` accepts arbitrarily deep documents) cannot overflow it.
+ */
+function serialize(root: JsonValue): Result.Result<string, WebhookError> {
+  const out: string[] = [];
+  const stack: Frame[] = [];
+  const ancestors = new Set<object>();
+  let failure = open(root, out, stack, ancestors);
+
+  while (failure === undefined && stack.length > 0) {
+    // SAFETY: the loop condition guarantees a frame.
+    const frame = stack[stack.length - 1]!;
+
+    if (frame.kind === "array") {
+      const elements = frame.container;
+
+      if (frame.next >= elements.length) {
+        out.push("]");
+        ancestors.delete(elements);
+        stack.pop();
+        continue;
+      }
+
+      if (frame.next > 0) out.push(",");
+      failure = open(elements[frame.next++] ?? null, out, stack, ancestors);
+      continue;
+    }
+
+    const { container: members, keys } = frame;
+    let key = keys[frame.next];
+
+    // Members whose value is `undefined` are omitted.
+    while (key !== undefined && members[key] === undefined) key = keys[++frame.next];
+
+    if (key === undefined) {
+      out.push("}");
+      ancestors.delete(members);
+      stack.pop();
+      continue;
+    }
+
+    frame.next++;
+
+    if (frame.wrote) out.push(",");
+    frame.wrote = true;
+    out.push(JSON.stringify(key), ":");
+    failure = open(members[key], out, stack, ancestors);
+  }
+
+  return failure === undefined ? Result.succeed(out.join("")) : Result.fail(failure);
 }
 
 /**
  * Canonical JSON per RFC 8785 (JCS): no insignificant whitespace, object members sorted by UTF-16 code units,
- * numbers and strings serialised as ECMAScript `JSON.stringify` does. Matches `json-canonicalize`'s
- * `canonicalize`, which Rafiki signs with: `undefined` members are omitted and `undefined` array elements become `null`.
- * Fails with `WebhookError` (`unsupported-value`) for NaN, ±Infinity, bigint, functions, symbols and cycles.
+ * numbers and strings serialised as ECMAScript `JSON.stringify` does. Produces the bytes of `json-canonicalize`'s
+ * `canonicalize`, which Rafiki signs with, for every JSON value and for `undefined` (an `undefined` member is
+ * omitted, an `undefined` array element becomes `null`), including its quirk that an object with a non-null `toJSON`
+ * member (a `Date`, say) is serialised by `JSON.stringify` alone, with members in insertion order.
+ *
+ * Where `canonicalize` would emit something other than a JSON document (or, depending on its version, throws or emits
+ * `null`), this fails with `WebhookError` (`unsupported-value`): NaN and ±Infinity, bigint, functions, symbols,
+ * cycles, and a `toJSON` member whose `JSON.stringify` throws or yields nothing. Sparse arrays are read as `undefined`
+ * elements (`null`); `canonicalize` skips the holes. There is no nesting limit.
  *
  * @see https://www.rfc-editor.org/rfc/rfc8785
  */
 export function canonicalizeJson(value: JsonValue): Result.Result<string, WebhookError> {
-  return serialize(value, new Set());
+  return serialize(value);
 }

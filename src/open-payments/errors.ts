@@ -4,15 +4,30 @@ import type { JsonObject } from "effect/Schema";
 
 /** Why an Open Payments operation failed. */
 export type OpenPaymentsErrorReason =
-  /** The server answered with a non-2xx status. `status` and the `{ error: { code, description } }` body fields are set when present. */
+  /**
+   * The server answered with a 4xx or 5xx status (a 3xx is not followed and fails as `transport`). `status` and
+   * `description` are always set; `code` and `details` when the `{ error: { code, description, details } }` body carries them.
+   */
   | "http"
-  /** The response did not match the Open Payments schema, or violated a payment invariant. */
+  /**
+   * The response did not match the Open Payments schema (amounts are checked as `uint64`, `assetScale` as 0-255), or
+   * violated a payment invariant (assets differ, sent more than debited, …), including an amount value the
+   * invariants cannot read when `validateResponses` is off.
+   */
   | "validation"
-  /** `fetch` rejected (network failure, abort, bad URL). */
+  /**
+   * No usable response: `fetch` rejected (network failure, abort, timeout), the URL does not parse, the server
+   * redirected (redirects are not followed), the body exceeded `maxResponseBytes`, or reading it failed or stalled
+   * past `requestTimeoutMs`. `status` is not set.
+   */
   | "transport"
-  /** The request was invalid before being sent (e.g. a grant request without `access_token` or `subject`). */
+  /**
+   * The request was refused before being sent: a grant request without `access_token` or `subject`, a request URL
+   * that is not `https:` (`http:` with `useHttp`) or has credentials or a fragment or is refused by `urlPolicy`, or a
+   * `requestTimeoutMs` / `maxResponseBytes` that is not a finite number of at least 0.
+   */
   | "invalid-request"
-  /** Amount value out of range, malformed, or assets differ. */
+  /** Returned by the amount helpers (`parseAmountValue`, `compareAmounts`, `addAmounts`, …): a value out of range or malformed, or assets differ. */
   | "invalid-amount"
   /** HTTP message signing of the request failed. */
   | "signing";

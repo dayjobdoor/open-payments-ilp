@@ -2,6 +2,7 @@ import { Effect, type Result } from "effect";
 import { describe, expect, it } from "vite-plus/test";
 import {
   HttpSignatureError,
+  SIGNATURE_REPLAY_WINDOW_SECONDS,
   createSignatureBase,
   exportPublicJwk,
   generateEd25519KeyPair,
@@ -294,5 +295,260 @@ describe("verifyRequest", () => {
     await verify(request, publicJwk);
 
     expect(await request.text()).toBe("payload");
+  });
+});
+
+describe("signRequest options", () => {
+  it("adds the nonce parameter before the tag, and verifyRequest reports it", async () => {
+    const { key, publicJwk } = await setup();
+
+    const request = await Effect.runPromise(
+      signRequest(new Request(url), key, { created, nonce: "n-123", tag: "open-payments" }),
+    );
+
+    expect(request.headers.get("Signature-Input")).toBe(
+      'sig1=("@method" "@target-uri");created=1767225600;keyid="k1";nonce="n-123";tag="open-payments"',
+    );
+    expect(await verify(request, publicJwk)).toMatchObject({ _tag: "Success", success: { nonce: "n-123" } });
+  });
+
+  it("reports no nonce member when the signer sent none", async () => {
+    const { request, publicJwk } = await sign({});
+    const result = await verify(request, publicJwk);
+
+    expect(result._tag === "Success" && result.success).not.toHaveProperty("nonce");
+  });
+
+  it("digests the body with sha-256 on request, and with sha-512 otherwise", async () => {
+    const { key, publicJwk } = await setup();
+    const init = { method: "POST", body: "payload" };
+
+    const sha256 = await Effect.runPromise(signRequest(new Request(url, init), key, { created, digest: "sha-256" }));
+    const sha512 = await Effect.runPromise(signRequest(new Request(url, init), key, { created }));
+
+    expect(sha256.headers.get("Content-Digest")).toMatch(/^sha-256=:[A-Za-z0-9+/]{43}=:$/);
+    expect(sha512.headers.get("Content-Digest")).toMatch(/^sha-512=:/);
+    expect(failureOf(await verify(sha256, publicJwk))).toBeUndefined();
+    expect(failureOf(await verify(sha512, publicJwk))).toBeUndefined();
+  });
+
+  it("fails with malformed for a created that is an Invalid Date", async () => {
+    const { key } = await setup();
+
+    const result = await Effect.runPromise(
+      Effect.result(signRequest(new Request(url), key, { created: new Date(Number.NaN) })),
+    );
+
+    expect(failureOf(result)).toBe("malformed");
+  });
+
+  it("signs the URL without its fragment, which fetch would not send", async () => {
+    const { key, publicJwk } = await setup();
+    const withFragment = new Request(`${url}#section`);
+    const signed = await Effect.runPromise(signRequest(withFragment, key, { created }));
+
+    expect(withFragment.url).toContain("#section");
+    // What a server sees: the same request without the fragment.
+    expect(failureOf(await verify(new Request(url, { headers: signed.headers }), publicJwk))).toBeUndefined();
+    expect(failureOf(await verify(signed, publicJwk))).toBeUndefined();
+  });
+});
+
+describe("verifyRequest replay window", () => {
+  it("keeps the default window constant and reports the window the verification actually used", async () => {
+    const { request, publicJwk } = await sign({});
+
+    expect(SIGNATURE_REPLAY_WINDOW_SECONDS).toBe(331);
+
+    for (const [maxAgeSeconds, window] of [
+      [undefined, 331],
+      [0, 31],
+      [600, 631],
+    ] as const) {
+      const options = maxAgeSeconds === undefined ? {} : { maxAgeSeconds };
+
+      expect(await verify(request, publicJwk, { ...options, clock: at(0) })).toMatchObject({
+        _tag: "Success",
+        success: { replayWindowSeconds: window },
+      });
+    }
+  });
+});
+
+describe("verifyRequest options", () => {
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, -1])(
+    "fails with invalid-config instead of skipping the age check for maxAgeSeconds %s",
+    async (maxAgeSeconds) => {
+      const { request, publicJwk } = await sign({});
+
+      // A signature far older than any window: it must not pass because the limit is unusable.
+      expect(failureOf(await verify(request, publicJwk, { maxAgeSeconds, clock: at(100_000) }))).toBe("invalid-config");
+    },
+  );
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, -1])(
+    "fails with invalid-config for maxBodyBytes %s",
+    async (maxBodyBytes) => {
+      const { request, publicJwk } = await sign({});
+
+      expect(failureOf(await verify(request, publicJwk, { maxBodyBytes }))).toBe("invalid-config");
+    },
+  );
+
+  it("fails with invalid-config instead of skipping the age check when the clock returns an Invalid Date", async () => {
+    const { request, publicJwk } = await sign({});
+
+    expect(failureOf(await verify(request, publicJwk, { clock: () => new Date(Number.NaN) }))).toBe("invalid-config");
+  });
+});
+
+describe("verifyRequest body limit", () => {
+  const post = (body: string) => sign({ method: "POST", body, headers: { "Content-Type": "text/plain" } });
+
+  it("accepts a body of exactly maxBodyBytes and refuses one byte more as malformed", async () => {
+    const { request, publicJwk } = await post("0123456789");
+
+    expect(failureOf(await verify(request, publicJwk, { maxBodyBytes: 10 }))).toBeUndefined();
+    expect(failureOf(await verify(request, publicJwk, { maxBodyBytes: 9 }))).toBe("malformed");
+  });
+
+  it("limits the body to 64 KiB by default", async () => {
+    const atLimit = await post("x".repeat(64 * 1024));
+    const over = await post("x".repeat(64 * 1024 + 1));
+
+    expect(failureOf(await verify(atLimit.request, atLimit.publicJwk))).toBeUndefined();
+    expect(failureOf(await verify(over.request, over.publicJwk))).toBe("malformed");
+    expect(failureOf(await verify(over.request, over.publicJwk, { maxBodyBytes: 1024 * 1024 }))).toBeUndefined();
+  });
+
+  it("stops reading a streamed body that is longer than the limit, whatever Content-Length says", async () => {
+    const { key, publicJwk } = await setup();
+    const signed = await Effect.runPromise(
+      signRequest(new Request(url, { method: "POST", body: "tiny" }), key, { created }),
+    );
+
+    let pulls = 0;
+
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls++;
+        controller.enqueue(new Uint8Array(1024));
+
+        if (pulls === 10_000) controller.close();
+      },
+    });
+
+    // The signed headers announce 4 bytes; the real body is not that.
+    const headers = new Headers(signed.headers);
+    const lying = new Request(url, { method: "POST", headers, body: stream, duplex: "half" } as RequestInit);
+
+    expect(failureOf(await verify(lying, publicJwk, { maxBodyBytes: 4096 }))).toBe("malformed");
+    expect(pulls).toBeLessThan(100);
+  });
+
+  /** A signed POST whose signature covers neither `content-digest` nor a body, then sent with one. */
+  async function uncoveredBody(pulled: { count: number }, chunks: number) {
+    const { key, publicJwk } = await setup();
+    const components = ["@method", "@target-uri"];
+
+    const params: ReadonlyArray<readonly [string, string | number]> = [
+      ["created", created.getTime() / 1000],
+      ["keyid", key.keyId],
+    ];
+
+    const message = { method: "POST", url, headers: new Headers() };
+    const base = await Effect.runPromise(Effect.fromResult(createSignatureBase(message, components, params)));
+    const value = await Effect.runPromise(Effect.fromResult(serializeSignatureParams(components, params)));
+    const signature = await crypto.subtle.sign("Ed25519", key.privateKey, utf8Encode(base));
+    let sent = 0;
+
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled.count++;
+        controller.enqueue(new Uint8Array(512));
+
+        if (++sent === chunks) controller.close();
+      },
+    });
+
+    const request = new Request(url, {
+      method: "POST",
+      headers: { "Signature-Input": `sig1=${value}`, Signature: `sig1=:${encodeBase64(new Uint8Array(signature))}:` },
+      body: stream,
+      duplex: "half",
+    } as RequestInit);
+
+    return { request, publicJwk };
+  }
+
+  it("does not read the body at all when no digest check is required", async () => {
+    const pulled = { count: 0 };
+    const { request, publicJwk } = await uncoveredBody(pulled, 100);
+
+    // Constructing a request primes its stream with one pull; verification must add none.
+    const primed = pulled.count;
+
+    expect(await verify(request, publicJwk, { requireBodyDigest: false })).toMatchObject({ _tag: "Success" });
+    expect(pulled.count).toBe(primed);
+  });
+
+  it("finds out that an uncovered body is not empty without draining it", async () => {
+    const pulled = { count: 0 };
+    const { request, publicJwk } = await uncoveredBody(pulled, 10_000);
+
+    expect(failureOf(await verify(request, publicJwk))).toBe("digest-mismatch");
+    expect(pulled.count).toBeLessThan(10);
+  });
+});
+
+describe("verifyRequest header shapes", () => {
+  const input = 'sig1=("@method" "@target-uri");created=1767225600;keyid="k1"';
+
+  async function withHeaders(headers: { input?: string; signature?: string }) {
+    const { request, publicJwk } = await sign({});
+
+    return {
+      publicJwk,
+      request: new Request(url, {
+        headers: {
+          "Signature-Input": headers.input ?? request.headers.get("Signature-Input") ?? "",
+          Signature: headers.signature ?? request.headers.get("Signature") ?? "",
+        },
+      }),
+    };
+  }
+
+  it("starts from a request that verifies, so the cases below fail because of what they change", async () => {
+    const { request, publicJwk } = await withHeaders({});
+
+    expect(failureOf(await verify(request, publicJwk))).toBeUndefined();
+  });
+
+  it.each([
+    ["an item where an inner list is required", "sig1=:AAAA:", "malformed"],
+    ["an unterminated inner list", "sig1=(", "malformed"],
+    ["a trailing comma", `${input},`, "malformed"],
+    ["no created parameter", 'sig1=("@method" "@target-uri");keyid="k1"', "malformed"],
+    ["no keyid parameter", 'sig1=("@method" "@target-uri");created=1767225600', "malformed"],
+    ["a covered component that is not a string", 'sig1=(5);created=1767225600;keyid="k1"', "malformed"],
+    ["a created that is a string", 'sig1=("@method");created="x";keyid="k1"', "malformed"],
+    ["a decimal created", 'sig1=("@method");created=1767225600.5;keyid="k1"', "unsupported"],
+    ["a binary parameter", `${input};x=:AAAA:`, "unsupported"],
+  ])("rejects a Signature-Input with %s", async (_name, value, reason) => {
+    const { request, publicJwk } = await withHeaders({ input: value });
+
+    expect(failureOf(await verify(request, publicJwk))).toBe(reason);
+  });
+
+  it.each([
+    ["a token", "sig1=token", "malformed"],
+    ["an inner list", 'sig1=("a")', "malformed"],
+    ["an unterminated byte sequence", "sig1=:AAAA", "malformed"],
+    ["a byte sequence of the wrong length", "sig1=:AAAA:", "invalid"],
+    ["an empty value", "", "missing"],
+  ])("rejects a Signature that is %s", async (_name, value, reason) => {
+    const { request, publicJwk } = await withHeaders({ signature: value });
+
+    expect(failureOf(await verify(request, publicJwk))).toBe(reason);
   });
 });

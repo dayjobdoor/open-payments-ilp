@@ -1,6 +1,5 @@
 import { Effect } from "effect";
 import { describe, expect, it } from "vite-plus/test";
-import { decodeBase64 } from "../../src/internal/bytes";
 import {
   createContentDigest,
   createSignatureBase,
@@ -55,6 +54,7 @@ describe("RFC 9421 B.2.6 (ed25519)", () => {
       label: "sig-b26",
       created: new Date(1618884473_000),
       components,
+      replayWindowSeconds: 331,
     });
   });
 
@@ -103,7 +103,9 @@ describe("RFC 9421 B.2.6 (ed25519)", () => {
     const key = await Effect.runPromise(importEd25519PublicJwk(publicJwk));
 
     expect(key.algorithm.name).toBe("Ed25519");
-    expect(decodeBase64("JrQLj5P/89iXES9+vFgrIy29clF9CC/oPPsw3c5D0bs=")).toHaveLength(32);
+    expect(key.usages).toEqual(["verify"]);
+    // The imported key is the RFC's, not merely some key: it exports to the same raw point.
+    expect(await crypto.subtle.exportKey("jwk", key)).toMatchObject({ kty: "OKP", crv: "Ed25519", x: publicJwk.x });
   });
 });
 
@@ -130,6 +132,16 @@ describe("createSignatureBase components (RFC 9421 section 2.2)", () => {
     ["x-a", '"x-a": a'],
   ])("derives %s", (name, line) => {
     expect(lineFor(name)).toBe(line);
+  });
+
+  it("leaves the fragment out of @target-uri, as fetch does not send it, and uses the normalised URL", () => {
+    expect(lineFor("@target-uri", { ...message, url: `${message.url}#section` })).toBe(
+      '"@target-uri": https://www.example.com:8443/path?param=value',
+    );
+    expect(lineFor("@target-uri", { ...message, url: "HTTPS://WWW.Example.com:443/a/../b#" })).toBe(
+      '"@target-uri": https://www.example.com/b',
+    );
+    expect(lineFor("@target-uri", { ...message, url: "/relative#frag" })).toBe("malformed");
   });
 
   it("renders an empty query as a lone question mark and omits it from the request target", () => {
@@ -167,7 +179,9 @@ describe("RFC 9530 Content-Digest vectors", () => {
 
   it("verifies each digest alone and together", async () => {
     for (const header of [sha256, sha512, `${sha256}, ${sha512}`]) {
-      await Effect.runPromise(verifyContentDigest(header, bytes));
+      expect(await Effect.runPromise(Effect.result(verifyContentDigest(header, bytes)))).toMatchObject({
+        _tag: "Success",
+      });
     }
   });
 
@@ -178,7 +192,9 @@ describe("RFC 9530 Content-Digest vectors", () => {
   });
 
   it("ignores unknown algorithms but needs one known", async () => {
-    await Effect.runPromise(verifyContentDigest(`md5=:AAAA:, ${sha256}`, bytes));
+    expect(await Effect.runPromise(Effect.result(verifyContentDigest(`md5=:AAAA:, ${sha256}`, bytes)))).toMatchObject({
+      _tag: "Success",
+    });
     const error = await Effect.runPromise(Effect.flip(verifyContentDigest("md5=:AAAA:", bytes)));
 
     expect(error.reason).toBe("unsupported");

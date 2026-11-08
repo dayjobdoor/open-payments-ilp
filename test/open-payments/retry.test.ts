@@ -125,20 +125,29 @@ describe("what is retried", () => {
   });
 
   it("retries a timed-out attempt, each with its own timeout", async () => {
-    let calls = 0;
+    const signals: AbortSignal[] = [];
 
     const fetch: typeof globalThis.fetch = (_input, init) => {
-      if (++calls > 1) return Promise.resolve(Response.json(walletBody));
+      const signal = init?.signal;
+
+      if (!signal) throw new Error("the client passes a signal");
+      signals.push(signal);
+
+      if (signals.length > 1) return Promise.resolve(Response.json(walletBody));
 
       return new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        signal.addEventListener("abort", () => reject(signal.reason));
       });
     };
 
-    const client = createUnauthenticatedClient({ fetch, requestTimeoutMs: 5, retry: instant().retry });
+    // Generous: the deadline also covers the second attempt's body read, which a loaded machine can stall for a few
+    // milliseconds. A third attempt would not hide that, so it must not be allowed to happen.
+    const client = createUnauthenticatedClient({ fetch, requestTimeoutMs: 200, retry: instant().retry });
 
     expect((await Effect.runPromise(getWallet(client))).assetCode).toBe("USD");
-    expect(calls).toBe(2);
+    expect(signals).toHaveLength(2);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(signals[1]).not.toBe(signals[0]);
   });
 
   it("does not retry a response longer than maxResponseBytes", async () => {
@@ -270,6 +279,27 @@ describe("methods", () => {
     expect(seen.map((request) => request.method)).toEqual(["POST", "POST"]);
   });
 
+  it("keeps the POST rule when retryOn accepts every error", async () => {
+    const { seen } = make([status(503), status(503)], instant({ retryOn: () => true }).retry);
+    const error = await failure(client.incomingPayment.complete(resource));
+
+    expect(seen).toHaveLength(1);
+    expect(error).toMatchObject({ reason: "http", status: 503, attempts: 1 });
+
+    // A GET is repeatable, so the same `retryOn` does apply to it.
+    const get = make([status(503)], instant({ retryOn: () => true }).retry);
+
+    await Effect.runPromise(client.incomingPayment.get(resource));
+    expect(get.seen).toHaveLength(2);
+  });
+
+  it("lets retryOn retry what is never retried by default, for a method that may repeat", async () => {
+    const { seen } = make([status(404), status(404)], instant({ retryOn: (error) => error.status === 404 }).retry);
+
+    await Effect.runPromise(client.incomingPayment.get(resource));
+    expect(seen).toHaveLength(3);
+  });
+
   it("retries a POST when the request opts in, and a request can opt out of the client option", async () => {
     const optedIn = make([new TypeError("lost")], instant().retry);
 
@@ -281,6 +311,28 @@ describe("methods", () => {
     await failure(client.incomingPayment.complete({ ...resource, retryNonIdempotent: false }));
     expect(optedOut.seen).toHaveLength(1);
   });
+
+  it.each([
+    ["token.rotate", (o: boolean | undefined) => client.token.rotate({ ...resource, retryNonIdempotent: o })],
+    [
+      "grant.continue",
+      (o: boolean | undefined) => client.grant.continue({ ...resource, retryNonIdempotent: o }, { interact_ref: "r" }),
+    ],
+  ] as const)(
+    "%s is attempted once under the client-wide retryNonIdempotent, and repeated only on its own flag",
+    async (_name, call) => {
+      const wide = make([status(503), status(503), status(503)], instant({ retryNonIdempotent: true }).retry);
+      const error = await failure(call(undefined));
+
+      expect(wide.seen).toHaveLength(1);
+      expect(error).toMatchObject({ reason: "http", status: 503, attempts: 1 });
+
+      const own = make([status(503), status(503), status(503)], instant({ retryNonIdempotent: true }).retry);
+
+      await failure(call(true));
+      expect(own.seen).toHaveLength(3);
+    },
+  );
 
   const postRoutes: Array<[string, (optIn: boolean | undefined) => Effect.Effect<unknown, OpenPaymentsError>]> = [
     [
@@ -352,10 +404,14 @@ describe("waiting", () => {
 
     const client = createUnauthenticatedClient({
       fetch,
-      retry: { maxAttempts: 2, baseDelayMs: 1, jitter: "none" },
+      retry: { maxAttempts: 2, baseDelayMs: 60, jitter: "none" },
     });
 
+    const started = performance.now();
+
     await Effect.runPromise(getWallet(client));
+    // Timers may fire a little early against `performance.now`; skipping the sleep would take a millisecond or two.
+    expect(performance.now() - started).toBeGreaterThanOrEqual(45);
     expect(seen).toHaveLength(2);
   });
 
@@ -392,17 +448,39 @@ describe("waiting", () => {
       expect(await waitFor(code, "0")).toEqual([0]);
     });
 
-    it("caps the wait at maxDelayMs", async () => {
-      expect(await waitFor(429, "3600")).toEqual([5000]);
-      expect(await waitFor(503, "10", { maxDelayMs: 1500 })).toEqual([1500]);
+    it("waits a Retry-After that is exactly maxDelayMs", async () => {
+      expect(await waitFor(503, "5")).toEqual([5000]);
+      expect(await waitFor(503, "2", { maxDelayMs: 2000 })).toEqual([2000]);
+    });
+
+    it.each([
+      [429, "3600", {}],
+      [503, "10", { maxDelayMs: 1500 }],
+      [503, "Thu, 01 Jan 2026 00:10:00 GMT", {}],
+    ])("stops, instead of waiting less, when a %i asks for %s (more than maxDelayMs)", async (code, value, extra) => {
+      const { fetch, seen } = scripted([
+        status(code, { "Retry-After": value }),
+        status(code, { "Retry-After": value }),
+      ]);
+      const { retry, sleeps } = instant({ maxDelayMs: 5000, ...extra });
+      const clock = { clock: () => new Date("2026-01-01T00:00:00Z") };
+
+      const error = await failure(getWallet(createUnauthenticatedClient({ fetch, retry, ...clock })));
+
+      expect(seen).toHaveLength(1);
+      expect(sleeps).toEqual([]);
+      expect(error).toMatchObject({ reason: "http", status: code, attempts: 1 });
     });
 
     it("waits until an HTTP-date, measured on the clock option", async () => {
       const now = new Date("2026-01-01T00:00:00Z");
 
       expect(await waitFor(503, "Thu, 01 Jan 2026 00:00:03 GMT", {}, now)).toEqual([3000]);
-      expect(await waitFor(503, "Thu, 01 Jan 2026 00:10:00 GMT", {}, now)).toEqual([5000]);
       expect(await waitFor(429, "Wed, 31 Dec 2025 23:00:00 GMT", {}, now)).toEqual([0]);
+    });
+
+    it("falls back to the backoff for an HTTP-date when the clock returns an Invalid Date", async () => {
+      expect(await waitFor(503, "Thu, 01 Jan 2026 00:00:03 GMT", {}, new Date(Number.NaN))).toEqual([100]);
     });
 
     it("falls back to the backoff for a value that is no delay", async () => {
@@ -444,7 +522,7 @@ describe("signing", () => {
     expect(seen).toHaveLength(3);
     expect(new Set(nonces).size).toBe(3);
     expect(nonces.every((nonce) => nonce !== undefined)).toBe(true);
-    expect(created.length).toBe(3);
+    expect(created.every((value) => value !== undefined)).toBe(true);
     expect(new Set(created).size).toBe(3);
     expect(new Set(seen.map((request) => request.headers.get("signature"))).size).toBe(3);
   });

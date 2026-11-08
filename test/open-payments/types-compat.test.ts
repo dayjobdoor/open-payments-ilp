@@ -1,9 +1,21 @@
 import type * as Upstream from "@interledger/open-payments/dist/types";
 import { AccessAction, AccessType } from "@interledger/open-payments";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, expectTypeOf, it } from "vite-plus/test";
 import * as Ours from "../../src/open-payments/index";
 
-type Mutual<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+type IsAny<T> = 0 extends 1 & T ? true : false;
+
+/** Mutual assignability, except that `any` (which is assignable both ways to everything) never counts as compatible. */
+type Mutual<A, B> =
+  IsAny<A> extends true
+    ? false
+    : IsAny<B> extends true
+      ? false
+      : [A] extends [B]
+        ? [B] extends [A]
+          ? true
+          : false
+        : false;
 
 /** Fails to compile unless every pair is mutually assignable. */
 type AllMutual<T extends Record<string, true>> = T;
@@ -75,6 +87,16 @@ export type Compat = AllMutual<{
 }>;
 
 describe("type compatibility with @interledger/open-payments", () => {
+  it("compares types strictly (checked by tsc -p tsconfig.test.json, which `vp test` does not run)", () => {
+    expectTypeOf<Mutual<{ a: 1 }, { a: 1 }>>().toEqualTypeOf<true>();
+    expectTypeOf<Mutual<{ a: 1 }, { a: 2 }>>().toEqualTypeOf<false>();
+    // The table above must not let a field that degraded to `any` pass.
+    expectTypeOf<Mutual<any, { a: 1 }>>().toEqualTypeOf<false>();
+    expectTypeOf<Mutual<{ a: 1 }, any>>().toEqualTypeOf<false>();
+    // Every row of the table is `true`, not merely something assignable to `true`.
+    expectTypeOf<Compat[keyof Compat]>().toEqualTypeOf<true>();
+  });
+
   it("has the same runtime constants", () => {
     expect(Ours.AccessType).toEqual(AccessType);
     expect(Ours.AccessAction).toEqual(AccessAction);

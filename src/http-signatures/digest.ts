@@ -16,7 +16,7 @@ async function digest(algorithm: DigestAlgorithm, body: Uint8Array): Promise<Uin
 }
 
 /**
- * Builds an RFC 9530 `Content-Digest` header value over the exact representation bytes, e.g.
+ * Builds an RFC 9530 `Content-Digest` header value over the exact message content bytes, e.g.
  * `sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:`.
  *
  * @see https://www.rfc-editor.org/rfc/rfc9530#section-2
@@ -27,7 +27,7 @@ export const createContentDigest: (body: Uint8Array, algorithm?: DigestAlgorithm
 ) => Effect.promise(async () => `${algorithm}=:${encodeBase64(await digest(algorithm, body))}:`);
 
 /**
- * Verifies a `Content-Digest` header against body bytes. Every supported algorithm (sha-256, sha-512) present in
+ * Verifies a `Content-Digest` header against the message content bytes. Every supported algorithm (sha-256, sha-512) present in
  * the header must match; unknown algorithms are ignored but at least one supported one is required.
  *
  * Fails with `HttpSignatureError`: `malformed` (unparsable header), `unsupported` (no supported algorithm),

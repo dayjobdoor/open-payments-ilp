@@ -47,6 +47,8 @@ export interface UnauthenticatedResourceRequestArgs {
   /**
    * Repeat this request if it fails transiently, although it is a `POST`: overrides `retry.retryNonIdempotent`.
    * Only meaningful with `ClientOptions.retry`, and only for requests whose first attempt may have been processed.
+   * `token.rotate` and `grant.continue` are repeated only when this is set: `retry.retryNonIdempotent` does not
+   * apply to them, because a lost response has already used up the old token or the continuation.
    */
   readonly retryNonIdempotent?: boolean | undefined;
 }
@@ -70,13 +72,33 @@ export interface CollectionRequestArgs extends ResourceRequestArgs {
 export interface ClientOptions {
   /** `fetch` implementation. Defaults to the global `fetch`. */
   readonly fetch?: typeof globalThis.fetch;
-  /** Rewrite every request URL to `http:` (development only). */
+  /**
+   * Development only: also accept `http:` request URLs and rewrite every request URL to `http:`. Without it, only
+   * `https:` URLs are requested. Whatever the setting, a URL with another scheme (`file:`, `data:`, …), embedded
+   * credentials (`https://user:pw@host`) or a fragment is refused with `invalid-request` before anything is sent: the
+   * URLs come from documents of the server being talked to (`authServer`, `resourceServer`, `continue.uri`, …).
+   */
   readonly useHttp?: boolean;
-  /** Abort a request after this many milliseconds. Defaults to 5000, like the reference client. */
+  /**
+   * Further restriction of request URLs, e.g. to refuse private or loopback hosts: called with every final request
+   * URL (after the `useHttp` rewrite and the query) once the scheme, credential and fragment rules have passed.
+   * Returning `false` fails the request with `invalid-request` before anything is sent. Must not throw.
+   */
+  readonly urlPolicy?: (url: URL) => boolean;
+  /**
+   * Abort a request after this many milliseconds, a finite number of at least 0. Defaults to 5000, like the reference
+   * client. Anything else (NaN, Infinity, negative) fails with `invalid-request` before anything is sent.
+   */
   readonly requestTimeoutMs?: number;
-  /** Fail a request whose response body is longer than this many bytes (announced or streamed). Defaults to 1 MiB. */
+  /**
+   * Fail a request whose response body is longer than this many bytes (announced or streamed), a finite number of at
+   * least 0. Defaults to 1 MiB. Anything else fails with `invalid-request` before anything is sent.
+   */
   readonly maxResponseBytes?: number;
-  /** Time source for the `created` parameter of request signatures. Defaults to `new Date()`. */
+  /**
+   * Time source for the `created` parameter of request signatures and for resolving an HTTP-date `Retry-After`.
+   * Defaults to `new Date()`. An Invalid Date fails signing with `signing` and is ignored for `Retry-After`.
+   */
   readonly clock?: () => Date;
   /**
    * Validate every response body against the Open Payments schemas (default `true`). When `false` the body is
@@ -125,7 +147,7 @@ const decode = {
   outgoingPaymentPage: Schema.decodeUnknownEffect(schemas.outgoingPaymentPage),
   outgoingPaymentGrantSpentAmounts: Schema.decodeUnknownEffect(schemas.outgoingPaymentGrantSpentAmounts),
   quote: Schema.decodeUnknownEffect(schemas.quote),
-  grantResponse: Schema.decodeUnknownEffect(Schema.Union([schemas.pendingGrant, schemas.grant])),
+  grantResponse: Schema.decodeUnknownEffect(Schema.Union([schemas.pendingGrant, schemas.finalizedGrant])),
   grant: Schema.decodeUnknownEffect(schemas.grant),
   accessTokenResponse: Schema.decodeUnknownEffect(schemas.accessTokenResponse),
 } as const;
@@ -244,6 +266,8 @@ interface Call {
   readonly body?: object | undefined;
   readonly query?: Readonly<Record<string, string | number | undefined>> | undefined;
   readonly retryNonIdempotent?: boolean | undefined;
+  /** Ignore `retry.retryNonIdempotent`: only `retryNonIdempotent` above may make this `POST` repeatable. */
+  readonly onlyRepeatWhenAskedTo?: boolean | undefined;
 }
 
 const transportError = (call: Call, cause: Error): OpenPaymentsError =>
@@ -252,6 +276,13 @@ const transportError = (call: Call, cause: Error): OpenPaymentsError =>
     message: `Error making Open Payments ${call.method} request`,
     description: cause.message,
     cause,
+  });
+
+const invalidRequestError = (call: Call, message: string, description: string): OpenPaymentsError =>
+  new OpenPaymentsError({
+    reason: "invalid-request",
+    message: `Error making Open Payments ${call.method} request`,
+    description: `${message}: ${description}`,
   });
 
 const signingError = (call: Call, cause: HttpSignatureError): OpenPaymentsError =>
@@ -301,17 +332,39 @@ const httpError = (call: Call, response: Response, text: string, url: string): O
   });
 };
 
+/** A URL the client refuses to request, as opposed to one that does not parse. */
+class RefusedUrl extends Error {}
+
+/**
+ * The URL to request: `call.url` with the query added, or a thrown `RefusedUrl` unless it is `https:` (`http:` with
+ * `useHttp`, which then rewrites it) without credentials or fragment and accepted by `urlPolicy`. Anything `new URL`
+ * rejects throws its `TypeError`.
+ */
 const requestUrl = (transport: Transport, call: Call): string => {
   const url = new URL(call.url);
+  const { useHttp, urlPolicy } = transport.options;
 
-  if (transport.options.useHttp) url.protocol = "http:";
+  if (url.protocol !== "https:" && !(useHttp && url.protocol === "http:")) {
+    throw new RefusedUrl(`the ${url.protocol} scheme is not allowed${useHttp ? "" : " (https only)"}`);
+  }
+
+  if (url.username !== "" || url.password !== "") throw new RefusedUrl("credentials in the URL are not allowed");
+
+  // `hash` is empty for a bare `#`, which `href` still keeps.
+  if (url.href.includes("#")) throw new RefusedUrl("a fragment in the URL is not allowed");
+
+  if (useHttp) url.protocol = "http:";
 
   for (const [name, value] of Object.entries(call.query ?? {})) {
     if (value) url.searchParams.set(name, String(value));
   }
 
+  if (urlPolicy && !urlPolicy(new URL(url.href))) throw new RefusedUrl("the URL policy refuses it");
+
   return url.href;
 };
+
+const isLimit = (value: number | undefined): boolean => value === undefined || (Number.isFinite(value) && value >= 0);
 
 const toError = (cause: unknown): Error => (cause instanceof Error ? cause : new Error(String(cause)));
 
@@ -337,8 +390,26 @@ const attempt = (transport: Transport, call: Call): Effect.Effect<Response, Atte
   Effect.gen(function* () {
     const url = yield* Effect.try({
       try: () => requestUrl(transport, call),
-      catch: (cause) => permanent(transportError(call, toError(cause))),
+      catch: (cause) =>
+        permanent(
+          cause instanceof RefusedUrl
+            ? invalidRequestError(call, "URL refused", cause.message)
+            : transportError(call, toError(cause)),
+        ),
     });
+
+    // NaN and Infinity would make `AbortSignal.timeout` throw, or switch the size limit off.
+    if (!isLimit(transport.options.requestTimeoutMs) || !isLimit(transport.options.maxResponseBytes)) {
+      return yield* Effect.fail(
+        permanent(
+          invalidRequestError(
+            call,
+            "Invalid option",
+            "requestTimeoutMs and maxResponseBytes must be finite numbers of at least 0",
+          ),
+        ),
+      );
+    }
 
     const headers = new Headers({ Accept: "application/json" });
     const body = call.body === undefined ? undefined : JSON.stringify(call.body);
@@ -445,7 +516,8 @@ const execute = (transport: Transport, call: Call): Effect.Effect<Response, Open
   if (retry === undefined) return Effect.mapError(attempt(transport, call), ({ error }) => error);
 
   const limit = attemptLimit(retry);
-  const repeatable = mayRepeat(call.method, call.retryNonIdempotent ?? retry.retryNonIdempotent ?? false);
+  const clientWide = call.onlyRepeatWhenAskedTo ? undefined : retry.retryNonIdempotent;
+  const repeatable = mayRepeat(call.method, call.retryNonIdempotent ?? clientWide ?? false);
 
   return Effect.gen(function* () {
     for (let made = 1; ; made++) {
@@ -459,8 +531,12 @@ const execute = (transport: Transport, call: Call): Effect.Effect<Response, Open
       }
 
       const now = (transport.options.clock ?? (() => new Date()))().getTime();
+      const delay = retryDelayMs(retry, made, error.status, retryAfter, now);
 
-      yield* pause(retry, retryDelayMs(retry, made, error.status, retryAfter, now));
+      // The server asked for more patience than `maxDelayMs` allows: waiting less would only be refused again.
+      if (delay === null) return yield* Effect.fail(withAttempts(error, made));
+
+      yield* pause(retry, delay);
     }
   });
 };
@@ -672,7 +748,7 @@ function grantRoutes(transport: Transport, client: string): GrantRoutes {
     continue: ({ url, accessToken, retryNonIdempotent }, continuation) =>
       requestJson(
         transport,
-        { method: "POST", url, accessToken, body: continuation, retryNonIdempotent },
+        { method: "POST", url, accessToken, body: continuation, retryNonIdempotent, onlyRepeatWhenAskedTo: true },
         decode.grant,
       ),
     cancel: ({ url, accessToken }) => requestVoid(transport, { method: "DELETE", url, accessToken }),
@@ -682,7 +758,11 @@ function grantRoutes(transport: Transport, client: string): GrantRoutes {
 function tokenRoutes(transport: Transport): TokenRoutes {
   return {
     rotate: ({ url, accessToken, retryNonIdempotent }) =>
-      requestJson(transport, { method: "POST", url, accessToken, retryNonIdempotent }, decode.accessTokenResponse),
+      requestJson(
+        transport,
+        { method: "POST", url, accessToken, retryNonIdempotent, onlyRepeatWhenAskedTo: true },
+        decode.accessTokenResponse,
+      ),
     revoke: ({ url, accessToken }) => requestVoid(transport, { method: "DELETE", url, accessToken }),
   };
 }
@@ -690,7 +770,7 @@ function tokenRoutes(transport: Transport): TokenRoutes {
 /**
  * Creates a client that can only fetch public data (wallet address, keys, DID document, public incoming payment).
  * Nothing is signed. Every route returns an `Effect` failing with {@link OpenPaymentsError}
- * (`http`, `validation` or `transport`); no I/O happens until the effect runs, and nothing is retried unless
+ * (`http`, `validation`, `transport` or `invalid-request`); no I/O happens until the effect runs, and nothing is retried unless
  * `options.retry` is set (see {@link RetryOptions}).
  *
  * @see https://openpayments.dev/apis/wallet-address-server/
@@ -707,9 +787,9 @@ export function createUnauthenticatedClient(options: ClientOptions = {}): Unauth
 /**
  * Creates a client exposing every Open Payments API. `POST` requests and requests carrying a token are
  * signed with `signRequest` (RFC 9421, Ed25519). Every route returns an `Effect` failing with
- * {@link OpenPaymentsError} (`http`, `validation`, `transport`, `signing`, `invalid-request`, `invalid-amount`);
+ * {@link OpenPaymentsError} (`http`, `validation`, `transport`, `signing`, `invalid-request`);
  * no I/O happens until the effect runs, and nothing is retried unless `options.retry` is set (see
- * {@link RetryOptions}; a `POST` needs `retryNonIdempotent`). Responses are returned as received (unknown members
+ * {@link RetryOptions}; a `POST` needs `retryNonIdempotent`, and `token.rotate` and `grant.continue` need it per request). Responses are returned as received (unknown members
  * included) after validation.
  *
  * @see https://openpayments.dev/apis/

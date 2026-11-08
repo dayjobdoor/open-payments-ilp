@@ -3,10 +3,12 @@ import * as Data from "effect/Data";
 
 /** Why a webhook could not be canonicalised, signed, or verified. */
 export type WebhookErrorReason =
-  /** The body contains a value JSON cannot represent (NaN, Infinity, bigint, function, symbol) or a cycle. */
+  /** The body contains a value JSON cannot represent (NaN, Infinity, bigint, function, symbol), a cycle, or a `toJSON` member that JSON.stringify cannot serialise. */
   | "unsupported-value"
-  /** The signature header or the signing secret is absent. */
+  /** The signature header or the signing secret is absent (an empty secret counts as absent when signing too). */
   | "missing"
+  /** The configuration is unusable: a replay window that is not a finite number of at least 0, or a clock returning an Invalid Date. */
+  | "invalid-config"
   /** The signature header does not have the `t=<ms>, v<N>=<hex>` form. */
   | "malformed"
   /** The header's signature version differs from the configured version. */

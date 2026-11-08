@@ -11,17 +11,20 @@ import type { OpenPaymentsError } from "./errors";
  * | `transport`: `fetch` rejected or timed out, or the body could not be read | retried                     | only with `retryNonIdempotent`                  |
  * | `http` `408` `429` `502` `503` `504`                                      | retried                     | only with `retryNonIdempotent`                  |
  * | any other `http` status, `validation`, `signing`, `invalid-*`             | never                       | never                                           |
- * | `transport`: bad URL, response longer than `maxResponseBytes`             | never                       | never                                           |
+ * | `transport`: bad URL, refused redirect, response longer than `maxResponseBytes` | never                 | never                                           |
  *
- * `retryOn` replaces the "transient" column (which errors are worth another attempt); the method rule and
- * `maxAttempts` still apply. A `POST` is not safe to repeat by default because the first attempt may have been
- * processed (a lost response creates the payment twice): Open Payments has no idempotency key, so repeating
- * a `POST` is an explicit decision, per client (`retryNonIdempotent`) or per request (`retryNonIdempotent` in the
- * request arguments, which wins over the client's).
+ * `retryOn` replaces the whole decision, the "never" rows included (it sees every error, a refused redirect or an
+ * oversized body too); the method rule and `maxAttempts` still apply. A `POST` is not safe to repeat by default
+ * because the first attempt may have been processed (a lost response creates the payment twice): Open Payments has
+ * no idempotency key, so repeating a `POST` is an explicit decision, per client (`retryNonIdempotent`) or per request
+ * (`retryNonIdempotent` in the request arguments, which wins over the client's). The exceptions are `token.rotate` and
+ * `grant.continue`: a lost response has already used up the old token or the continuation, so the client-wide flag
+ * does not cover them and only their own request flag does.
  *
  * **Waiting.** After failed attempt `n` (1-based) the wait is `min(maxDelayMs, baseDelayMs * 2^(n-1))`, then
  * multiplied by `random()` for `jitter: "full"` (the default). A `Retry-After` header (seconds or HTTP-date) of a `429`
- * or `503` replaces that wait: it is honoured as sent, but at most `maxDelayMs`, without jitter.
+ * or `503` replaces that wait: it is honoured as sent, without jitter, unless it asks for more than `maxDelayMs`; then
+ * the request is not repeated at all and fails with the response's error.
  *
  * **Every attempt is a new request.** It is signed again with a fresh `created` (from `clock`) and a fresh `nonce`
  * (only when retries are on), and gets its own `requestTimeoutMs`. Nothing signed is ever replayed.
@@ -35,13 +38,16 @@ export interface RetryOptions {
   readonly maxAttempts: number;
   /** Wait before the second attempt, doubled for every further one. Defaults to 200. */
   readonly baseDelayMs?: number;
-  /** Upper bound of every wait, `Retry-After` included. Defaults to 5000. */
+  /** Upper bound of every wait; a longer `Retry-After` ends the retries instead. Defaults to 5000. */
   readonly maxDelayMs?: number;
   /** `"full"` (default) waits a random share of the backoff, `"none"` the whole backoff. */
   readonly jitter?: "full" | "none";
-  /** Which errors are worth another attempt, instead of the default transient set (see above). */
+  /** Which errors are worth another attempt, instead of the default transient set and "never" rows (see above). */
   readonly retryOn?: (error: OpenPaymentsError) => boolean;
-  /** Also repeat `POST` (and `PATCH`) requests. A request's own `retryNonIdempotent` overrides this. Defaults to `false`. */
+  /**
+   * Also repeat `POST` (and `PATCH`) requests, except `token.rotate` and `grant.continue`. A request's own
+   * `retryNonIdempotent` overrides this. Defaults to `false`.
+   */
   readonly retryNonIdempotent?: boolean;
   /** Waits `ms` milliseconds. Defaults to `Effect.sleep`. Effects are interrupted with the request; a promise is abandoned. */
   readonly sleep?: (ms: number) => Effect.Effect<void> | Promise<void>;
@@ -75,12 +81,14 @@ const retryAfterMs = (value: string, now: number): number | undefined => {
   // `Date.parse` alone is too lenient ("5" is a date); an HTTP-date always names its day and month.
   const date = /[A-Za-z]{3}/.test(text) ? Date.parse(text) : Number.NaN;
 
-  return Number.isNaN(date) ? undefined : Math.max(0, date - now);
+  // A clock returning an Invalid Date makes `now` NaN: the date cannot be resolved, so the header is ignored.
+  return Number.isNaN(date) || Number.isNaN(now) ? undefined : Math.max(0, date - now);
 };
 
 /**
- * The wait before the attempt after failed attempt number `failed` (1-based). `retryAfter` is the response's
- * `Retry-After` header and counts for `429` and `503` only.
+ * The wait before the attempt after failed attempt number `failed` (1-based), or `null` when there should be no
+ * further attempt because the response's `Retry-After` (which counts for `429` and `503` only) asks for longer than
+ * `maxDelayMs`.
  */
 export const retryDelayMs = (
   options: RetryOptions,
@@ -88,13 +96,13 @@ export const retryDelayMs = (
   status: number | undefined,
   retryAfter: string | null,
   now: number,
-): number => {
+): number | null => {
   const maxDelayMs = options.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
 
   if (retryAfter !== null && (status === 429 || status === 503)) {
     const asked = retryAfterMs(retryAfter, now);
 
-    if (asked !== undefined) return Math.min(asked, maxDelayMs);
+    if (asked !== undefined) return asked > maxDelayMs ? null : asked;
   }
 
   const backoff = Math.min(maxDelayMs, (options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS) * 2 ** (failed - 1));

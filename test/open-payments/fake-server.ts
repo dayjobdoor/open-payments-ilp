@@ -218,7 +218,8 @@ export async function listen(handle: (request: Request) => Promise<Response>): P
       });
 
       void handle(request).then(async (response) => {
-        outgoing.writeHead(response.status, Object.fromEntries(response.headers));
+        // A flat name/value list keeps repeated headers (several `Set-Cookie`); an object would keep only the last.
+        outgoing.writeHead(response.status, [...response.headers].flat());
         outgoing.end(Buffer.from(await response.arrayBuffer()));
       });
     });

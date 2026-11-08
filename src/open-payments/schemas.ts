@@ -1,9 +1,10 @@
 /**
  * Effect schemas for the responses the client validates. Each schema's decoded type is checked
- * against the corresponding alias in ./types.ts at its use site in client.ts.
+ * against the corresponding alias in ./types.ts by the `Schema.Codec<Alias>` annotation on the schema.
  * @internal Not exported from the public entry point.
  */
 import * as Schema from "effect/Schema";
+import { isAmountValue } from "./amount";
 import type {
   AccessItem,
   Subject,
@@ -30,12 +31,19 @@ import type {
 const mutableArray = <S extends Schema.Constraint>(item: S): Schema.mutable<Schema.$Array<S>> =>
   Schema.mutable(Schema.Array(item));
 
-const amountValue = Schema.String.check(Schema.isPattern(/^\d+$/));
+/** `format: uint64` in the OpenAPI documents: unsigned decimal digits not above 2^64 - 1. */
+const amountValue = Schema.String.check(
+  Schema.isPattern(/^\d+$/),
+  Schema.makeFilter((value: string) => isAmountValue(value) || "Expected an unsigned 64-bit integer"),
+);
+
+/** `minimum: 0`, `maximum: 255` in the OpenAPI documents. */
+const assetScale = Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 255 }));
 
 export const amount: Schema.Codec<Amount> = Schema.Struct({
   value: amountValue,
   assetCode: Schema.String,
-  assetScale: Schema.Int,
+  assetScale,
 });
 
 const metadata = Schema.Record(Schema.String, Schema.Unknown);
@@ -59,7 +67,7 @@ export const walletAddress: Schema.Codec<WalletAddress> = Schema.StructWithRest(
     id: Schema.String,
     publicName: Schema.optionalKey(Schema.String),
     assetCode: Schema.String,
-    assetScale: Schema.Int,
+    assetScale,
     authServer: Schema.String,
     resourceServer: Schema.String,
   }),
@@ -215,4 +223,17 @@ export const grant: Schema.Codec<Grant> = Schema.Struct({
   access_token: Schema.optionalKey(accessToken),
   continue: continuation,
   subject: Schema.optionalKey(subject),
+});
+
+/**
+ * The other branch of a grant request's response: the OpenAPI `interact-response` requires both `redirect` and
+ * `finish`, so a body with an `interact` member that is not a {@link pendingGrant} must not pass as a finalised grant
+ * (`grant` alone ignores unknown members and would let it through as a grant that `isPendingGrant` calls pending).
+ * The member is declared as never-present rather than checked afterwards: decoding drops unknown members first.
+ */
+export const finalizedGrant: Schema.Codec<Grant> = Schema.Struct({
+  access_token: Schema.optionalKey(accessToken),
+  continue: continuation,
+  subject: Schema.optionalKey(subject),
+  interact: Schema.optionalKey(Schema.Never),
 });

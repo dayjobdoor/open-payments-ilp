@@ -1,5 +1,5 @@
 /**
- * Open Payments wire types, generated from the Open Payments OpenAPI documents.
+ * Open Payments wire types: aliases over the types generated from the Open Payments OpenAPI documents.
  * Names and shapes mirror `@interledger/open-payments`' `types.d.ts` (mutual assignability is
  * asserted by test/open-payments/types-compat.test.ts).
  */
@@ -71,7 +71,10 @@ export type ForwardPagination = Omit<BasePaginationArgs, "last"> & { last?: neve
 /** Backward pagination (`last` / `cursor`). */
 export type BackwardPagination = Omit<BasePaginationArgs, "first"> & { first?: never };
 
-/** Pagination arguments of the list operations. */
+/**
+ * Pagination arguments of the list operations. `wallet-address` is part of the type but the list routes overwrite it
+ * with their `walletAddress` argument, so setting it here has no effect.
+ */
 export type PaginationArgs = ForwardPagination | BackwardPagination;
 
 /** Quote. */

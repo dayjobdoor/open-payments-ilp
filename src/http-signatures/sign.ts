@@ -21,7 +21,7 @@ export interface SignOptions {
 }
 
 /**
- * Signs `message` in place: sets `Content-Digest` (sha-512) and `Content-Length` when `body` is given, then
+ * Signs `message` in place: sets `Content-Digest` (default sha-512) and `Content-Length` when `body` is given, then
  * `Signature-Input` and `Signature` on `message.headers`. `body` must be the exact bytes that will be sent.
  * Shared by {@link signRequest} and the Open Payments client, which already holds the encoded body.
  * @internal Not exported from the public entry point.

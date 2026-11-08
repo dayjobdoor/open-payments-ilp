@@ -13,6 +13,13 @@ const violation = (message: string): Result.Result<never, OpenPaymentsError> =>
     new OpenPaymentsError({ reason: "validation", message, description: message, validationErrors: [message] }),
   );
 
+/** A response amount value as a bigint; a malformed or oversized one is a validation failure of the response. */
+const amountOf = (value: string): Result.Result<bigint, OpenPaymentsError> => {
+  const parsed = parseAmountValue(value);
+
+  return Result.isFailure(parsed) ? violation(parsed.failure.message) : parsed;
+};
+
 /** Incoming payment invariant: the incoming amount shares the received amount's asset. */
 export function checkIncomingPayment<T extends IncomingPayment>(payment: T): Result.Result<T, OpenPaymentsError> {
   const { incomingAmount, receivedAmount } = payment;
@@ -31,7 +38,7 @@ export function checkIncomingPayment<T extends IncomingPayment>(payment: T): Res
 export function checkCreatedIncomingPayment(
   payment: IncomingPaymentWithPaymentMethods,
 ): Result.Result<IncomingPaymentWithPaymentMethods, OpenPaymentsError> {
-  const received = parseAmountValue(payment.receivedAmount.value);
+  const received = amountOf(payment.receivedAmount.value);
 
   if (Result.isFailure(received)) return Result.fail(received.failure);
 
@@ -61,10 +68,10 @@ export function checkOutgoingPayment<T extends OutgoingPayment | OutgoingPayment
     return violation("Asset code or asset scale of sending amount does not match sent amount");
   }
 
-  const debit = parseAmountValue(debitAmount.value);
+  const debit = amountOf(debitAmount.value);
 
   if (Result.isFailure(debit)) return Result.fail(debit.failure);
-  const sent = parseAmountValue(sentAmount.value);
+  const sent = amountOf(sentAmount.value);
 
   if (Result.isFailure(sent)) return Result.fail(sent.failure);
 

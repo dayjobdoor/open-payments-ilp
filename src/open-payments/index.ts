@@ -1,5 +1,5 @@
 /**
- * Open Payments: wire types generated from the Open Payments OpenAPI documents, amount helpers, and an
+ * Open Payments: wire types aliasing those generated from the Open Payments OpenAPI documents, amount helpers, and an
  * Effect-based fetch client for the wallet address, resource and authorisation server APIs.
  * Web Standards only (`fetch`, `Request`, WebCrypto).
  *

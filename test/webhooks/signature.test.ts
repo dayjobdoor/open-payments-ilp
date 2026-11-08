@@ -66,6 +66,21 @@ describe("signWebhook", () => {
     expect(failure.reason).toBe("unsupported-value");
   });
 
+  it("fails with missing, not an untagged WebCrypto error, for an empty secret", async () => {
+    const failure = await Effect.runPromise(Effect.flip(signWebhook(event, { secret: "", ...clock })));
+
+    expect(failure).toBeInstanceOf(WebhookError);
+    expect(failure.reason).toBe("missing");
+  });
+
+  it("fails with invalid-config when its clock returns an Invalid Date", async () => {
+    const failure = await Effect.runPromise(
+      Effect.flip(signWebhook(event, { secret: "s", clock: () => new Date(Number.NaN) })),
+    );
+
+    expect(failure.reason).toBe("invalid-config");
+  });
+
   it("stamps the time its clock reads when the effect runs, not when it is built", async () => {
     let current = NOW;
     const signing = signWebhook(event, { secret: "s", clock: () => new Date(current) });
@@ -149,13 +164,54 @@ describe("verifyWebhookSignature", () => {
     expect(outcome).toBe("expired");
   });
 
-  it("refuses a body nested too deeply to canonicalise, as a failure rather than a stack overflow", async () => {
+  it("signs and verifies a body nested far deeper than any stack could recurse", async () => {
     let deep: JsonValue = [];
 
     for (let level = 0; level < 100_000; level++) deep = [deep];
+    const header = await sign(deep, { secret: "s" });
 
-    expect(await verifyReason(deep, `t=${NOW}, v1=${"0".repeat(64)}`, { secret: "s", ...clock })).toBe(
-      "unsupported-value",
+    expect(await verifyReason(deep, header, { secret: "s", ...clock })).toBe("ok");
+    expect(await verifyReason(deep, `t=${NOW}, v1=${"0".repeat(64)}`, { secret: "s", ...clock })).toBe("mismatch");
+  });
+
+  it("ignores whitespace around the header and nothing else", async () => {
+    const header = rafikiSign(event, "s", 1, NOW);
+    const config = { secret: "s", ...clock };
+
+    expect(await verifyReason(event, `  ${header}\t\n`, config)).toBe("ok");
+    expect(await verifyReason(event, header.replace("t=", "t= "), config)).toBe("malformed");
+    expect(await verifyReason(event, header.replace(", v1", " ,v1"), config)).toBe("malformed");
+    expect(await verifyReason(event, "   ", config)).toBe("malformed");
+  });
+
+  it("fails closed, with invalid-config, on a replay window or clock that would switch the checks off", async () => {
+    const header = await sign(event, { secret: "s" }, NOW - 1_000_000);
+    const config = { secret: "s", ...clock };
+
+    for (const maxAgeMs of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      expect(await verifyReason(event, header, { ...config, maxAgeMs })).toBe("invalid-config");
+    }
+
+    for (const futureSkewMs of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      expect(await verifyReason(event, header, { ...config, futureSkewMs })).toBe("invalid-config");
+    }
+
+    expect(await verifyReason(event, header, { secret: "s", clock: () => new Date(Number.NaN) })).toBe(
+      "invalid-config",
     );
+    // The documented bounds themselves are fine: a zero window accepts only the current millisecond.
+    expect(
+      await verifyReason(event, await sign(event, { secret: "s" }), { ...config, maxAgeMs: 0, futureSkewMs: 0 }),
+    ).toBe("ok");
+  });
+
+  it("verifies what Rafiki signs for metadata with a toJSON member, which json-canonicalize leaves unsorted", async () => {
+    // SAFETY: deliberately outside JsonValue; metadata is chosen by the sender of the webhook.
+    const metadata = { toJSON: 1, b: 1, a: 2 } as never;
+    const withMetadata = { id: "e2", type: "incoming_payment.created", data: { metadata } };
+    const header = rafikiSign(withMetadata, "s", 1, NOW);
+
+    expect(await verifyReason(withMetadata, header, { secret: "s", version: 1, ...clock })).toBe("ok");
+    expect(await sign(withMetadata, { secret: "s" })).toBe(header);
   });
 });

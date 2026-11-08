@@ -173,24 +173,29 @@ describe("tampered requests are rejected by this library and by @interledger/htt
     ],
   ];
 
-  it.each(tampers)("with %s", async (_name, tamper) => {
-    const request = tamper(await signed());
-
-    const theirs = await reference.validateSignature(publicJwk, request);
-
-    const ours = await Effect.runPromise(
+  /** `"accepted"` or the `reason` this library rejects with, so an unrelated rejection cannot pass for the expected one. */
+  const ourOutcome = (request: Sent): Promise<string> =>
+    Effect.runPromise(
       verifyRequest(
         new Request(request.url, { method: request.method, headers: request.headers, body: request.body }),
-        {
-          resolveKey,
-          clock,
-        },
+        { resolveKey, clock },
       ).pipe(
-        Effect.as(true),
-        Effect.catch(() => Effect.succeed(false)),
+        Effect.as("accepted"),
+        Effect.catch((error) => Effect.succeed(error.reason)),
       ),
     );
 
-    expect([theirs, ours]).toEqual([false, false]);
+  it("accepts the untampered request in both, so the rejections below are caused by the tampering", async () => {
+    const request = await signed();
+
+    expect(await reference.validateSignature(publicJwk, request)).toBe(true);
+    expect(await ourOutcome(request)).toBe("accepted");
+  });
+
+  it.each(tampers)("with %s", async (_name, tamper) => {
+    const request = tamper(await signed());
+
+    expect(await reference.validateSignature(publicJwk, request)).toBe(false);
+    expect(await ourOutcome(request)).toBe("invalid");
   });
 });

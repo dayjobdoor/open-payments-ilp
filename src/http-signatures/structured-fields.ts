@@ -322,19 +322,39 @@ function serializeString(value: string): string {
   return `${out}"`;
 }
 
+/**
+ * RFC 8941 §4.1.5: at most 12 integer digits and three fraction digits, rounded half to even. `toFixed` rounds ties
+ * up, so the exact ties (multiples of 1/16 whose thousandths end in .5) are rounded here.
+ */
+function serializeDecimal(value: number): string {
+  const magnitude = Math.abs(value);
+
+  if (!Number.isFinite(value) || magnitude >= 1e12) fail("decimal out of range");
+  const sixteenths = magnitude * 16;
+  const floor = Math.floor(magnitude * 1000);
+
+  const thousandths =
+    Number.isInteger(sixteenths) && sixteenths % 2 === 1
+      ? floor + (floor % 2)
+      : Number(magnitude.toFixed(3).replace(".", ""));
+
+  // Rounding can carry into a 13th integer digit (999999999999.9996).
+  if (thousandths >= 1e15) fail("decimal out of range");
+  const fraction = String(thousandths % 1000)
+    .padStart(3, "0")
+    .replace(/0+$/, "");
+
+  return `${value < 0 ? "-" : ""}${Math.floor(thousandths / 1000)}.${fraction === "" ? "0" : fraction}`;
+}
+
 function serializeBare(item: SfBareItem): string {
   switch (item.type) {
     case "integer":
       if (!Number.isSafeInteger(item.value) || Math.abs(item.value) > 999_999_999_999_999) fail("integer out of range");
 
       return String(item.value);
-    case "decimal": {
-      const text = item.value.toFixed(3).replace(/0+$/, "");
-
-      if (Math.abs(item.value) >= 1e12) fail("decimal out of range");
-
-      return text.endsWith(".") ? `${text}0` : text;
-    }
+    case "decimal":
+      return serializeDecimal(item.value);
 
     case "string":
       return serializeString(item.value);
@@ -351,9 +371,13 @@ function serializeBare(item: SfBareItem): string {
 
 function serializeParams(params: SfParams): string {
   let out = "";
+  const seen = new Set<string>();
 
   for (const [key, value] of params) {
     if (!/^[a-z*][a-z0-9_\-.*]*$/.test(key)) fail(`invalid parameter key "${key}"`);
+
+    if (seen.has(key)) fail(`duplicate parameter "${key}"`);
+    seen.add(key);
     out += value.type === "boolean" && value.value ? `;${key}` : `;${key}=${serializeBare(value)}`;
   }
 
@@ -367,7 +391,9 @@ function serializeItemUnchecked(item: SfItem): string {
 /**
  * RFC 8941 item serialization.
  *
- * Fails with `HttpSignatureError` (`malformed`) when a value cannot be represented (e.g. non-ASCII string).
+ * Fails with `HttpSignatureError` (`malformed`) when a value cannot be represented: a non-ASCII string, a NaN,
+ * infinite or out-of-range number (more than 12 integer digits for a decimal, counted after rounding to three
+ * fraction digits half to even), an invalid token or key, or a parameter given twice.
  *
  * @see https://www.rfc-editor.org/rfc/rfc8941#section-4.1.3
  */

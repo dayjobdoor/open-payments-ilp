@@ -8,7 +8,8 @@ export type HttpSignatureErrorReason =
   | "invalid"
   | "digest-mismatch"
   | "expired"
-  | "unsupported";
+  | "unsupported"
+  | "invalid-config";
 
 interface HttpSignatureErrorFields {
   readonly reason: HttpSignatureErrorReason;
@@ -26,12 +27,17 @@ const Base: new (fields: HttpSignatureErrorFields) => YieldableError & {
  *
  * `reason` discriminates the failure:
  * - `missing`: a required header, signature member or covered header field is absent
- * - `malformed`: unparsable structured field, invalid component or parameter, unusable JWK
+ * - `malformed`: unparsable structured field, invalid component or parameter, unusable JWK (not Ed25519, `d` not
+ *   matching `x`, or `x` a point of small order), a body that cannot be read or is longer than `maxBodyBytes`
  * - `unknown-key`: the `keyid` could not be resolved to a key
- * - `invalid`: signature does not verify, required component not covered, or created time is in the future
- * - `digest-mismatch`: `Content-Digest` is absent/uncovered/wrong for the body
+ * - `invalid`: signature does not verify, required component not covered, an `alg` parameter refused under
+ *   `forbidAlg`, or created time is in the future
+ * - `digest-mismatch`: the `Content-Digest` does not match the body, or a non-empty body is not covered by
+ *   `content-digest` (an absent header is `missing`)
  * - `expired`: `created` is older than the allowed age, or `expires` has passed
  * - `unsupported`: valid syntax that this implementation does not handle (algorithm, component parameters)
+ * - `invalid-config`: the verifier's own options are unusable (`maxAgeSeconds` or `maxBodyBytes` not a finite number
+ *   of at least 0) or its clock returned an Invalid Date; not the request's fault
  *
  * `cause`, when set, is what actually went wrong underneath (for `unknown-key` from the default key fetch: the
  * timeout, status, size or JWKS error). It never reaches a client; log it from a `resolveClientKeys` wrapper.
