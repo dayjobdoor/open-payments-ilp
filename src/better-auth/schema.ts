@@ -2,7 +2,7 @@ import type { BetterAuthPlugin } from "better-auth/types";
 
 /**
  * The three tables the plugin adds to the Better Auth schema (run the Better Auth migration after adding it):
- * `gnapGrant`, with the interaction inline, `gnapAccessToken` and `gnapNonce` (replay guard for signature nonces; delete rows past `expiresAt` whenever convenient). Timestamps are `date` columns; the store
+ * `gnapGrant`, with the interaction inline, `gnapAccessToken` and `gnapNonce` (replay guard for signature nonces; the store deletes expired rows itself, at most once a minute per process). Timestamps are `date` columns; the store
  * converts them to the epoch milliseconds of `GnapStore`.
  *
  * Indexes the server relies on: `gnapGrant.continueId` and `gnapGrant.interactId` (unique, the latter nullable),
@@ -31,7 +31,9 @@ export const gnapSchema: NonNullable<BetterAuthPlugin["schema"]> = {
         type: "string",
         required: false,
         index: true,
-        references: { model: "user", field: "id", onDelete: "set null" },
+        // A grant is the authority of the user who approved it: when the user goes, the grant and (through
+        // `gnapAccessToken.grantId`) its tokens go with them, rather than staying valid with no owner.
+        references: { model: "user", field: "id", onDelete: "cascade" },
       },
       continueId: { type: "string", required: true, unique: true },
       continueTokenHash: { type: "string", required: true },

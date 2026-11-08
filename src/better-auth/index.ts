@@ -33,11 +33,11 @@ import {
 } from "../gnap/server/index";
 import * as schemas from "../open-payments/schemas";
 import { GNAP_ERROR_CODES, gnapSchema } from "./schema";
-import { betterAuthGnapStore, type GnapDb } from "./store";
+import { betterAuthGnapStore, revokeUserGrants, type GnapDb } from "./store";
 
 export { GNAP_ERROR_CODES, gnapSchema } from "./schema";
 
-export { betterAuthGnapStore, type GnapDb } from "./store";
+export { betterAuthGnapStore, revokeUserGrants, type GnapDb } from "./store";
 
 export type { GnapRouteError, InteractionDetails } from "../gnap/server/index";
 
@@ -230,6 +230,20 @@ export function gnap(options: GnapOptions = {}): GnapPlugin {
   return {
     id: "gnap",
     schema: gnapSchema,
+    // Deleting a user ends what the user authorised, whether or not the database cascades the foreign key.
+    init: (context) => ({
+      options: {
+        databaseHooks: {
+          user: {
+            delete: {
+              before: async (user) => {
+                await revokeUserGrants(context.adapter, user.id, (options.clock?.() ?? new Date()).getTime());
+              },
+            },
+          },
+        },
+      },
+    }),
     endpoints: {
       gnapGrantRequest: route(options.tenants === undefined ? "/gnap" : "/gnap/:tenantId", "POST"),
       gnapContinueGrant: route("/gnap/continue/:id", "POST"),

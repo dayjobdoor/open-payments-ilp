@@ -11,6 +11,7 @@ import { afterAll, describe, expect, it } from "vite-plus/test";
 import { gnap } from "../../src/better-auth/index";
 import { betterAuthGnapStore } from "../../src/better-auth/store";
 import { storeContract } from "../../src/gnap/server/testing/index";
+import { seedApprovedGrant } from "./seed";
 
 const url = process.env["GNAP_TEST_POSTGRES_URL"];
 const pools: Pool[] = [];
@@ -87,6 +88,26 @@ if (url === undefined) {
       });
 
       expect(outcome).toEqual([true, false, true]);
+    });
+  });
+
+  describe("deleting a user on PostgreSQL", () => {
+    it("takes the grants and tokens the user authorised along", async () => {
+      const { auth } = await freshAuth(url);
+      const context = await auth.$context;
+      const store = betterAuthGnapStore(context.adapter);
+      const now = new Date();
+
+      await context.adapter.create({
+        model: "user",
+        data: { id: "owner", name: "O", email: "o@example.com", emailVerified: true, createdAt: now, updatedAt: now },
+        forceAllowId: true,
+      });
+      await seedApprovedGrant(store, "owner");
+
+      await context.internalAdapter.deleteUser("owner");
+
+      expect(await Effect.runPromise(store.findTokenWithGrant("valueHash", "v1"))).toBeNull();
     });
   });
 }

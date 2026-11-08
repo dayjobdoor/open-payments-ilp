@@ -39,8 +39,12 @@ const fromRow = (row: Row, dates: ReadonlyArray<string>): Row =>
 
 const equals = (field: string, value: string | number | null): Where => ({ field, value });
 
-/** The part of Better Auth's `DBAdapter` (or its transaction adapter) the store uses. */
-export type GnapDb = Pick<DBTransactionAdapter, "create" | "findOne" | "incrementOne" | "updateMany">;
+/**
+ * The part of Better Auth's `DBAdapter` (or its transaction adapter) the store uses. `deleteMany` is optional: without
+ * it expired nonces are not deleted.
+ */
+export type GnapDb = Pick<DBTransactionAdapter, "create" | "findOne" | "incrementOne" | "updateMany"> &
+  Partial<Pick<DBTransactionAdapter, "deleteMany">>;
 
 /**
  * A {@link GnapStore} on Better Auth's database adapter: the `gnapGrant`, `gnapAccessToken` and `gnapNonce` tables of
@@ -56,6 +60,33 @@ export const betterAuthGnapStore = (db: GnapDb): GnapStore => {
       // `gnapSchema` declares; the adapter hands back JSON columns parsed.
       return row === null ? null : (fromRow(row, dates) as R);
     });
+
+  const claim = async (key: string, expiresAt: number, now: number): Promise<boolean> => {
+    const find = () => db.findOne<Row>({ model: "gnapNonce", where: [equals("key", key)] });
+
+    if ((await find()) === null) {
+      try {
+        await db.create({ model: "gnapNonce", data: { key, expiresAt: new Date(expiresAt) } });
+
+        return true;
+      } catch (error) {
+        // The unique `key` column makes the loser of a concurrent claim fail here (a replay); any other failure
+        // (the database is down) is not a replay and must not look like one.
+        if ((await find()) === null) throw error;
+
+        return false;
+      }
+    }
+
+    // An expired claim is taken over by one conditional update: only one concurrent caller changes the row.
+    return (
+      (await db.updateMany({
+        model: "gnapNonce",
+        where: [equals("key", key), { field: "expiresAt", value: new Date(now), operator: "lte" }],
+        update: { expiresAt: new Date(expiresAt) },
+      })) > 0
+    );
+  };
 
   return {
     // The grant table has the `interactBinding` column of `gnapSchema`.
@@ -96,30 +127,52 @@ export const betterAuthGnapStore = (db: GnapDb): GnapStore => {
       ),
     claimNonce: (key, expiresAt, now) =>
       Effect.promise(async () => {
-        const find = () => db.findOne<Row>({ model: "gnapNonce", where: [equals("key", key)] });
+        const claimed = await claim(key, expiresAt, now);
 
-        if ((await find()) === null) {
-          try {
-            await db.create({ model: "gnapNonce", data: { key, expiresAt: new Date(expiresAt) } });
+        if (claimed) await sweepExpiredNonces(db, now);
 
-            return true;
-          } catch (error) {
-            // The unique `key` column makes the loser of a concurrent claim fail here (a replay); any other failure
-            // (the database is down) is not a replay and must not look like one.
-            if ((await find()) === null) throw error;
-
-            return false;
-          }
-        }
-
-        // An expired claim is taken over by one conditional update: only one concurrent caller changes the row.
-        return (
-          (await db.updateMany({
-            model: "gnapNonce",
-            where: [equals("key", key), { field: "expiresAt", value: new Date(now), operator: "lte" }],
-            update: { expiresAt: new Date(expiresAt) },
-          })) > 0
-        );
+        return claimed;
       }),
   };
+};
+
+/** Housekeeping at most once a minute per process: claims whose `expiresAt` passed can never block anything again. */
+const SWEEP_EVERY_MS = 60_000;
+
+let lastSweepAt = 0;
+
+const sweepExpiredNonces = async (db: GnapDb, now: number): Promise<void> => {
+  if (now >= lastSweepAt && now - lastSweepAt < SWEEP_EVERY_MS) return;
+  lastSweepAt = now;
+
+  // Best effort: a failed cleanup must not turn a claim that succeeded into an error.
+  await Promise.resolve(
+    db.deleteMany?.({ model: "gnapNonce", where: [{ field: "expiresAt", value: new Date(now), operator: "lt" }] }),
+  ).catch(() => 0);
+};
+
+/**
+ * Revokes every grant `userId` approved and their live tokens, in statements that need no foreign key: the deletion of
+ * a user must end what the user authorised on adapters that do not cascade (the memory adapter, MongoDB).
+ */
+export const revokeUserGrants = async (
+  db: Pick<DBTransactionAdapter, "findMany" | "updateMany">,
+  userId: string,
+  now: number,
+): Promise<void> => {
+  const grants = await db.findMany<{ id: string }>({ model: "gnapGrant", where: [equals("userId", userId)] });
+
+  for (const { id } of grants) {
+    await db.updateMany({
+      model: "gnapAccessToken",
+      where: [equals("grantId", id), equals("revokedAt", null)],
+      update: { revokedAt: new Date(now) },
+    });
+  }
+
+  await db.updateMany({
+    model: "gnapGrant",
+    where: [equals("userId", userId)],
+    update: { state: "REVOKED", updatedAt: new Date(now) },
+  });
 };
