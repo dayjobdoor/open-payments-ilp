@@ -79,6 +79,46 @@
       "types": "./dist/hono/index.d.ts",
       "default": "./dist/hono/index.js"
     },
+    "./plain/ilp": {
+      "types": "./dist/plain/ilp.d.ts",
+      "default": "./dist/plain/ilp.js"
+    },
+    "./plain/ildcp": {
+      "types": "./dist/plain/ildcp.d.ts",
+      "default": "./dist/plain/ildcp.js"
+    },
+    "./plain/http-signatures": {
+      "types": "./dist/plain/http-signatures.d.ts",
+      "default": "./dist/plain/http-signatures.js"
+    },
+    "./plain/open-payments": {
+      "types": "./dist/plain/open-payments.d.ts",
+      "default": "./dist/plain/open-payments.js"
+    },
+    "./plain/stream": {
+      "types": "./dist/plain/stream.d.ts",
+      "default": "./dist/plain/stream.js"
+    },
+    "./plain/webhooks": {
+      "types": "./dist/plain/webhooks.d.ts",
+      "default": "./dist/plain/webhooks.js"
+    },
+    "./plain/gnap": {
+      "types": "./dist/plain/gnap.d.ts",
+      "default": "./dist/plain/gnap.js"
+    },
+    "./plain/gnap/server": {
+      "types": "./dist/plain/gnap/server.d.ts",
+      "default": "./dist/plain/gnap/server.js"
+    },
+    "./plain/gnap/server/testing": {
+      "types": "./dist/plain/gnap/server/testing.d.ts",
+      "default": "./dist/plain/gnap/server/testing.js"
+    },
+    "./plain/better-auth": {
+      "types": "./dist/plain/better-auth.d.ts",
+      "default": "./dist/plain/better-auth.js"
+    },
     "./package.json": "./package.json"
   },
   "publishConfig": {

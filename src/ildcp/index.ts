@@ -2,10 +2,10 @@
  * Interledger Dynamic Configuration Protocol (IL-DCP): a node asks its upstream peer for its ILP address,
  * asset code and asset scale by sending a zero-amount Prepare to `peer.config`.
  *
- * @see https://interledger.org/developers/rfcs/ilp-over-http/
  * @see https://interledger.org/developers/rfcs/dynamic-configuration-protocol/
  * @module
  */
+import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 import { IlpErrorCode } from "../ilp/codes";
 import { codecFail, IlpCodecError } from "../ilp/errors";
@@ -14,6 +14,8 @@ import { isValidIlpAddress } from "../ilp/address";
 import {
   deserializeFulfill,
   deserializePrepare,
+  deserializeReply,
+  isReject,
   serializeFulfill,
   serializePrepare,
   type IlpReply,
@@ -116,7 +118,8 @@ export function deserializeIldcpResponse(bytes: Uint8Array): Result.Result<Ildcp
 
 /**
  * Answers an IL-DCP request. Never fails: an invalid, foreign or expired request yields an `F00` Reject
- * triggered by `serverAddress`, a valid one yields the Fulfill carrying `response`.
+ * triggered by `serverAddress`, a valid one yields the Fulfill carrying `response`. A `response` that cannot be
+ * encoded (an invalid address or an out-of-range scale: server misconfiguration) yields the same `F00` Reject.
  *
  * `now` is explicit; the request is expired when `now` is later than its `expiresAt`.
  */
@@ -143,6 +146,47 @@ export function serveIldcp(options: {
   if (Result.isFailure(data)) return reject(data.failure.message);
 
   return { fulfillment: new Uint8Array(FULFILLMENT_LENGTH), data: data.success };
+}
+
+/** Default lifetime of the request {@link fetchIldcp} sends, in milliseconds. */
+const DEFAULT_REQUEST_TTL_MS = 30_000;
+
+/**
+ * Asks the upstream connector for this node's ILP address and asset: sends an IL-DCP request through `sendData`
+ * and decodes the reply.
+ *
+ * `sendData` carries one serialized Prepare to the connector and succeeds with the serialized reply; its own
+ * failures `E` pass through. Options: `clock` supplies "now" (default `new Date()`), `ttlMs` is how long the
+ * request stays valid, in milliseconds (default 30000).
+ *
+ * Fails with `IlpCodecError` when the reply cannot be decoded or is not an IL-DCP response. A connector Reject
+ * (reason `invalid-type`) names the Reject's `code` and `message`, e.g. `F00: ...`.
+ */
+export function fetchIldcp<E = never>(
+  sendData: (prepare: Uint8Array<ArrayBuffer>) => Effect.Effect<Uint8Array, E>,
+  options: { readonly clock?: () => Date; readonly ttlMs?: number } = {},
+): Effect.Effect<IldcpResponse, IlpCodecError | E> {
+  return Effect.gen(function* () {
+    const now = (options.clock ?? (() => new Date()))();
+    const prepare = yield* Effect.fromResult(
+      serializeIldcpRequest({
+        expiresAt: new Date(now.getTime() + (options.ttlMs ?? DEFAULT_REQUEST_TTL_MS)),
+      }),
+    );
+    const reply = yield* sendData(prepare);
+    const decoded = yield* Effect.fromResult(deserializeReply(reply));
+
+    if (isReject(decoded)) {
+      return yield* Effect.fail(
+        new IlpCodecError({
+          reason: "invalid-type",
+          message: `IL-DCP request rejected: ${decoded.code} ${decoded.message}`,
+        }),
+      );
+    }
+
+    return yield* Effect.fromResult(deserializeIldcpResponse(reply));
+  });
 }
 
 function encodeResponseData(response: IldcpResponse): Result.Result<Uint8Array<ArrayBuffer>, IlpCodecError> {

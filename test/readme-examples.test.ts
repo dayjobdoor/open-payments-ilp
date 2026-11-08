@@ -38,6 +38,8 @@ import { deserializePrepare, deserializeReply, postPrepare, serializePrepare, se
 import { addAmounts, createUnauthenticatedClient, parseAmountValue } from "../src/open-payments/index";
 import { buildStreamPrepare, createStreamReply, generateStreamCredentials } from "../src/stream/index";
 import { signWebhook, verifyWebhookSignature } from "../src/webhooks/index";
+import { deserializeIlpPrepare, serializeIlpPrepare } from "../src/plain/ilp";
+import { createAuthenticatedClient } from "../src/plain/open-payments";
 import { encodeBase64 } from "../src/internal/bytes";
 
 /** An Ed25519 key in the two formats the hono examples use as `privateKeyPem` and `privateJwk`. */
@@ -297,6 +299,7 @@ describe("README examples", () => {
       "*",
       initGnapAuthMiddleware({
         secret: "a-session-secret-of-at-least-32-characters",
+        externalUrl: "https://app.example",
         grantEndpoint: "https://auth.wallet.example",
         access: [{ type: "incoming-payment", actions: ["create", "read"] }],
         client: "https://wallet.example/alice",
@@ -332,6 +335,7 @@ describe("README examples", () => {
       "*",
       initGnapAuthMiddleware({
         secret: "a-session-secret-of-at-least-32-characters",
+        externalUrl: "https://app.example",
         grantEndpoint: "https://as.example/gnap",
         access: [{ type: "outgoing-payment", actions: ["read"], identifier: "https://wallet.example/alice" }],
         keyId: "my-key-1",
@@ -427,6 +431,52 @@ describe("README is in sync with this file", () => {
     expect([asDocumented, asDeclared]).toHaveLength(2);
   });
 
+  it("plain", async () => {
+    const wire = serializeIlpPrepare({
+      amount: 100n,
+      expiresAt: new Date("2030-01-01T00:00:00.000Z"),
+      executionCondition: new Uint8Array(32),
+      destination: "g.alice",
+      data: new Uint8Array(0),
+    });
+    const prepare = deserializeIlpPrepare(wire); // throws IlpCodecError on malformed bytes
+
+    expect(prepare).toMatchObject({ amount: 100n, destination: "g.alice" });
+
+    const { privateKey } = await Effect.runPromise(generateEd25519KeyPair());
+    const accessToken = "TOKEN-123";
+    const original = globalThis.fetch;
+
+    globalThis.fetch = async () =>
+      Response.json(
+        {
+          id: "https://wallet.example/rs/incoming-payments/1",
+          walletAddress: "https://wallet.example/alice",
+          completed: false,
+          receivedAmount: { value: "0", assetCode: "USD", assetScale: 2 },
+          createdAt: "2022-03-12T23:20:50.52Z",
+          methods: [],
+        },
+        { status: 201 },
+      );
+
+    try {
+      const client = await createAuthenticatedClient({
+        walletAddressUrl: "https://wallet.example/alice",
+        keyId: "my-key",
+        privateKey, // CryptoKey, private JWK or PKCS#8 PEM string
+      });
+      const incomingPayment = await client.incomingPayment.create(
+        { url: "https://wallet.example/rs", accessToken },
+        { walletAddress: "https://wallet.example/alice" },
+      );
+
+      expect(incomingPayment.completed).toBe(false);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
   it("has ts blocks", () => {
     expect(blocks.length).toBeGreaterThan(0);
   });
@@ -450,6 +500,11 @@ describe("README is in sync with this file", () => {
       const local = specifier
         .replace(/^vitest$/, "vite-plus/test")
         .replace(/^open-payments-ilp\/better-auth\/client$/, "../src/better-auth/client")
+        .replace(
+          /^open-payments-ilp\/plain\/(.+)$/,
+          (_, entry: string) =>
+            `../src/plain/${entry.replace(/^gnap\/server(\/testing)?$/, (_m, testing?: string) => `gnap-server${testing ? "-testing" : ""}`)}`,
+        )
         .replace(/^open-payments-ilp\/(.+)$/, "../src/$1/index");
 
       if (specifier.startsWith("open-payments-ilp/")) {

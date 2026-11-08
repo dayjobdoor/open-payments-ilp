@@ -1,11 +1,13 @@
 import * as IlpPacket from "ilp-packet";
 import * as Reference from "ilp-protocol-ildcp";
+import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 import { describe, expect, it } from "vite-plus/test";
 import { deserializeFulfill, IlpErrorCode, isFulfill, isReject, serializeFulfill, serializeReply } from "../../src/ilp";
 import {
   deserializeIldcpRequest,
   deserializeIldcpResponse,
+  fetchIldcp,
   ILDCP_DESTINATION,
   serializeIldcpRequest,
   serializeIldcpResponse,
@@ -194,5 +196,103 @@ describe("serveIldcp", () => {
 
     expect(isReject(reply) && reply.code).toBe("F00");
     expect(Result.isSuccess(serializeReply(reply))).toBe(true);
+  });
+});
+
+describe("fetchIldcp", () => {
+  const response: IldcpResponse = { clientAddress: "g.hub.alice", assetScale: 6, assetCode: "USD" };
+  const serverAddress = "g.hub";
+  const clock = (): Date => NOW;
+  const run = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(Effect.result(effect));
+
+  it("sends an IL-DCP request valid for 30 s by default and decodes the response", async () => {
+    let sent: Uint8Array | undefined;
+
+    const result = await run(
+      fetchIldcp(
+        (prepare) => {
+          sent = prepare;
+          const reply = serveIldcp({ requestPacket: prepare, serverAddress, response, now: NOW });
+
+          return Effect.succeed(Result.getOrThrow(serializeReply(reply)));
+        },
+        { clock },
+      ),
+    );
+
+    expect(result).toEqual(Result.succeed(response));
+    expect(Result.getOrThrow(deserializeIldcpRequest(sent!)).expiresAt).toEqual(new Date(NOW.getTime() + 30_000));
+  });
+
+  it("honours ttlMs and reads the clock once per call", async () => {
+    let sent: Uint8Array | undefined;
+
+    await run(
+      fetchIldcp(
+        (prepare) => {
+          sent = prepare;
+
+          return Effect.succeed(
+            Result.getOrThrow(serializeFulfill({ fulfillment: new Uint8Array(32), data: new Uint8Array(0) })),
+          );
+        },
+        { clock, ttlMs: 1_500 },
+      ),
+    );
+
+    expect(Result.getOrThrow(deserializeIldcpRequest(sent!)).expiresAt).toEqual(new Date(NOW.getTime() + 1_500));
+  });
+
+  it("fails with IlpCodecError naming the Reject's code and message when the connector rejects", async () => {
+    const reject = Result.getOrThrow(
+      serializeReply({
+        code: "F00",
+        triggeredBy: serverAddress,
+        message: "no config for you",
+        data: new Uint8Array(0),
+      }),
+    );
+
+    const result = await run(fetchIldcp(() => Effect.succeed(reject), { clock }));
+
+    expect(Result.isFailure(result)).toBe(true);
+    expect(result).toMatchObject({
+      failure: {
+        _tag: "IlpCodecError",
+        reason: "invalid-type",
+        message: expect.stringContaining("F00"),
+      },
+    });
+    expect(Result.isFailure(result) && result.failure.message).toContain("no config for you");
+  });
+
+  it("fails with IlpCodecError for a garbage reply and for a Fulfill that is not an IL-DCP response", async () => {
+    for (const garbage of [Uint8Array.of(9, 9), Uint8Array.of()]) {
+      const result = await run(fetchIldcp(() => Effect.succeed(garbage), { clock }));
+
+      expect(result).toMatchObject({ failure: { _tag: "IlpCodecError" } });
+    }
+
+    const notIldcp = Result.getOrThrow(
+      serializeFulfill({ fulfillment: new Uint8Array(32).fill(1), data: new Uint8Array(0) }),
+    );
+
+    expect(await run(fetchIldcp(() => Effect.succeed(notIldcp), { clock }))).toMatchObject({
+      failure: { _tag: "IlpCodecError", reason: "invalid-field" },
+    });
+  });
+
+  it("passes the failure of sendData through", async () => {
+    const result = await run(fetchIldcp(() => Effect.fail("link down" as const), { clock }));
+
+    expect(result).toEqual(Result.fail("link down"));
+  });
+
+  it("fails with IlpCodecError when ttlMs makes the expiry unrepresentable", async () => {
+    const result = await run(
+      fetchIldcp(() => Effect.succeed(Uint8Array.of()), { clock, ttlMs: Number.POSITIVE_INFINITY }),
+    );
+
+    expect(result).toMatchObject({ failure: { _tag: "IlpCodecError" } });
   });
 });
