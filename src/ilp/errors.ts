@@ -5,7 +5,7 @@ import * as Data from "effect/Data";
 export type IlpCodecErrorReason =
   /** Input ended before a complete value could be read. */
   | "truncated"
-  /** A length prefix used more bytes than needed. */
+  /** A length prefix used more bytes than needed (or the empty form `0x80`). */
   | "non-canonical"
   /** A number does not fit its OER type (e.g. uint64) or a length exceeds a protocol limit. */
   | "out-of-range"

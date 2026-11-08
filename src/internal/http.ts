@@ -73,10 +73,15 @@ export const bufferResponse = async (
   }
 
   const bodyless = response.status === 204 || response.status === 205 || response.status === 304;
+  const headers = new Headers(response.headers);
+
+  // `bytes` are already decoded: the announced length and encoding no longer describe them.
+  headers.delete("content-length");
+  headers.delete("content-encoding");
 
   return new Response(bodyless ? null : bytes, {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers,
+    headers,
   });
 };

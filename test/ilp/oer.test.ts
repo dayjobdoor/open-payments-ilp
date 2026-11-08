@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Result from "effect/Result";
-import { OerReader, OerWriter, readOer, writeOer } from "../../src/ilp";
+import { IlpCodecError, OerReader, OerWriter, readOer, writeOer } from "../../src/ilp";
+import { utf8String } from "../../src/ilp/oer";
+import { reasonOf } from "../support/result";
 
 function hex(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("hex");
@@ -19,20 +21,40 @@ describe("OER length determinants", () => {
     [256, "820100"],
     [65535, "82ffff"],
     [65536, "83010000"],
+    [0xff_ffff, "83ffffff"],
+    [0x100_0000, "8401000000"],
+    [0xffff_ffff, "84ffffffff"],
   ])("writes length %i as %s and reads it back", (length, encoded) => {
     expect(written((w) => w.writeLengthPrefix(length))).toBe(encoded);
     expect(Result.getOrThrow(readOer(Buffer.from(encoded, "hex"), (r) => r.readLengthPrefix()))).toBe(length);
   });
 
   it.each([
-    ["a zero-byte prefix", "80"],
-    ["a long form for a short length", "817f"],
-    ["a leading zero byte", "820080"],
-    ["a prefix wider than 4 bytes", "850000000000"],
-  ])("rejects %s", (_name, encoded) => {
+    ["a zero-byte prefix", "80", "non-canonical"],
+    ["a long form for a short length", "817f", "non-canonical"],
+    ["a leading zero byte", "820080", "non-canonical"],
+    ["a 3-byte form for a 2-byte length", "8300ffff", "non-canonical"],
+    ["a 3-byte form for a 1-byte length", "83000001", "non-canonical"],
+    ["a 4-byte form for a 3-byte length", "8400ffffff", "non-canonical"],
+    ["a 4-byte form for a 2-byte length", "840000ffff", "non-canonical"],
+    ["a prefix wider than 4 bytes", "850000000000", "out-of-range"],
+    ["a prefix of 127 bytes", "ff", "out-of-range"],
+    ["no input at all", "", "truncated"],
+    ["a prefix cut short", "82ff", "truncated"],
+  ])("rejects %s", (_name, encoded, reason) => {
     const result = readOer(Buffer.from(encoded, "hex"), (r) => r.readLengthPrefix());
 
-    expect(Result.isFailure(result)).toBe(true);
+    expect(reasonOf(result)).toBe(reason);
+  });
+
+  it("reads a 4-byte length without allocating it: a huge announced length is just truncated", () => {
+    const result = readOer(Buffer.from("84ffffffff01", "hex"), (r) => r.readVarOctetString());
+
+    expect(reasonOf(result)).toBe("truncated");
+  });
+
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 32])("refuses to write the length %s", (length) => {
+    expect(reasonOf(writeOer((w) => w.writeLengthPrefix(length)))).toBe("out-of-range");
   });
 });
 
@@ -50,16 +72,23 @@ describe("VarUInt", () => {
   });
 
   it("rejects values outside uint64 on write", () => {
-    expect(Result.isFailure(writeOer((w) => w.writeVarUInt(1n << 64n)))).toBe(true);
-    expect(Result.isFailure(writeOer((w) => w.writeVarUInt(-1n)))).toBe(true);
+    expect(reasonOf(writeOer((w) => w.writeVarUInt(1n << 64n)))).toBe("out-of-range");
+    expect(reasonOf(writeOer((w) => w.writeVarUInt(-1n)))).toBe("out-of-range");
   });
 
   it("rejects a zero-length and a nine-byte VarUInt on read, but saturates when asked", () => {
     const nine = Buffer.from("09010000000000000000", "hex");
 
-    expect(Result.isFailure(readOer(Buffer.from("00", "hex"), (r) => r.readVarUInt()))).toBe(true);
-    expect(Result.isFailure(readOer(nine, (r) => r.readVarUInt()))).toBe(true);
+    expect(reasonOf(readOer(Buffer.from("00", "hex"), (r) => r.readVarUInt()))).toBe("invalid-field");
+    expect(reasonOf(readOer(Buffer.from("00", "hex"), (r) => r.readVarUIntSaturating()))).toBe("invalid-field");
+    expect(reasonOf(readOer(nine, (r) => r.readVarUInt()))).toBe("out-of-range");
     expect(Result.getOrThrow(readOer(nine, (r) => r.readVarUIntSaturating()))).toBe((1n << 64n) - 1n);
+  });
+
+  it("saturates on the encoded width, not the value: nine zero bytes are 2^64-1 too", () => {
+    const zeros = Buffer.from("0900000000000000000000", "hex");
+
+    expect(Result.getOrThrow(readOer(zeros, (r) => r.readVarUIntSaturating()))).toBe((1n << 64n) - 1n);
   });
 
   it("tolerates leading zero bytes like ilp-packet does", () => {
@@ -105,6 +134,94 @@ describe("fixed integers", () => {
   });
 });
 
+describe("OerReader.readOctets", () => {
+  it("reads exactly the requested number of octets and advances", () => {
+    const result = readOer(Uint8Array.of(1, 2, 3, 4), (r) => ({
+      none: r.readOctets(0),
+      two: r.readOctets(2),
+      offset: r.offset,
+      remaining: r.remaining,
+    }));
+
+    expect(Result.getOrThrow(result)).toEqual({
+      none: new Uint8Array(),
+      two: Uint8Array.of(1, 2),
+      offset: 2,
+      remaining: 2,
+    });
+  });
+
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "refuses the length %s as out-of-range and leaves the cursor where it was",
+    (length) => {
+      const reader = new OerReader(Uint8Array.of(1, 2, 3));
+      reader.readUInt8();
+      let thrown: unknown;
+
+      try {
+        reader.readOctets(length);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(IlpCodecError);
+      expect(thrown).toMatchObject({ reason: "out-of-range" });
+      expect(reader.offset).toBe(1);
+      expect(reader.remaining).toBe(2);
+      expect(reader.readUInt8()).toBe(2);
+    },
+  );
+
+  it("reports a length beyond the input as truncated", () => {
+    expect(reasonOf(readOer(Uint8Array.of(1, 2, 3), (r) => r.readOctets(4)))).toBe("truncated");
+  });
+});
+
+describe("readOer and writeOer", () => {
+  it("rethrow anything that is not an IlpCodecError instead of hiding a defect", () => {
+    const boom = new RangeError("boom");
+
+    expect(() =>
+      readOer(Uint8Array.of(1), () => {
+        throw boom;
+      }),
+    ).toThrow(boom);
+
+    expect(() =>
+      writeOer(() => {
+        throw boom;
+      }),
+    ).toThrow(boom);
+  });
+
+  it("turn a thrown IlpCodecError into a failure carrying the same error", () => {
+    const error = new IlpCodecError({ reason: "invalid-field", message: "nope" });
+
+    const read = readOer(Uint8Array.of(1), () => {
+      throw error;
+    });
+
+    expect(Result.isFailure(read) && read.failure).toBe(error);
+  });
+});
+
+describe("UTF-8 strings", () => {
+  const encoder = new TextEncoder();
+
+  it("keeps a leading byte-order mark, so decoding then encoding is the identity", () => {
+    const bytes = Uint8Array.of(0xef, 0xbb, 0xbf, 0x41);
+
+    expect(utf8String(bytes, "text")).toBe("\ufeffA");
+    expect(encoder.encode(utf8String(bytes, "text"))).toEqual(bytes);
+  });
+
+  it("reports malformed UTF-8 as an invalid-field codec error, not a TypeError", () => {
+    expect(() => utf8String(Uint8Array.of(0xc3, 0x28), "text")).toThrow(
+      expect.objectContaining({ _tag: "IlpCodecError", reason: "invalid-field", message: "text is not valid UTF-8" }),
+    );
+  });
+});
+
 describe("VarOctetString", () => {
   it.each([0, 1, 127, 128, 255, 256, 70_000])("round-trips %i bytes", (length) => {
     const payload = Uint8Array.from({ length }, (_, i) => i & 0xff);
@@ -146,21 +263,35 @@ describe("ILP timestamp (YYYYMMDDhhmmssfff)", () => {
   });
 
   it.each([
-    "2026101113050900",
-    "2026-10-11T13:05:09",
-    "20261301000000000",
-    "20260230000000000",
-    "20261011240000000",
-    "20261011126000000",
-    "20261011120060000",
-    "abcdefghijklmnopq",
-  ])("rejects %s", (text) => {
-    expect(Result.isFailure(read(text))).toBe(true);
+    ["2026101113050900", "truncated"],
+    ["2026-10-11T13:05:09", "invalid-timestamp"],
+    ["20261301000000000", "invalid-timestamp"],
+    ["20260230000000000", "invalid-timestamp"],
+    ["20261011240000000", "invalid-timestamp"],
+    ["20261011126000000", "invalid-timestamp"],
+    ["20261011120060000", "invalid-timestamp"],
+    ["abcdefghijklmnopq", "invalid-timestamp"],
+  ])("rejects %s as %s", (text, reason) => {
+    expect(reasonOf(read(text))).toBe(reason);
   });
 
-  it("refuses to write an invalid date or a year beyond four digits", () => {
-    expect(Result.isFailure(writeOer((w) => w.writeTimestamp(new Date(Number.NaN))))).toBe(true);
-    expect(Result.isFailure(writeOer((w) => w.writeTimestamp(new Date(Date.UTC(10_000, 0, 1)))))).toBe(true);
+  it("refuses to write an invalid date or a year outside 0000–9999, all as invalid-timestamp", () => {
+    const years = [
+      new Date(Number.NaN),
+      new Date(Date.UTC(10_000, 0, 1)),
+      new Date(Date.UTC(9999, 11, 31, 23, 59, 59, 999) + 1),
+      new Date(-62_167_219_200_001),
+    ];
+
+    for (const date of years) expect(reasonOf(writeOer((w) => w.writeTimestamp(date)))).toBe("invalid-timestamp");
+  });
+
+  it("writes the first and last representable instants", () => {
+    const first = Result.getOrThrow(writeOer((w) => w.writeTimestamp(new Date(-62_167_219_200_000))));
+    const last = Result.getOrThrow(writeOer((w) => w.writeTimestamp(new Date(253_402_300_799_999))));
+
+    expect(Buffer.from(first).toString("ascii")).toBe("00000101000000000");
+    expect(Buffer.from(last).toString("ascii")).toBe("99991231235959999");
   });
 });
 
@@ -239,7 +370,7 @@ describe("nested VarOctetStrings", () => {
   });
 
   it("readNested fails on truncation and the nested reader cannot read past its contents", () => {
-    expect(Result.isFailure(readOer(Buffer.from("05aabb", "hex"), (r) => r.readNested()))).toBe(true);
+    expect(reasonOf(readOer(Buffer.from("05aabb", "hex"), (r) => r.readNested()))).toBe("truncated");
 
     // The outer input still has bb cc left, but the nested contents are only aa.
     const overrun = readOer(Buffer.from("01aabbcc", "hex"), (r) => {
@@ -328,7 +459,7 @@ describe("ILP timestamp calendar rules", () => {
     ["a byte just above the digits", "2026101113050900:"],
     ["a non-ASCII byte", "2026101113050900\u00e9"],
   ])("rejects %s", (_name, text) => {
-    expect(Result.isFailure(read(text))).toBe(true);
+    expect(reasonOf(read(text))).toBe("invalid-timestamp");
   });
 
   it("is exact over every day of a leap year and its neighbours", () => {
@@ -339,8 +470,8 @@ describe("ILP timestamp calendar rules", () => {
         const at = (day: number) =>
           `${String(year).padStart(4, "0")}${String(month).padStart(2, "0")}${String(day).padStart(2, "0")}000000000`;
 
-        expect(Result.isSuccess(read(at(days)))).toBe(true);
-        expect(Result.isFailure(read(at(days + 1)))).toBe(true);
+        expect(reasonOf(read(at(days)))).toBe("success");
+        expect(reasonOf(read(at(days + 1)))).toBe("invalid-timestamp");
       }
     }
   });

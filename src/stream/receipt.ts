@@ -21,7 +21,7 @@ export interface StreamReceipt {
   readonly nonce: Uint8Array;
   /** The stream the receipt covers (a single byte on the wire). */
   readonly streamId: number;
-  /** Total amount the receiver has credited on the connection. */
+  /** Total amount the receiver has received on this stream (`streamId`). */
   readonly totalReceived: bigint;
   /** The 32-byte HMAC-SHA256 over the preceding 26 bytes. */
   readonly hmac: Uint8Array;
@@ -48,14 +48,16 @@ export function decodeStreamReceipt(bytes: Uint8Array): Result<StreamReceipt, Il
 /**
  * Authenticates a STREAM receipt (RFC 39) against the receipt secret issued with the credentials and returns it decoded.
  * `secret` is either the 32-byte secret itself or, when secrets are per nonce, a function from the (still
- * unauthenticated) receipt to its secret. The HMAC is compared in constant time.
+ * unauthenticated) receipt to its secret, synchronous or returning a promise (a database lookup, say). The HMAC is
+ * compared in constant time.
  *
  * Fails with `StreamError`: `invalid-receipt` when `receipt` is not 58 bytes or has a version other than 1,
- * `invalid-key` for an empty secret, `receipt-hmac-mismatch` when the HMAC does not match (forged or wrong secret).
+ * `invalid-key` for an empty secret or when the `secret` function throws or rejects (an unknown nonce),
+ * `receipt-hmac-mismatch` when the HMAC does not match (forged or wrong secret).
  */
 export function verifyStreamReceipt(
   receipt: Uint8Array,
-  secret: Uint8Array | ((receipt: StreamReceipt) => Uint8Array),
+  secret: Uint8Array | ((receipt: StreamReceipt) => Uint8Array | PromiseLike<Uint8Array>),
 ): Effect.Effect<StreamReceipt, StreamError> {
   const decoded = decodeStreamReceipt(receipt);
 
@@ -65,23 +67,40 @@ export function verifyStreamReceipt(
 
   if (decoded.success.version !== RECEIPT_VERSION) {
     return Effect.fail(
-      new StreamError({ reason: "invalid-receipt", message: `unsupported receipt version ${decoded.success.version}` }),
+      new StreamError({
+        reason: "invalid-receipt",
+        message: `unsupported receipt version ${decoded.success.version}`,
+      }),
     );
   }
 
-  const key = secret instanceof Uint8Array ? secret : secret(decoded.success);
+  const found = decoded.success;
 
-  if (key.length === 0) {
-    return Effect.fail(new StreamError({ reason: "invalid-key", message: "receipt secret must not be empty" }));
-  }
+  const lookup =
+    secret instanceof Uint8Array
+      ? Effect.succeed(secret)
+      : Effect.tryPromise({
+          try: async () => secret(found),
+          catch: (cause) =>
+            new StreamError({
+              reason: "invalid-key",
+              message: `receipt secret lookup failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+            }),
+        });
 
-  return Effect.flatMap(
-    Effect.promise(() => hmac(key, receipt.subarray(0, SIGNED_LENGTH))),
-    (expected) =>
-      constantTimeEqual(expected, decoded.success.hmac)
-        ? Effect.succeed(decoded.success)
-        : Effect.fail(new StreamError({ reason: "receipt-hmac-mismatch", message: "receipt HMAC does not match" })),
-  );
+  return Effect.flatMap(lookup, (key) => {
+    if (key.length === 0) {
+      return Effect.fail(new StreamError({ reason: "invalid-key", message: "receipt secret must not be empty" }));
+    }
+
+    return Effect.flatMap(
+      Effect.promise(() => hmac(key, receipt.subarray(0, SIGNED_LENGTH))),
+      (expected) =>
+        constantTimeEqual(expected, found.hmac)
+          ? Effect.succeed(found)
+          : Effect.fail(new StreamError({ reason: "receipt-hmac-mismatch", message: "receipt HMAC does not match" })),
+    );
+  });
 }
 
 /** @internal A receipt for stream 1 totalling `totalReceived` (a uint64), authenticated with `setup.secret`. */

@@ -181,7 +181,7 @@ async function openConnectionToken(keys: SecretKeys, token: Uint8Array): Promise
  * `@interledger/stream-receiver`'s `StreamServer.generateCredentials`:
  * a random-IV AES-256-GCM connection token (keyed from the server secret) is appended to the server address,
  * and the shared secret is `HMAC-SHA256(HMAC-SHA256(serverSecret, "ilp_stream_shared_secret"), token)`.
- * Nothing is stored: {@link createStreamReply} re-derives everything from the token.
+ * Nothing is stored: `createStreamReply` re-derives everything from the token.
  *
  * Fails with `StreamError`: `invalid-key` for a server secret that is not 32 bytes, `invalid-address` for an invalid
  * server address or a resulting address over 1023 characters, `invalid-option` for malformed options.

@@ -2,9 +2,10 @@
  * STREAM (RFC 29): packet and frame codecs, AES-256-GCM packet encryption with HMAC-derived keys,
  * fulfillment/condition generation, SPSP-style credentials, a receiver that answers incoming Prepares,
  * receipts (RFC 39), and the sender pieces (chunk planning, Prepare construction including unfulfillable rate
- * probes, reply decryption). Interoperates byte-for-byte with `ilp-protocol-stream` and
- * `@interledger/stream-receiver`. Web Standards only (WebCrypto); imported keys and per-connection derivations
- * are cached in small bounded maps, so repeat packets under one secret cost a fraction of the first.
+ * probes, reply decryption). The packet and frame wire format is byte-for-byte that of `ilp-protocol-stream`; the
+ * credential token and receiver decisions follow `@interledger/stream-receiver`. Web Standards only (WebCrypto);
+ * imported keys and per-connection derivations are cached in small bounded maps, so repeat packets under one secret
+ * cost a fraction of the first.
  *
  * @see https://interledger.org/developers/rfcs/stream-protocol/
  * @module
@@ -51,7 +52,14 @@ export {
   type StreamReceiptFrame,
 } from "./frames";
 
-export { decodeStreamPacket, decryptStreamPacket, encodeStreamPacket, type StreamPacket } from "./packet";
+export {
+  decodeStreamPacket,
+  decryptStreamPacket,
+  encodeStreamPacket,
+  type DecryptStreamPacketOptions,
+  type ExpectedStreamPacket,
+  type StreamPacket,
+} from "./packet";
 
 export { decodeStreamReceipt, verifyStreamReceipt, type StreamReceipt } from "./receipt";
 

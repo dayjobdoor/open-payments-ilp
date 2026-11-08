@@ -1,9 +1,9 @@
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 import { createReceipt, decodeReceipt, verifyReceipt } from "ilp-protocol-stream/dist/src/util/receipt";
 import { describe, expect, it } from "vite-plus/test";
-import { IlpErrorCode, IlpPacketType, type IlpPrepare } from "../../src/ilp";
+import { IlpErrorCode, IlpPacketType, isReject, type IlpPrepare } from "../../src/ilp";
 import {
   buildStreamPrepare,
   createStreamReply,
@@ -15,13 +15,15 @@ import {
   StreamError,
   verifyStreamReceipt,
 } from "../../src/stream";
+import { byteSource } from "../support/prng";
+import { reasonOf } from "../support/result";
 import { referencePrepare, StreamServer } from "../support/stream-oracle";
 
 const SERVER_ADDRESS = "test.receiver";
 
 const EXPIRES = new Date(Date.UTC(2099, 0, 1));
 
-const bytes = (length: number): Uint8Array => new Uint8Array(randomBytes(length));
+const bytes = byteSource(0x4ec3);
 
 const run = Effect.runPromise;
 
@@ -48,7 +50,9 @@ describe("STREAM receipts (RFC 39) interoperate with ilp-protocol-stream", () =>
       const decoded = Result.getOrThrow(decodeStreamReceipt(theirs));
       // The reference reports the stream id as a decimal string and keeps the HMAC (absent from its typings).
       // SAFETY: decodeReceipt returns the decoded receipt including `hmac`; only its declared type omits the field.
-      const reference = decodeReceipt(theirs) as ReturnType<typeof decodeReceipt> & { hmac: Buffer };
+      const reference = decodeReceipt(theirs) as ReturnType<typeof decodeReceipt> & {
+        hmac: Buffer;
+      };
 
       expect(decoded.totalReceived).toBe(totalReceived);
       expect(reference.totalReceived.toString()).toBe(totalReceived.toString());
@@ -80,6 +84,57 @@ describe("STREAM receipts (RFC 39) interoperate with ilp-protocol-stream", () =>
 
     expect(verified.totalReceived).toBe(7n);
     expect(seen).toEqual([nonce]);
+  });
+
+  describe("a secret function", () => {
+    const receipt = createReceipt({
+      nonce: Buffer.from(nonce),
+      secret: Buffer.from(secret),
+      streamId: 1,
+      totalReceived: "12",
+    });
+
+    it("may return a promise, as a database lookup does", async () => {
+      const verified = await run(verifyStreamReceipt(receipt, async () => secret));
+
+      expect(verified.totalReceived).toBe(12n);
+    });
+
+    it.each([
+      [
+        "throws",
+        () => {
+          throw new Error("unknown nonce");
+        },
+      ],
+      ["rejects", async () => Promise.reject(new Error("unknown nonce"))],
+    ])("that %s becomes an invalid-key failure instead of escaping the Effect", async (_how, lookup) => {
+      // Building the Effect must not throw either: the lookup runs when the Effect does.
+      const effect = verifyStreamReceipt(receipt, lookup);
+      const error = await failure(effect);
+
+      expect(error).toBeInstanceOf(StreamError);
+      expect(error).toMatchObject({ reason: "invalid-key" });
+      expect(error?.message).toContain("unknown nonce");
+    });
+
+    it("that returns an empty or a wrong secret fails as invalid-key or receipt-hmac-mismatch", async () => {
+      expect((await failure(verifyStreamReceipt(receipt, async () => new Uint8Array(0))))?.reason).toBe("invalid-key");
+      expect((await failure(verifyStreamReceipt(receipt, () => bytes(32))))?.reason).toBe("receipt-hmac-mismatch");
+    });
+
+    it("is not called for a receipt that is malformed or of another version", async () => {
+      let calls = 0;
+
+      const lookup = () => {
+        calls++;
+
+        return secret;
+      };
+
+      await failure(verifyStreamReceipt(receipt.subarray(0, 57), lookup));
+      expect(calls).toBe(0);
+    });
   });
 
   it("fails exactly where the reference throws", async () => {
@@ -119,9 +174,9 @@ describe("STREAM receipts (RFC 39) interoperate with ilp-protocol-stream", () =>
   });
 
   it("decodes only 58-byte receipts", () => {
-    expect(Result.isFailure(decodeStreamReceipt(new Uint8Array(57)))).toBe(true);
-    expect(Result.isFailure(decodeStreamReceipt(new Uint8Array(59)))).toBe(true);
-    expect(Result.isSuccess(decodeStreamReceipt(new Uint8Array(58)))).toBe(true);
+    expect(reasonOf(decodeStreamReceipt(new Uint8Array(57)))).toBe("invalid-field");
+    expect(reasonOf(decodeStreamReceipt(new Uint8Array(59)))).toBe("invalid-field");
+    expect(reasonOf(decodeStreamReceipt(new Uint8Array(58)))).toBe("success");
   });
 });
 
@@ -192,7 +247,12 @@ describe("rate probes and reply decoding (what @interledger/pay needs from a sen
 
   async function build(
     credentials: { ilpAddress: string; sharedSecret: Uint8Array },
-    options: { amount: bigint; minDestinationAmount?: bigint; unfulfillable?: boolean },
+    options: {
+      amount: bigint;
+      sequence?: bigint;
+      minDestinationAmount?: bigint;
+      unfulfillable?: boolean;
+    },
   ): Promise<IlpPrepare> {
     return run(
       buildStreamPrepare({
@@ -240,11 +300,16 @@ describe("rate probes and reply decoding (what @interledger/pay needs from a sen
     expect(Buffer.from(a.executionCondition).equals(Buffer.from(b.executionCondition))).toBe(false);
 
     const keys = await run(deriveStreamKeys(credentials.sharedSecret));
-    const fulfillable = createHmac("sha256", keys.fulfillmentKey).update(real.data).digest();
-    const condition = Buffer.from(await crypto.subtle.digest("SHA-256", fulfillable));
 
-    expect(Buffer.from(real.executionCondition).equals(condition)).toBe(true);
-    expect(Buffer.from(a.executionCondition).equals(condition)).toBe(false);
+    // The condition a sender holding the secret would have chosen for exactly this packet's data.
+    const conditionFor = (data: Uint8Array) =>
+      createHash("sha256").update(createHmac("sha256", keys.fulfillmentKey).update(data).digest()).digest();
+
+    expect(Buffer.from(real.executionCondition).equals(conditionFor(real.data))).toBe(true);
+
+    // A fresh IV already makes conditions differ between packets, so each probe is compared with its own data's.
+    expect(Buffer.from(a.executionCondition).equals(conditionFor(a.data))).toBe(false);
+    expect(Buffer.from(b.executionCondition).equals(conditionFor(b.data))).toBe(false);
   });
 
   it("minDestinationAmount sets the packet's minimum, which both receivers enforce with F04", async () => {
@@ -301,6 +366,97 @@ describe("rate probes and reply decoding (what @interledger/pay needs from a sen
       expect(reasons).toEqual(["invalid-key", "decryption-failed", "decryption-failed", "decryption-failed"]);
     });
 
+    describe("binds a reply to its request with `expect`", () => {
+      const rejectFor = async (prepare: IlpPrepare) => {
+        const reply = await run(createStreamReply(config, prepare));
+
+        if (reply.type !== "final" || !isReject(reply.reply)) throw new Error("expected a final reject");
+
+        return reply.reply.data;
+      };
+
+      it("passes a reply with the expected sequence and ILP packet type, checking only what is given", async () => {
+        const credentials = await connection();
+        const probe = await build(credentials, { amount: 50n, sequence: 5n, unfulfillable: true });
+        const data = await rejectFor(probe);
+
+        const checked = await run(
+          decryptStreamPacket(credentials.sharedSecret, data, {
+            expect: { sequence: 5n, ilpPacketType: IlpPacketType.Reject },
+          }),
+        );
+
+        expect(checked).toMatchObject({ sequence: 5n, ilpPacketType: IlpPacketType.Reject, prepareAmount: 50n });
+
+        for (const expectation of [{}, { sequence: 5n }, { ilpPacketType: IlpPacketType.Reject }]) {
+          expect(await run(decryptStreamPacket(credentials.sharedSecret, data, { expect: expectation }))).toEqual(
+            checked,
+          );
+        }
+
+        expect(await run(decryptStreamPacket(credentials.sharedSecret, data, {}))).toEqual(checked);
+      });
+
+      it("refuses an older reply replayed for a later request, which would spoof the delivered amount", async () => {
+        const credentials = await connection();
+        const first = await rejectFor(await build(credentials, { amount: 900n, sequence: 5n, unfulfillable: true }));
+        const second = await rejectFor(await build(credentials, { amount: 7n, sequence: 6n, unfulfillable: true }));
+
+        // Without `expect` the replay is indistinguishable from the real answer, and claims 900 arrived.
+        expect((await run(decryptStreamPacket(credentials.sharedSecret, first))).prepareAmount).toBe(900n);
+
+        const replayed = await failure(
+          decryptStreamPacket(credentials.sharedSecret, first, { expect: { sequence: 6n } }),
+        );
+
+        expect(replayed).toBeInstanceOf(StreamError);
+        expect(replayed).toMatchObject({ reason: "unexpected-packet" });
+        expect(replayed?.message).toContain("sequence");
+
+        const genuine = await run(decryptStreamPacket(credentials.sharedSecret, second, { expect: { sequence: 6n } }));
+
+        expect(genuine.prepareAmount).toBe(7n);
+      });
+
+      it("refuses a Reject's data presented as a Fulfill's, and the other way round", async () => {
+        const credentials = await connection();
+        const reject = await rejectFor(await build(credentials, { amount: 5n, unfulfillable: true }));
+        const theirs = theirServer.createReply(referencePrepare(await build(credentials, { amount: 5n })));
+
+        if (!("accept" in theirs)) throw new Error("expected the reference to accept");
+        const fulfill = new Uint8Array(theirs.accept().data);
+
+        const asFulfill = await failure(
+          decryptStreamPacket(credentials.sharedSecret, reject, { expect: { ilpPacketType: IlpPacketType.Fulfill } }),
+        );
+
+        const asReject = await failure(
+          decryptStreamPacket(credentials.sharedSecret, fulfill, { expect: { ilpPacketType: IlpPacketType.Reject } }),
+        );
+
+        expect(asFulfill).toMatchObject({ _tag: "StreamError", reason: "unexpected-packet" });
+        expect(asFulfill?.message).toContain("packet type");
+        expect(asReject).toMatchObject({ _tag: "StreamError", reason: "unexpected-packet" });
+
+        expect(
+          await run(
+            decryptStreamPacket(credentials.sharedSecret, fulfill, {
+              expect: { ilpPacketType: IlpPacketType.Fulfill },
+            }),
+          ),
+        ).toMatchObject({ ilpPacketType: IlpPacketType.Fulfill });
+      });
+
+      it("still reports undecryptable data as decryption-failed before comparing anything", async () => {
+        const credentials = await connection();
+        const error = await failure(
+          decryptStreamPacket(credentials.sharedSecret, new Uint8Array(40), { expect: { sequence: 1n } }),
+        );
+
+        expect(error?.reason).toBe("decryption-failed");
+      });
+    });
+
     it("fails with IlpCodecError when authentic data is not a STREAM packet", async () => {
       const credentials = await connection();
       const { encryptionKey } = await run(deriveStreamKeys(credentials.sharedSecret));
@@ -313,7 +469,7 @@ describe("rate probes and reply decoding (what @interledger/pay needs from a sen
 });
 
 describe("credential caching never changes the answer", () => {
-  it("keeps working past the cache capacities, for many servers and many connections", async () => {
+  it("keeps working past the server-secret cache capacity (16), with 24 servers", async () => {
     const servers = Array.from({ length: 24 }, () => ({ serverSecret: bytes(32), serverAddress: SERVER_ADDRESS }));
 
     // Two passes: the second one meets every secret again after the first evicted the oldest.
@@ -334,6 +490,34 @@ describe("credential caching never changes the answer", () => {
 
         expect(await run(createStreamReply(server, prepare))).toMatchObject({ type: "pending" });
       }
+    }
+  });
+
+  it("keeps working past the connection cache capacity (256), with 300 connections to one server", async () => {
+    const server = { serverSecret: bytes(32), serverAddress: SERVER_ADDRESS };
+
+    const connections = await Promise.all(
+      Array.from({ length: 300 }, async () => {
+        const credentials = await run(generateStreamCredentials(server));
+
+        const prepare = await run(
+          buildStreamPrepare({
+            destination: credentials.ilpAddress,
+            sharedSecret: credentials.sharedSecret,
+            amount: 3n,
+            sequence: 1n,
+            sourceAddress: "test.sender",
+            expiresAt: EXPIRES,
+          }),
+        );
+
+        return prepare;
+      }),
+    );
+
+    // The first connections were evicted by the later ones; each is still answered correctly when it returns.
+    for (const prepare of [...connections, ...connections.slice().reverse()]) {
+      expect(await run(createStreamReply(server, prepare))).toMatchObject({ type: "pending" });
     }
   });
 
@@ -394,7 +578,10 @@ describe("credential caching never changes the answer", () => {
     });
     expect(
       await run(
-        createStreamReply(b, { ...prepare, destination: `test.tenant.b.${prepare.destination.split(".").pop()}` }),
+        createStreamReply(b, {
+          ...prepare,
+          destination: `test.tenant.b.${prepare.destination.split(".").pop()}`,
+        }),
       ),
     ).toMatchObject({ type: "pending" });
   });

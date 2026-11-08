@@ -67,17 +67,43 @@ export function decodeStreamPacket(bytes: Uint8Array): Result.Result<StreamPacke
   });
 }
 
+/** What {@link decryptStreamPacket} checks the decrypted packet against. */
+export interface ExpectedStreamPacket {
+  /** The sequence number of the request this reply answers. */
+  readonly sequence?: bigint;
+  /**
+   * The ILP packet type the reply travels in: `IlpPacketType.Fulfill` for a Fulfill's data, `IlpPacketType.Reject`
+   * for a Reject's, `IlpPacketType.Prepare` for a Prepare's.
+   */
+  readonly ilpPacketType?: number;
+}
+
+/** Options of {@link decryptStreamPacket}. */
+export interface DecryptStreamPacketOptions {
+  /**
+   * Bind the packet to its request. A connection's replies are all encrypted under the same key, so without this a
+   * connector can replay an older reply (with another `prepareAmount`) into a later exchange, or hand a Reject's data
+   * over as a Fulfill's. A mismatch fails with `StreamError` (`unexpected-packet`).
+   */
+  readonly expect?: ExpectedStreamPacket;
+}
+
 /**
  * Decrypts and parses the STREAM packet in an ILP packet's `data` under `sharedSecret`: the sender's view of a
  * Fulfill or Reject (how much arrived, receipts, `ConnectionClose`, asset details) and the receiver's of a Prepare.
  *
+ * A reply is only authentic for the exchange that produced it when its `sequence` and `ilpPacketType` match the
+ * request and the ILP reply type. Pass them as `options.expect`, as `@interledger/pay` checks them; the decrypted
+ * packet is returned unchecked otherwise.
+ *
  * Fails with `StreamError` (`invalid-key` for an empty secret, `decryption-failed` for data that is too short or
- * does not authenticate, e.g. a reply from a connector rather than the receiver) or `IlpCodecError` when the
- * decrypted packet is malformed.
+ * does not authenticate, e.g. a reply from a connector rather than the receiver, `unexpected-packet` when
+ * `options.expect` does not match) or `IlpCodecError` when the decrypted packet is malformed.
  */
 export function decryptStreamPacket(
   sharedSecret: Uint8Array,
   data: Uint8Array,
+  options: DecryptStreamPacketOptions = {},
 ): Effect.Effect<StreamPacket, StreamError | IlpCodecError> {
   if (sharedSecret.length === 0) {
     return Effect.fail(new StreamError({ reason: "invalid-key", message: "shared secret must not be empty" }));
@@ -98,6 +124,27 @@ export function decryptStreamPacket(
       return yield* Effect.fail(new StreamError({ reason: "decryption-failed", message: "authentication failed" }));
     }
 
-    return yield* Effect.fromResult(decodeStreamPacket(plaintext));
+    const packet = yield* Effect.fromResult(decodeStreamPacket(plaintext));
+    const expected = options.expect;
+
+    if (expected?.sequence !== undefined && packet.sequence !== expected.sequence) {
+      return yield* Effect.fail(
+        new StreamError({
+          reason: "unexpected-packet",
+          message: `expected sequence ${expected.sequence}, got ${packet.sequence}`,
+        }),
+      );
+    }
+
+    if (expected?.ilpPacketType !== undefined && packet.ilpPacketType !== expected.ilpPacketType) {
+      return yield* Effect.fail(
+        new StreamError({
+          reason: "unexpected-packet",
+          message: `expected ILP packet type ${expected.ilpPacketType}, got ${packet.ilpPacketType}`,
+        }),
+      );
+    }
+
+    return packet;
   });
 }

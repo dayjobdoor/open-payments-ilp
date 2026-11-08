@@ -4,9 +4,10 @@ import { codecFail, type IlpCodecError } from "../ilp/errors";
 import { asciiBytes, OerReader, OerWriter, readOer, writeOer } from "../ilp/oer";
 import { utf8Encode } from "../internal/bytes";
 
-const lenientUtf8 = new TextDecoder();
+// `ignoreBOM: true` keeps a leading U+FEFF so strings survive decode then encode.
+const lenientUtf8 = new TextDecoder("utf-8", { ignoreBOM: true });
 
-/** STREAM frame type bytes (RFC 29 §6). */
+/** STREAM frame type bytes (RFC 29 §5.3; `StreamReceipt` 0x17 is RFC 39). */
 export const StreamFrameType = {
   ConnectionClose: 1,
   ConnectionNewAddress: 2,
@@ -25,7 +26,7 @@ export const StreamFrameType = {
   StreamReceipt: 23,
 } as const;
 
-/** STREAM error codes carried by `ConnectionClose` / `StreamClose` (RFC 29 §7). */
+/** STREAM error codes carried by `ConnectionClose` / `StreamClose` (RFC 29 §5.4). */
 export const StreamErrorCode = {
   NoError: 1,
   InternalError: 2,
@@ -48,6 +49,7 @@ export interface ConnectionCloseFrame {
 /** The sender announces the ILP address it can be reached on. */
 export interface ConnectionNewAddressFrame {
   readonly type: "ConnectionNewAddress";
+  /** A valid ILP address, or `""` (no address; a request for the receiver's asset details). */
   readonly sourceAccount: string;
 }
 
@@ -97,7 +99,7 @@ export interface StreamMoneyFrame {
   readonly shares: bigint;
 }
 
-/** Stream money limit. A value wider than uint64 on the wire decodes as 2^64-1. */
+/** Stream money limit. A `receiveMax` encoded in more than 8 bytes decodes as 2^64-1; `totalReceived` must fit in 8. */
 export interface StreamMaxMoneyFrame {
   readonly type: "StreamMaxMoney";
   readonly streamId: bigint;
@@ -105,7 +107,10 @@ export interface StreamMaxMoneyFrame {
   readonly totalReceived: bigint;
 }
 
-/** The sender is blocked by the stream money limit. A wire value wider than uint64 decodes as 2^64-1. */
+/**
+ * The sender is blocked by the stream money limit. A `sendMax` encoded in more than 8 bytes decodes as 2^64-1;
+ * `totalSent` must fit in 8.
+ */
 export interface StreamMoneyBlockedFrame {
   readonly type: "StreamMoneyBlocked";
   readonly streamId: bigint;
@@ -265,7 +270,8 @@ function writeFrameContents(body: OerWriter, frame: StreamFrame): void {
       return;
 
     case "ConnectionNewAddress":
-      if (!isValidIlpAddress(frame.sourceAccount)) {
+      // `""` is valid: `@interledger/pay` sends it to ask for the asset details without announcing an address.
+      if (frame.sourceAccount !== "" && !isValidIlpAddress(frame.sourceAccount)) {
         codecFail("invalid-address", "sourceAccount is not a valid ILP address");
       }
 

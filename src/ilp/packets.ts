@@ -8,6 +8,9 @@ import { utf8Encode } from "../internal/bytes";
 /** Maximum `data` length of any ILP packet (RFC 27). */
 export const MAX_ILP_DATA_LENGTH = 32767;
 
+/** Longest Reject `message` in UTF-8 bytes (RFC 27: `UTF8String (SIZE (0..8191))`). */
+const MAX_REJECT_MESSAGE_LENGTH = 8191;
+
 /** ILP Prepare: a conditional transfer request. */
 export interface IlpPrepare {
   /** Amount in the receiving account's units (uint64). */
@@ -35,7 +38,7 @@ export interface IlpReject {
   readonly code: string;
   /** Address of the node that rejected, or `""` when unknown. */
   readonly triggeredBy: string;
-  /** Human-readable diagnostic (UTF-8). */
+  /** Human-readable diagnostic (UTF-8); at most 8191 bytes when serialized. */
   readonly message: string;
   readonly data: Uint8Array;
 }
@@ -51,7 +54,8 @@ export type IlpPacket =
 
 const CONDITION_LENGTH = 32;
 
-const lenientUtf8 = new TextDecoder();
+// `ignoreBOM: true` keeps a leading U+FEFF so the message survives decode then encode.
+const lenientUtf8 = new TextDecoder("utf-8", { ignoreBOM: true });
 
 /** Type guard: `reply` is a Fulfill. */
 export function isFulfill(reply: IlpReply): reply is IlpFulfill {
@@ -116,7 +120,9 @@ export function deserializeFulfill(bytes: Uint8Array): Result.Result<IlpFulfill,
 
 /**
  * Serializes a Reject. Fails with `IlpCodecError` unless `code` is three printable ASCII characters,
- * `triggeredBy` is `""` or a valid ILP address, and `data` ≤ 32767 bytes.
+ * `triggeredBy` is `""` or a valid ILP address, `message` is at most 8191 UTF-8 bytes (RFC 27) and `data` is at most
+ * 32767 bytes.
+ * Decoding stays lenient about the message length, as ilp-packet is.
  */
 export function serializeReject(reject: IlpReject): Result.Result<Uint8Array<ArrayBuffer>, IlpCodecError> {
   return writeOer((out) => {
@@ -128,12 +134,18 @@ export function serializeReject(reject: IlpReject): Result.Result<Uint8Array<Arr
       codecFail("invalid-address", "triggeredBy is not a valid ILP address");
     }
 
+    const message = utf8Encode(reject.message);
+
+    if (message.length > MAX_REJECT_MESSAGE_LENGTH) {
+      codecFail("out-of-range", `message of ${message.length} bytes exceeds ${MAX_REJECT_MESSAGE_LENGTH}`);
+    }
+
     checkData(reject.data);
     out.writeUInt8(IlpPacketType.Reject);
     out.writeNested((body) => {
       body.writeOctets(code);
       body.writeVarOctetString(asciiBytes(reject.triggeredBy, "triggeredBy"));
-      body.writeVarOctetString(utf8Encode(reject.message));
+      body.writeVarOctetString(message);
       body.writeVarOctetString(reject.data);
     });
   });

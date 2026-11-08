@@ -1,7 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 import { IlpErrorCode, IlpPacketType } from "../ilp/codes";
-import type { IlpFulfill, IlpPrepare, IlpReject, IlpReply } from "../ilp/packets";
+import { MAX_ILP_DATA_LENGTH, type IlpFulfill, type IlpPrepare, type IlpReject, type IlpReply } from "../ilp/packets";
 import { constantTimeEqual, sha256, toHex, utf8Encode } from "../internal/bytes";
 import { checkServerConfig, openConnection, secretKeys, type SecretKeys, type StreamServerConfig } from "./credentials";
 import { decrypt, encrypt, STREAM_ENCRYPTION_OVERHEAD } from "./crypto";
@@ -16,7 +16,13 @@ const MAX_UINT64 = (1n << 64n) - 1n;
 /** A Prepare that authenticated as a STREAM packet for a known connection and awaits the application's decision. */
 export interface StreamPendingReply {
   readonly type: "pending";
-  /** Hex SHA-256 of the destination address: a stable id for the connection. */
+  /**
+   * Hex SHA-256 of the full destination address of this Prepare. It is not a canonical connection id: the same
+   * connection answers to many destinations, since anything after the token (`<token>.<anything>`) and every
+   * base64url spelling of the token that differs only in its unused trailing bits authenticate alike (as in
+   * `@interledger/stream-receiver`). Use it to correlate packets that carry the same address; key per-connection
+   * state on `paymentTag` or on your own bookkeeping instead.
+   */
   readonly connectionId: string;
   /** The payment tag bound into the credentials, if any. */
   readonly paymentTag: string | undefined;
@@ -29,8 +35,12 @@ export interface StreamPendingReply {
   readonly accept: (options?: { readonly totalReceived?: bigint }) => Effect.Effect<IlpFulfill, StreamError>;
   /** Rejects with `T00` (temporary): the sender may retry. */
   readonly temporaryDecline: () => Effect.Effect<IlpReject>;
-  /** Rejects with `F99` and a `ConnectionClose` frame (plus a `StreamData` frame when `applicationData` is non-empty). */
-  readonly finalDecline: (applicationData?: Uint8Array | string) => Effect.Effect<IlpReject>;
+  /**
+   * Rejects with `F99` and a `ConnectionClose` frame (plus a `StreamData` frame when `applicationData` is non-empty).
+   * Fails with `StreamError` (`invalid-option`) when the data does not fit in a Reject's 32767 bytes of data along
+   * with the encryption overhead and the other frames.
+   */
+  readonly finalDecline: (applicationData?: Uint8Array | string) => Effect.Effect<IlpReject, StreamError>;
 }
 
 /** A reply decided without the application (reject, or a zero-amount Fulfill). */
@@ -67,7 +77,7 @@ interface ReplyState {
  * frame is added when the sender announced a new address and the credentials carry asset details.
  *
  * The caller must still enforce its own rules (expiry, replay protection, caps) before calling `accept`.
- * Fails with `StreamError` only when `config` is invalid.
+ * Fails with `StreamError` only when `config` is invalid or `prepare.amount` is outside uint64.
  */
 export function createStreamReply(
   config: StreamServerConfig,
@@ -76,6 +86,11 @@ export function createStreamReply(
   const invalid = checkServerConfig(config);
 
   if (invalid) return Effect.fail(invalid);
+
+  // Replies echo the amount in an encrypted STREAM packet; checking here keeps every later encoding infallible.
+  if (prepare.amount < 0n || prepare.amount > MAX_UINT64) {
+    return Effect.fail(new StreamError({ reason: "invalid-option", message: "prepare amount is not a uint64" }));
+  }
 
   return Effect.promise(async () => replyTo(await secretKeys(config.serverSecret), config.serverAddress, prepare));
 }
@@ -123,8 +138,6 @@ async function replyTo(keys: SecretKeys, serverAddress: string, prepare: IlpPrep
   if (!connection) return final(IlpErrorCode.F06_UNEXPECTED_PAYMENT);
   const { details, keys: connectionKeys } = connection;
   const { encryptionKey, fulfillmentKey } = connectionKeys;
-  // Independent of the packet's contents, so it runs alongside the decryption.
-  const connectionId = sha256(utf8Encode(prepare.destination)).then(toHex);
   const request = await decryptPacket(encryptionKey, prepare.data);
 
   if (!request) return final(IlpErrorCode.F06_UNEXPECTED_PAYMENT);
@@ -142,7 +155,11 @@ async function replyTo(keys: SecretKeys, serverAddress: string, prepare: IlpPrep
     state = {
       ...state,
       frames: [
-        { type: "ConnectionAssetDetails", sourceAssetCode: details.asset.code, sourceAssetScale: details.asset.scale },
+        {
+          type: "ConnectionAssetDetails",
+          sourceAssetCode: details.asset.code,
+          sourceAssetScale: details.asset.scale,
+        },
       ],
     };
   }
@@ -159,7 +176,7 @@ async function replyTo(keys: SecretKeys, serverAddress: string, prepare: IlpPrep
 
   return {
     type: "pending",
-    connectionId: await connectionId,
+    connectionId: toHex(await sha256(utf8Encode(prepare.destination))),
     paymentTag: details.paymentTag,
     dataFrames: request.frames.filter((frame) => frame.type === "StreamData"),
     accept: (options) => {
@@ -194,6 +211,26 @@ async function replyTo(keys: SecretKeys, serverAddress: string, prepare: IlpPrep
 
       if (data && data.length > 0) frames.push({ type: "StreamData", streamId: 1n, offset: 0n, data });
 
+      const plaintext = encodeStreamPacket({
+        sequence: state.sequence,
+        ilpPacketType: IlpPacketType.Reject,
+        prepareAmount: state.receivedAmount,
+        frames,
+      });
+
+      if (Result.isFailure(plaintext)) {
+        return Effect.fail(new StreamError({ reason: "invalid-option", message: plaintext.failure.message }));
+      }
+
+      if (plaintext.success.length + STREAM_ENCRYPTION_OVERHEAD > MAX_ILP_DATA_LENGTH) {
+        return Effect.fail(
+          new StreamError({
+            reason: "invalid-option",
+            message: `application data does not fit in the ${MAX_ILP_DATA_LENGTH} bytes of a Reject's data`,
+          }),
+        );
+      }
+
       return Effect.promise(() => rejectWith({ ...state, frames }, IlpErrorCode.F99_APPLICATION_ERROR));
     },
   };
@@ -222,7 +259,11 @@ function localSegment(serverAddress: string, destination: string): string | unde
   return segment === "" ? undefined : segment;
 }
 
-/** The encrypted STREAM reply packet carried in a Fulfill/Reject, or empty when no key is established yet. */
+/**
+ * The encrypted STREAM reply packet carried in a Fulfill/Reject, or empty when no key is established yet.
+ * Cannot fail on encoding: `createStreamReply` rejects an out-of-range amount up front, the sequence was decoded from
+ * a `VarUInt`, and `finalDecline` checks the size of its own frames.
+ */
 async function replyData(state: ReplyState, ilpPacketType: number): Promise<Uint8Array<ArrayBuffer>> {
   if (!state.encryptionKey) return new Uint8Array(0);
 

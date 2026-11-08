@@ -34,8 +34,12 @@ export interface BuildStreamPrepareOptions {
   readonly minDestinationAmount?: bigint;
   /** Packet sequence number, starting at 1 for a connection. */
   readonly sequence: bigint;
-  /** The sender's own ILP address, announced in a `ConnectionNewAddress` frame on sequence 1. */
-  readonly sourceAddress: string;
+  /**
+   * The sender's own ILP address, announced in a `ConnectionNewAddress` frame on sequence 1. Omitted or `""` sends an
+   * empty address, as `@interledger/pay` does to ask for the receiver's asset details; anything else must be a valid
+   * ILP address.
+   */
+  readonly sourceAddress?: string;
   /** Prepare expiry. */
   readonly expiresAt: Date;
   /** Optional application payload, sent as a `StreamData` frame on stream 1 at offset 0. */
@@ -76,14 +80,15 @@ export function planStreamChunks(
 /**
  * Builds the ILP Prepare for one STREAM packet carrying `amount` on stream 1.
  *
- * The STREAM packet holds `ConnectionNewAddress` (sequence 1 only), `StreamMoney(1, amount)` and optionally
- * `StreamData(1, 0, additionalData)`; it is encrypted with a fresh IV, so rebuilding the same chunk yields a
- * different, equally valid Prepare. The execution condition is `SHA-256(HMAC(fulfillmentKey, encryptedData))`,
- * which only the holder of the shared secret can fulfill (or random when `unfulfillable`).
+ * The STREAM packet holds `ConnectionNewAddress` (sequence 1 only, empty when no `sourceAddress` is given),
+ * `StreamMoney(1, amount)` and optionally `StreamData(1, 0, additionalData)`; it is encrypted with a fresh IV, so
+ * rebuilding the same chunk yields a different, equally valid Prepare. The execution condition is
+ * `SHA-256(HMAC(fulfillmentKey, encryptedData))`, which only the holder of the shared secret can fulfill (or random
+ * when `unfulfillable`).
  *
  * Fails with `StreamError` (`invalid-key`) for an empty shared secret, or `IlpCodecError` when `amount`,
  * `sequence` or `sourceAddress` cannot be encoded into the STREAM packet. `destination`, `expiresAt` and the size of
- * the packet are checked by `encodePrepare` when the returned Prepare is encoded.
+ * the packet are checked by `serializePrepare` when the returned Prepare is encoded.
  */
 export function buildStreamPrepare(
   options: BuildStreamPrepareOptions,
@@ -94,7 +99,9 @@ export function buildStreamPrepare(
 
   const frames: StreamFrame[] = [];
 
-  if (options.sequence === 1n) frames.push({ type: "ConnectionNewAddress", sourceAccount: options.sourceAddress });
+  if (options.sequence === 1n) {
+    frames.push({ type: "ConnectionNewAddress", sourceAccount: options.sourceAddress ?? "" });
+  }
   frames.push({ type: "StreamMoney", streamId: 1n, shares: options.amount });
 
   if (options.additionalData && options.additionalData.length > 0) {

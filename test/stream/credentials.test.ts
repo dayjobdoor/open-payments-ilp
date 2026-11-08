@@ -1,13 +1,20 @@
-import { randomBytes } from "node:crypto";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 import { describe, expect, it } from "vite-plus/test";
 import { isValidIlpAddress } from "../../src/ilp";
-import { decodeStreamPaymentTag, generateStreamCredentials, type StreamCredentialOptions } from "../../src/stream";
+import {
+  buildStreamPrepare,
+  decodeStreamPaymentTag,
+  generateStreamCredentials,
+  type StreamCredentialOptions,
+} from "../../src/stream";
 import { decodeBase64Url } from "../../src/internal/bytes";
-import { StreamServer } from "../support/stream-oracle";
+import { byteSource } from "../support/prng";
+import { referencePrepare, StreamServer } from "../support/stream-oracle";
 
-const serverSecret = new Uint8Array(randomBytes(32));
+const bytes = byteSource(0xc4ed);
+
+const serverSecret = bytes(32);
 
 const serverAddress = "test.receiver";
 
@@ -53,13 +60,46 @@ describe("SPSP credentials", () => {
   });
 
   it("issues credentials whose token stream-receiver decrypts, with every option combination", async () => {
-    const receipt = { nonce: new Uint8Array(randomBytes(16)), secret: new Uint8Array(randomBytes(32)) };
+    const receipt = { nonce: bytes(16), secret: bytes(32) };
     const asset = { code: "JPY", scale: 0 };
 
     for (const options of [{}, { paymentTag: "a" }, { receipt }, { asset }, { paymentTag: "tag", receipt, asset }]) {
       const { ilpAddress } = await run(options);
 
       expect(theirServer.decodePaymentTag(ilpAddress)).toBe("paymentTag" in options ? options.paymentTag : undefined);
+    }
+  });
+
+  // `decodePaymentTag` is also `undefined` for a token that does not authenticate, so on its own it cannot tell
+  // a good token without a tag from garbage. A packet through the reference receiver can: F06 means garbage.
+  it("issues tokens the reference receiver authenticates, and refuses the same token with one character changed", async () => {
+    const receipt = { nonce: bytes(16), secret: bytes(32) };
+    const asset = { code: "JPY", scale: 0 };
+
+    for (const options of [{}, { paymentTag: "a" }, { receipt }, { asset }, { paymentTag: "tag", receipt, asset }]) {
+      const { ilpAddress, sharedSecret } = await run(options);
+
+      const prepare = await Effect.runPromise(
+        buildStreamPrepare({
+          destination: ilpAddress,
+          sharedSecret,
+          amount: 5n,
+          sequence: 2n,
+          expiresAt: new Date(Date.UTC(2099, 0, 1)),
+        }),
+      );
+
+      expect("accept" in theirServer.createReply(referencePrepare(prepare))).toBe(true);
+
+      const middle = serverAddress.length + 1 + 10;
+      const changed = ilpAddress[middle] === "A" ? "B" : "A";
+      const garbage = `${ilpAddress.slice(0, middle)}${changed}${ilpAddress.slice(middle + 1)}`;
+
+      expect(theirServer.createReply(referencePrepare({ ...prepare, destination: garbage }))).toMatchObject({
+        code: "F06",
+      });
+
+      expect(await Effect.runPromise(decodeStreamPaymentTag(config, garbage))).toBeUndefined();
     }
   });
 
@@ -99,6 +139,27 @@ describe("SPSP credentials", () => {
       "invalid-address",
     );
   });
+
+  // The limit is 1023 characters (RFC 15). The check predicts the token's length before encrypting, so it must be
+  // exact: one address character too many fails, and the longest that passes really is 1023 characters long.
+  it.each(["", "a", "ab", "abc", "abcd", "x".repeat(40)])(
+    "accepts a server address up to exactly 1023 characters with the tag %j, and refuses one more",
+    async (paymentTag) => {
+      const options = paymentTag === "" ? {} : { paymentTag };
+      const sample = await run(options);
+      const tokenLength = sample.ilpAddress.length - serverAddress.length - 1;
+      const longest = 1023 - 1 - tokenLength;
+      const base = (length: number) => `test.${"a".repeat(length - "test.".length)}`;
+
+      const fits = await Effect.runPromise(
+        generateStreamCredentials({ ...config, serverAddress: base(longest) }, options),
+      );
+
+      expect(fits.ilpAddress).toHaveLength(1023);
+      expect(isValidIlpAddress(fits.ilpAddress)).toBe(true);
+      expect(await reason({ ...config, serverAddress: base(longest + 1) }, options)).toBe("invalid-address");
+    },
+  );
 });
 
 describe("their credentials against our receiver", () => {
@@ -158,7 +219,7 @@ describe("decodeStreamPaymentTag matches stream-receiver's decodePaymentTag", ()
   });
 
   it("does not decode tokens issued under another server secret", async () => {
-    const other = { serverSecret: new Uint8Array(randomBytes(32)), serverAddress };
+    const other = { serverSecret: bytes(32), serverAddress };
     const foreign = await Effect.runPromise(generateStreamCredentials(other, { paymentTag: "tag" }));
 
     expect(await mine(foreign.ilpAddress)).toBeUndefined();

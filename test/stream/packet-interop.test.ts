@@ -12,6 +12,7 @@ import {
   type StreamPacket,
 } from "../../src/stream";
 import { mutations } from "../support/prng";
+import { reasonOf } from "../support/result";
 import { MAX_UINT64, normalizeReference, Reference, referencePacket } from "../support/stream-oracle";
 
 const bytes = (...values: number[]): Uint8Array => Uint8Array.from(values);
@@ -30,17 +31,39 @@ const allFrames: StreamFrame[] = [
   { type: "StreamMaxMoney", streamId: 3n, receiveMax: MAX_UINT64, totalReceived: 12345678901234n },
   { type: "StreamMoneyBlocked", streamId: 3n, sendMax: 255n, totalSent: 0n },
   { type: "StreamData", streamId: 1n, offset: 0n, data: new Uint8Array(0) },
-  { type: "StreamData", streamId: 2n, offset: 1n << 40n, data: Uint8Array.from({ length: 400 }, (_, i) => i & 0xff) },
+  {
+    type: "StreamData",
+    streamId: 2n,
+    offset: 1n << 40n,
+    data: Uint8Array.from({ length: 400 }, (_, i) => i & 0xff),
+  },
   { type: "StreamMaxData", streamId: 1n, maxOffset: 1n << 32n },
   { type: "StreamDataBlocked", streamId: 1n, maxOffset: 127n },
   { type: "StreamReceipt", streamId: 1n, receipt: Uint8Array.from({ length: 58 }, (_, i) => i) },
+  // What `@interledger/pay` sends to ask for the receiver's asset details.
+  { type: "ConnectionNewAddress", sourceAccount: "" },
 ];
 
 const packets: StreamPacket[] = [
   { sequence: 0n, ilpPacketType: IlpPacketType.Prepare, prepareAmount: 0n, frames: [] },
-  { sequence: MAX_UINT64, ilpPacketType: IlpPacketType.Fulfill, prepareAmount: MAX_UINT64, frames: [allFrames[8]!] },
-  { sequence: 1n, ilpPacketType: IlpPacketType.Prepare, prepareAmount: 1_000_000n, frames: allFrames },
-  { sequence: 255n, ilpPacketType: IlpPacketType.Reject, prepareAmount: 256n, frames: allFrames.slice(0, 7) },
+  {
+    sequence: MAX_UINT64,
+    ilpPacketType: IlpPacketType.Fulfill,
+    prepareAmount: MAX_UINT64,
+    frames: [allFrames[8]!],
+  },
+  {
+    sequence: 1n,
+    ilpPacketType: IlpPacketType.Prepare,
+    prepareAmount: 1_000_000n,
+    frames: allFrames,
+  },
+  {
+    sequence: 255n,
+    ilpPacketType: IlpPacketType.Reject,
+    prepareAmount: 256n,
+    frames: allFrames.slice(0, 7),
+  },
 ];
 
 const ours = <A, E>(result: Result.Result<A, E>): A => Result.getOrThrow(result);
@@ -70,7 +93,8 @@ describe("STREAM packet codec matches ilp-protocol-stream", () => {
       referencePacket({ sequence: 1n, ilpPacketType: 12, prepareAmount: 0n, frames: [frame] }).frames[0]!,
     ]);
 
-    // Skip the 4-byte packet header (version, type, 1-byte-VarUInt sequence, 1-byte-VarUInt amount) and count byte.
+    // Skip the 8-byte packet header: version and type, then the sequence, the prepare amount and the frame count,
+    // each a one-byte VarUInt (a length byte and a value byte).
     expect(
       Buffer.from(reference._serialize())
         .subarray(2 + 2 + 2 + 2)
@@ -128,11 +152,23 @@ describe("STREAM packet codec matches ilp-protocol-stream", () => {
     const tooBig = { sequence: 1n << 64n, ilpPacketType: 12, prepareAmount: 0n, frames: [] };
     const tooBigMoney: StreamFrame = { type: "StreamMoney", streamId: 1n, shares: 1n << 64n };
 
-    expect(Result.isFailure(encodeStreamPacket(tooBig))).toBe(true);
-    expect(Result.isFailure(encodeStreamFrame(tooBigMoney))).toBe(true);
-    expect(Result.isFailure(encodeStreamFrame({ type: "ConnectionNewAddress", sourceAccount: "not an address" }))).toBe(
-      true,
+    expect(reasonOf(encodeStreamPacket(tooBig))).toBe("out-of-range");
+    expect(reasonOf(encodeStreamFrame(tooBigMoney))).toBe("out-of-range");
+    expect(reasonOf(encodeStreamFrame({ type: "ConnectionNewAddress", sourceAccount: "not an address" }))).toBe(
+      "invalid-address",
     );
+  });
+
+  it("accepts an empty ConnectionNewAddress on the wire, as the reference does, but no other invalid address", () => {
+    const empty: StreamFrame = { type: "ConnectionNewAddress", sourceAccount: "" };
+    const wire = ours(encodeStreamFrame(empty));
+
+    expect(Array.from(wire)).toEqual([StreamFrameType.ConnectionNewAddress, 1, 0]);
+    expect(ours(decodeStreamFrame(wire))).toEqual(empty);
+
+    for (const sourceAccount of ["g", " ", "g.", "é"]) {
+      expect(reasonOf(encodeStreamFrame({ type: "ConnectionNewAddress", sourceAccount }))).toBe("invalid-address");
+    }
   });
 
   it("rejects an unsupported version and every strict prefix of a valid packet", () => {
@@ -140,7 +176,7 @@ describe("STREAM packet codec matches ilp-protocol-stream", () => {
     const wrongVersion = wire.slice();
     wrongVersion[0] = 2;
 
-    expect(Result.isFailure(decodeStreamPacket(wrongVersion))).toBe(true);
+    expect(reasonOf(decodeStreamPacket(wrongVersion))).toBe("invalid-field");
     expect(referenceDecodes(wrongVersion)).toBeUndefined();
 
     for (let length = 0; length < wire.length; length++) {
@@ -148,7 +184,7 @@ describe("STREAM packet codec matches ilp-protocol-stream", () => {
       const mine = decodeStreamPacket(prefix);
 
       // A prefix that ends exactly on a frame boundary still declares more frames than it has: truncated.
-      expect(Result.isFailure(mine)).toBe(true);
+      expect(reasonOf(mine)).toBe("truncated");
       expect(referenceDecodes(prefix)).toBeUndefined();
     }
   });

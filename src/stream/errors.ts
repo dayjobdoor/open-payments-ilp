@@ -1,7 +1,7 @@
 import type { YieldableError } from "effect/Cause";
 import * as Data from "effect/Data";
 
-/** Why a STREAM crypto, credential, receipt or sender operation failed. */
+/** Why a STREAM crypto, credential, receipt, sender or reply-reading operation failed. */
 export type StreamErrorReason =
   /** AES-256-GCM authentication failed, or the ciphertext is shorter than IV + tag. */
   | "decryption-failed"
@@ -14,7 +14,12 @@ export type StreamErrorReason =
   /** A receipt is not 58 bytes or has an unsupported version. */
   | "invalid-receipt"
   /** A receipt's HMAC does not match its secret: forged, corrupted or from another connection. */
-  | "receipt-hmac-mismatch";
+  | "receipt-hmac-mismatch"
+  /**
+   * A decrypted packet is not the one the caller expected (`sequence` or `ilpPacketType`): a replayed or misrouted
+   * reply.
+   */
+  | "unexpected-packet";
 
 interface StreamErrorFields {
   readonly reason: StreamErrorReason;

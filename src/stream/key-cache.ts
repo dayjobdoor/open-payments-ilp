@@ -42,10 +42,14 @@ function cached(
   return memo(cache, latin1(raw), importKey, KEY_CAPACITY);
 }
 
+/** Promises that settled with a value; only those count toward a cache's capacity or get evicted. */
+const settledPromises = new WeakSet<Promise<unknown>>();
+
 /**
  * The value cached under `id`, computed by `create` on a miss. Concurrent misses share one computation.
  * A computation that rejects or yields `undefined` is not kept. Once a computation succeeds, the least recently
- * used entries beyond `capacity` are evicted, so failing lookups never push out good entries.
+ * used settled entries beyond `capacity` are evicted. Computations still in flight neither count toward the capacity
+ * nor get evicted, so a burst of failing lookups never pushes out good entries.
  */
 export function memo<V>(
   cache: Map<string, Promise<V>>,
@@ -68,15 +72,33 @@ export function memo<V>(
 
   created.then(
     (value) => {
-      if (value === undefined) cache.delete(id);
-      else if (cache.size > capacity) {
-        for (const oldest of cache.keys()) {
-          cache.delete(oldest);
-          break;
+      // The entry was evicted or replaced meanwhile: leave whatever is there now alone.
+      if (cache.get(id) !== created) return;
+
+      if (value === undefined) {
+        cache.delete(id);
+
+        return;
+      }
+
+      settledPromises.add(created);
+      let excess = -capacity;
+
+      for (const entry of cache.values()) if (settledPromises.has(entry)) excess++;
+
+      // Map iteration runs oldest first, which is least recently used first.
+      for (const [key, entry] of cache) {
+        if (excess <= 0) break;
+
+        if (settledPromises.has(entry)) {
+          cache.delete(key);
+          excess--;
         }
       }
     },
-    () => cache.delete(id),
+    () => {
+      if (cache.get(id) === created) cache.delete(id);
+    },
   );
 
   return created;

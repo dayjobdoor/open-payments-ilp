@@ -14,7 +14,7 @@ export { IlpPacket, Reference, StreamServer };
 const MAX_UINT64 = (1n << 64n) - 1n;
 
 /** The reference frame object equivalent to `frame` (Long-backed numbers are passed as decimal strings). */
-export function referenceFrame(frame: StreamFrame): Reference.Frame {
+function referenceFrame(frame: StreamFrame): Reference.Frame {
   switch (frame.type) {
     case "ConnectionClose":
       return new Reference.ConnectionCloseFrame(frame.errorCode, frame.errorMessage);
@@ -192,7 +192,6 @@ export function referencePrepare(prepare: IlpPrepare): IlpPacket.IlpPrepare {
 export async function referenceRequest(
   sharedSecret: Uint8Array,
   packet: StreamPacket,
-  overrides: { readonly condition?: Uint8Array } = {},
 ): Promise<{ data: Uint8Array; condition: Uint8Array; fulfillment: Uint8Array }> {
   const { createHash, createHmac } = await import("node:crypto");
   const secret = Buffer.from(sharedSecret);
@@ -206,7 +205,7 @@ export async function referenceRequest(
 
   return {
     data: new Uint8Array(data),
-    condition: overrides.condition ?? new Uint8Array(condition),
+    condition: new Uint8Array(condition),
     fulfillment: new Uint8Array(fulfillment),
   };
 }

@@ -5,7 +5,8 @@
 
 const encoder = new TextEncoder();
 
-const decoder = new TextDecoder("utf-8", { fatal: true });
+// `ignoreBOM: true` keeps a leading U+FEFF, so decoding then re-encoding is the identity.
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 export function utf8Encode(text: string): Uint8Array<ArrayBuffer> {
   return encoder.encode(text);
@@ -31,7 +32,10 @@ export function concatBytes(...parts: ReadonlyArray<Uint8Array>): Uint8Array<Arr
   return out;
 }
 
-/** Length-independent comparison time for equal-length inputs; different lengths return false immediately. */
+/**
+ * Compares in time that does not depend on where the inputs differ (best effort in JavaScript). Inputs of different
+ * lengths return false immediately, which reveals the length.
+ */
 export function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
@@ -76,12 +80,32 @@ export function encodeBase64Url(bytes: Uint8Array): string {
   return encodeBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** Accepts padded or unpadded input. Throws on characters outside the base64url alphabet. */
+/**
+ * Lenient: accepts padded or unpadded input, and non-zero trailing bits (`QQ`, `QR` and `QW` all decode to `[65]`).
+ * Throws a `TypeError` on characters outside the base64url alphabet or an impossible length.
+ * Use {@link decodeBase64UrlStrict} where one byte string must have exactly one spelling.
+ */
 export function decodeBase64Url(text: string): Uint8Array<ArrayBuffer> {
   if (/[^A-Za-z0-9\-_=]/.test(text)) throw new TypeError("Invalid base64url");
   const base64 = text.replace(/-/g, "+").replace(/_/g, "/");
 
-  return decodeBase64(base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "="));
+  try {
+    return decodeBase64(base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "="));
+  } catch {
+    throw new TypeError("Invalid base64url");
+  }
+}
+
+/**
+ * Canonical decode: only what {@link encodeBase64Url} would write is accepted, i.e. unpadded, with zero trailing
+ * bits, so every byte string has exactly one spelling. Throws a `TypeError` otherwise.
+ */
+export function decodeBase64UrlStrict(text: string): Uint8Array<ArrayBuffer> {
+  const bytes = decodeBase64Url(text);
+
+  if (encodeBase64Url(bytes) !== text) throw new TypeError("Non-canonical base64url");
+
+  return bytes;
 }
 
 export async function sha256(data: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>> {

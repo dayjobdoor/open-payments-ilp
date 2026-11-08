@@ -42,7 +42,8 @@ export function asciiBytes(text: string, what: string): Uint8Array {
   return out;
 }
 
-const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+// `ignoreBOM: true` keeps a leading U+FEFF, so decoding then re-encoding is the identity.
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** Decodes UTF-8 bytes; malformed input is a codec failure rather than a `TypeError`. */
 export function utf8String(bytes: Uint8Array, what: string): string {
@@ -78,7 +79,7 @@ export class OerReader {
     return this.#bytes.length - this.#offset;
   }
 
-  /** Reads exactly `length` raw octets (fixed-length OCTET STRING). */
+  /** Reads exactly `length` raw octets (fixed-length OCTET STRING). `length` must be a non-negative integer. */
   readOctets(length: number): Uint8Array {
     const start = this.#take(length);
 
@@ -145,7 +146,10 @@ export class OerReader {
     return this.#bigint(this.#take(length), length);
   }
 
-  /** Like {@link readVarUInt} but a value wider than 8 bytes saturates to 2^64-1 (STREAM `receiveMax`/`sendMax`). */
+  /**
+   * Like {@link OerReader.readVarUInt} but a `VarUInt` encoded in more than 8 bytes saturates to 2^64-1, whatever
+   * its value (STREAM `receiveMax`/`sendMax`, as in `ilp-protocol-stream`).
+   */
   readVarUIntSaturating(): bigint {
     const length = this.readLengthPrefix();
 
@@ -204,6 +208,8 @@ export class OerReader {
   /** Claims `length` bytes and returns where they start. */
   #take(length: number): number {
     const start = this.#offset;
+
+    if (!Number.isInteger(length) || length < 0) codecFail("out-of-range", `${length} is not a valid length`);
 
     if (length > this.#bytes.length - start) {
       codecFail("truncated", `expected ${length} bytes but only ${this.#bytes.length - start} remain`);
@@ -329,7 +335,7 @@ export class OerWriter {
 
     if (Number.isNaN(year)) codecFail("invalid-timestamp", "expiresAt is an invalid Date");
 
-    if (year < 0 || year > 9999) codecFail("out-of-range", `year ${year} is outside 0000–9999`);
+    if (year < 0 || year > 9999) codecFail("invalid-timestamp", `year ${year} is outside 0000–9999`);
     this.#reserve(TIMESTAMP_LENGTH);
     this.#putDigits(year, 4);
     this.#putDigits(date.getUTCMonth() + 1, 2);

@@ -26,7 +26,8 @@ export interface StreamKeys {
 }
 
 /**
- * Derives the encryption and fulfillment keys from a STREAM shared secret (RFC 29 §3).
+ * Derives the encryption and fulfillment keys from a STREAM shared secret (RFC 29 §5.1.2 for the encryption key,
+ * §6.2 and §6.3 for the fulfillment key).
  * Secrets are 32 bytes by convention; like ilp-protocol-stream, any non-empty length is accepted so that
  * receivers with other secret sizes still interoperate.
  * Fails with `StreamError` (`invalid-key`) when the secret is empty.
@@ -58,7 +59,7 @@ export function keysForSecret(sharedSecret: Uint8Array): Promise<StreamKeys> {
 
 /**
  * Encrypts `plaintext` with AES-256-GCM under a fresh random 12-byte IV.
- * Output layout (RFC 29 §3.1): `IV (12) | auth tag (16) | ciphertext`.
+ * Output layout (RFC 29 §5.1.1): `IV (12) | auth tag (16) | ciphertext`.
  * Fails with `StreamError` (`invalid-key`) when `key` is not 32 bytes.
  */
 export function encryptStreamData(
@@ -135,7 +136,7 @@ export async function decrypt(key: Uint8Array, data: Uint8Array): Promise<Uint8A
 }
 
 /**
- * The fulfillment for an encrypted STREAM packet: `HMAC-SHA256(fulfillmentKey, data)` (RFC 29 §3.3).
+ * The fulfillment for an encrypted STREAM packet: `HMAC-SHA256(fulfillmentKey, data)` (RFC 29 §6.3).
  * `data` is the full encrypted payload of the Prepare. Fails with `StreamError` (`invalid-key`) for an empty key.
  */
 export function generateStreamFulfillment(
