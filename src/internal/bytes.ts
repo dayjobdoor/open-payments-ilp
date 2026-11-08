@@ -83,7 +83,6 @@ export function encodeBase64Url(bytes: Uint8Array): string {
 /**
  * Lenient: accepts padded or unpadded input, and non-zero trailing bits (`QQ`, `QR` and `QW` all decode to `[65]`).
  * Throws a `TypeError` on characters outside the base64url alphabet or an impossible length.
- * Use {@link decodeBase64UrlStrict} where one byte string must have exactly one spelling.
  */
 export function decodeBase64Url(text: string): Uint8Array<ArrayBuffer> {
   if (/[^A-Za-z0-9\-_=]/.test(text)) throw new TypeError("Invalid base64url");
@@ -94,18 +93,6 @@ export function decodeBase64Url(text: string): Uint8Array<ArrayBuffer> {
   } catch {
     throw new TypeError("Invalid base64url");
   }
-}
-
-/**
- * Canonical decode: only what {@link encodeBase64Url} would write is accepted, i.e. unpadded, with zero trailing
- * bits, so every byte string has exactly one spelling. Throws a `TypeError` otherwise.
- */
-export function decodeBase64UrlStrict(text: string): Uint8Array<ArrayBuffer> {
-  const bytes = decodeBase64Url(text);
-
-  if (encodeBase64Url(bytes) !== text) throw new TypeError("Non-canonical base64url");
-
-  return bytes;
 }
 
 export async function sha256(data: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>> {

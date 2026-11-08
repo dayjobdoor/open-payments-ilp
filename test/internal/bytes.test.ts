@@ -5,7 +5,6 @@ import {
   constantTimeEqualText,
   decodeBase64,
   decodeBase64Url,
-  decodeBase64UrlStrict,
   encodeBase64,
   encodeBase64Url,
   hmacSha256,
@@ -41,7 +40,6 @@ describe("base64url", () => {
     "rejects the impossible length of %j with a TypeError, not a DOMException",
     (text) => {
       expect(() => decodeBase64Url(text)).toThrow(TypeError);
-      expect(() => decodeBase64UrlStrict(text)).toThrow(TypeError);
     },
   );
 
@@ -54,45 +52,6 @@ describe("base64url", () => {
 
   it("lenient decoding gives one byte string several spellings: QQ, QR and QW all decode to [65]", () => {
     for (const text of ["QQ", "QR", "QW", "QX"]) expect(decodeBase64Url(text)).toEqual(Uint8Array.of(65));
-  });
-});
-
-describe("decodeBase64UrlStrict", () => {
-  it("accepts exactly what encodeBase64Url writes, for every length up to 40", () => {
-    for (let length = 0; length <= 40; length++) {
-      const bytes = Uint8Array.from({ length }, (_, i) => (i * 37 + 11) & 0xff);
-
-      expect(decodeBase64UrlStrict(encodeBase64Url(bytes))).toEqual(bytes);
-    }
-  });
-
-  it("accepts the one canonical spelling and rejects the others that lenient decoding allows", () => {
-    expect(decodeBase64UrlStrict("QQ")).toEqual(Uint8Array.of(65));
-
-    // Non-zero trailing bits.
-    for (const text of ["QR", "QW", "QX"]) expect(() => decodeBase64UrlStrict(text)).toThrow(TypeError);
-
-    // Padding is not written by encodeBase64Url.
-    expect(() => decodeBase64UrlStrict("QQ==")).toThrow(TypeError);
-    expect(() => decodeBase64UrlStrict("QUI=")).toThrow(TypeError);
-  });
-
-  it("rejects characters outside the base64url alphabet", () => {
-    for (const text of ["QQ+", "Q/Q", "Q Q", "QQ\n"]) expect(() => decodeBase64UrlStrict(text)).toThrow(TypeError);
-  });
-
-  it("has exactly one accepted spelling per byte string: of the 4 spellings of [65, 66], one is canonical", () => {
-    const accepted = ["QUI", "QUJ", "QUK", "QUL"].filter((text) => {
-      try {
-        decodeBase64UrlStrict(text);
-
-        return true;
-      } catch {
-        return false;
-      }
-    });
-
-    expect(accepted).toEqual(["QUI"]);
   });
 });
 
