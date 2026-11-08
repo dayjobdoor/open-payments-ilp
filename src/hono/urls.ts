@@ -8,21 +8,29 @@ import { isLoopbackHost } from "../internal/url";
 import { httpError, type Resolved } from "./config";
 
 /**
+ * Headers a reverse proxy adds. A loopback `Host` that comes with one is the proxy's upstream address, not where the
+ * user's browser is.
+ */
+const PROXY_HEADERS = ["x-forwarded-host", "x-forwarded-proto", "x-forwarded-for", "forwarded"] as const;
+
+/** Whether the request is the user's own loopback request: a loopback host, and no sign of a proxy in front. */
+const isDirectLoopbackRequest = (c: Context): boolean =>
+  isLoopbackHost(new URL(c.req.url).hostname) && PROXY_HEADERS.every((name) => c.req.header(name) === undefined);
+
+/**
  * A relative callback is resolved against `externalUrl`, or against the request only when that host is loopback.
  * A public request host is not the finish origin: a proxy that copies `Host` would register the attacker's URL.
  */
 const configuredOrigin = (c: Context, config: Resolved): string => {
   if (config.externalUrl !== undefined) return config.externalUrl;
-  const request = new URL(c.req.url);
-
-  if (!isLoopbackHost(request.hostname)) {
+  if (!isDirectLoopbackRequest(c)) {
     throw httpError(
       500,
       "Set externalUrl; the request host is neither the GNAP finish origin nor the origin of the post-login URL",
     );
   }
 
-  return request.origin;
+  return new URL(c.req.url).origin;
 };
 
 /** The URL the authorisation server sends the user back to: behind a proxy, below `externalUrl`. */
@@ -60,9 +68,7 @@ export const isCallbackRequest = (c: Context, config: Resolved): boolean => {
 /** The URL of the request as the user sees it. */
 export const publicRequestUrl = (c: Context, config: Resolved): string => {
   if (config.externalUrl === undefined) {
-    const request = new URL(c.req.url);
-
-    if (!isLoopbackHost(request.hostname)) {
+    if (!isDirectLoopbackRequest(c)) {
       throw httpError(500, "Set externalUrl; the request host is not used as the public origin");
     }
 
