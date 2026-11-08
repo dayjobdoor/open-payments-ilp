@@ -280,7 +280,8 @@ function withinCap(cap: Amount | undefined, amount: Amount): boolean {
  * Whether an outgoing payment's amounts fit the `debitAmount` / `receiveAmount` limits of the matched access
  * items. An item without the relevant limit does not constrain; with no limits at all the payment is allowed, but
  * with no matched item nothing authorizes it. A limit in another asset code or scale cannot be compared and rejects
- * the payment, as does a malformed value.
+ * the payment, as does a malformed value. A payment without a `receive` amount is rejected when an item limits
+ * `receiveAmount`: the limit cannot be checked, so it is not treated as met.
  */
 export function validateOutgoingPaymentAmounts(
   matchedAccess: AccessMatchItem[],
@@ -291,7 +292,10 @@ export function validateOutgoingPaymentAmounts(
     matchedAccess.length > 0 &&
     matchedAccess.every(
       (access) =>
-        withinCap(access.limits?.debitAmount, debit) && (!receive || withinCap(access.limits?.receiveAmount, receive)),
+        withinCap(access.limits?.debitAmount, debit) &&
+        (receive === undefined
+          ? access.limits?.receiveAmount === undefined
+          : withinCap(access.limits?.receiveAmount, receive)),
     )
   );
 }

@@ -1,7 +1,9 @@
 name: CI
 
 on:
-  # manual only while GitHub billing blocks runs; restore pull_request / push (main) once it is fixed
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 concurrency:

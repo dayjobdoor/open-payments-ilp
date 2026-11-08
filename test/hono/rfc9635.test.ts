@@ -658,6 +658,21 @@ describe("front-channel URIs (RFC 9635 §2.5.2, §2.5.2.1, §4.1.1)", () => {
     expect(insecure.as.calls).toHaveLength(0);
   });
 
+  it("does not trust a loopback Host that a reverse proxy forwards, whatever header it adds", async () => {
+    const proxied = await createApp({}, { externalUrl: undefined });
+    const page = { accept: "text/html" };
+
+    for (const header of ["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded"]) {
+      const response = await proxied.app.request("http://localhost:3000/", { headers: { ...page, [header]: "x" } });
+
+      expect(response.status, header).toBe(500);
+    }
+
+    expect(proxied.as.calls).toHaveLength(0);
+    // The same request without a proxy header is the user's own, as before.
+    expect((await proxied.app.request("http://localhost:3000/", { headers: page })).status).toBe(302);
+  });
+
   it("does not send the user to an interaction URI that is not HTTPS", async () => {
     const h = await createApp();
 

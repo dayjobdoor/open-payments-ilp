@@ -3,6 +3,16 @@
 This project follows [semantic versioning](https://semver.org/). While the major version is `0`, minor
 releases may contain breaking changes.
 
+## Unreleased
+
+- **Fix, `/better-auth`:** deleting a user now deletes the grants that user approved, and with them their tokens (`gnapGrant.userId` is `ON DELETE CASCADE`, it was `SET NULL`: the grants and tokens stayed valid with no owner). A database created earlier keeps its old constraint until you alter that foreign key. The plugin also revokes the user's grants and live tokens from a `databaseHooks.user.delete.before` hook, for adapters that do not cascade (the memory adapter, MongoDB); it runs next to a `user.delete.before` hook of your own. `revokeUserGrants` is exported from `/better-auth`.
+- `/better-auth`: `betterAuthGnapStore` deletes expired `gnapNonce` rows itself, at most once a minute per process, when the adapter has `deleteMany` (optional in `GnapDb`).
+- **Fix, `/gnap`:** `validateOutgoingPaymentAmounts` rejects a payment that has no `receive` amount when an access item limits `receiveAmount` (it passed, so a caller that left `receive` out switched the limit off).
+- `/gnap/server`: with `interactionBinding`, the bound browser's later visits to `/finish` push again until the client continues, so a failed `finish.method: "push"` delivery is repaired by the next visit. Without it the push is still made once.
+- `/hono`: a loopback `Host` that comes with `X-Forwarded-*` or `Forwarded` is no longer taken as the public origin without `externalUrl`: the proxy's upstream address is not where the user's browser is.
+- CI runs on every push to `main` and every pull request (it was manual only).
+- Removed the unused `decodeBase64UrlStrict` helper. The README-example test compares tokens, so a changed identifier no longer passes.
+
 ## 0.1.0-alpha.3 (2026-11-08)
 
 - `/plain/ilp`, `/plain/ildcp`, `/plain/http-signatures`, `/plain/open-payments`: Promise and exception entry points over the Effect modules, shaped after `ilp-packet`, `ilp-protocol-ildcp` and `@interledger/open-payments` (`await createAuthenticatedClient({ walletAddressUrl, keyId, privateKey })`, `privateKey` as CryptoKey, JWK or PEM). `effect` stays a required peer dependency.

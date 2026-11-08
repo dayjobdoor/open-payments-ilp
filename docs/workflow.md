@@ -5,7 +5,7 @@ How changes get into `main` and onto npm. History is managed with [jj](https://j
 ## jj
 
 - The working copy `@` is always one commit; edits update it, no `git add`. `◆` is immutable (pushed), `○` is mutable. Bookmarks (git branches) do not move on their own.
-- git hooks do not run for jj commits: checks live in CI (`.github/workflows/ci.yml`, manual dispatch only while GitHub billing blocks runs: `gh workflow run ci.yml`), and locally you run `mise run check` yourself before pushing.
+- git hooks do not run for jj commits: checks live in CI (`.github/workflows/ci.yml` runs on every push to `main` and every pull request, and on demand with `gh workflow run ci.yml`), and locally you run `mise run check` yourself before pushing.
 - Commit messages: `feat:` `fix:` `test:` `docs:` `chore:`. A commit without a description cannot be pushed.
 
 ```sh

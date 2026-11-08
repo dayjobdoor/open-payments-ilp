@@ -377,7 +377,17 @@ describe("README examples", () => {
 });
 
 describe("README is in sync with this file", () => {
-  const strip = (text: string) => text.replace(/\s+/g, "").replace(/,([)}\]])/g, "$1");
+  // Whitespace and a trailing comma before a closing bracket are formatting; everything else must match, token for
+  // token (`a b` is not `ab`).
+  const tokens = (text: string): string[] => {
+    const all = text.match(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|\w+|[^\s\w]/g) ?? [];
+
+    return all.filter((token, index) => !(token === "," && [")", "}", "]"].includes(all[index + 1] ?? "")));
+  };
+
+  const contains = (haystack: string[], needle: string[]): boolean =>
+    needle.length > 0 &&
+    haystack.some((_, start) => needle.every((token, offset) => haystack[start + offset] === token));
 
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
 
@@ -395,6 +405,12 @@ describe("README is in sync with this file", () => {
   for (const [, names, specifier] of source.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+"([^"]+)"/g)) {
     available.set(specifier!, new Set(names!.split(",").map((name) => name.trim().replace(/^type\s+/, ""))));
   }
+
+  it("compares tokens, not characters", () => {
+    expect(contains(tokens("const ab = f(a, b,)"), tokens("const ab = f(a, b)"))).toBe(true);
+    expect(contains(tokens("const a b = 1"), tokens("const ab = 1"))).toBe(false);
+    expect(contains(tokens("f(1, 2)"), tokens("f(1, 3)"))).toBe(false);
+  });
 
   it("lists the tables of gnapSchema", () => {
     const sentence = /migration to create the \w+ tables \(([^)]*)\)/.exec(readme)?.[1] ?? "";
@@ -490,7 +506,7 @@ describe("README is in sync with this file", () => {
 
       if (!named) {
         // `import * as X from "effect/…"`: must be present verbatim.
-        expect(strip(source)).toContain(strip(statement.replace(/;$/, ";")));
+        expect(contains(tokens(source), tokens(statement)), statement).toBe(true);
         continue;
       }
 
@@ -516,6 +532,6 @@ describe("README is in sync with this file", () => {
       }
     }
 
-    expect(strip(source)).toContain(strip(body));
+    expect(contains(tokens(source), tokens(body)), "this README block is not written out in this file").toBe(true);
   });
 });
