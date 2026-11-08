@@ -7,15 +7,18 @@ client, a [Better Auth](https://better-auth.com) GNAP plugin, and a [Hono](https
 ## Install
 
 ```sh
-npm i open-payments-ilp effect
+npm i open-payments-ilp@alpha effect
 # only for the /better-auth subpaths:
 npm i better-auth
 # only for the /hono subpath:
 npm i hono
 ```
 
+Releases are prereleases on the `alpha` dist-tag (`latest` still points at `0.1.0-alpha.0`), so install
+`open-payments-ilp@alpha`.
+
 `effect` (`^4.0.0`) is a peer dependency. `better-auth` (`^1.6.19`) is an optional peer dependency used by
-`open-payments-ilp/better-auth` only, `hono` (`^4.7.11`) by `open-payments-ilp/hono` only. The package is ESM only and ships TypeScript declarations.
+`open-payments-ilp/better-auth`, `/better-auth/client` and `/plain/better-auth` only, `hono` (`^4.7.11`) by `open-payments-ilp/hono` only. The package is ESM only and ships TypeScript declarations.
 
 ## Runtime support
 
@@ -29,32 +32,105 @@ are untested. `engines` is not set because the requirement is a runtime feature,
 
 ## Design
 
-- **Effect only.** Anything that does I/O, WebCrypto, or needs a clock returns an `Effect`; run it with
+- **Effect-native.** Anything that does I/O, WebCrypto, or needs a clock returns an `Effect`; run it with
   `Effect.runPromise` or compose it into your own program. The framework adapters (`/better-auth`, `/hono`) are the
-  exception: they speak the Promises of their framework.
+  exception: they speak the Promises of their framework. If you do not want to write Effect, the
+  [`/plain/*` entry points](#plain-promises-and-exceptions-open-payments-ilpplain) wrap the same code in Promises and exceptions.
 - **`Result` for synchronous codecs.** Parsers and serializers (`/ilp`, `/ildcp`, STREAM packets, amounts, JCS) are pure and
   return `Result<A, E>` from `effect/Result`; they never throw on bad input.
 - **`bigint` amounts.** ILP amounts and STREAM counters are `bigint`. Open Payments amounts keep their wire form
   (`value` as a digit string) and are converted with the helpers in `/open-payments`.
 - **Tagged errors.** Each subpath fails with its own tagged error, discriminated by a `reason` that is always
-  kebab-case (`non-canonical`, `invalid-key`, `unknown-key`, ...): `/ilp` and `/ildcp` with `IlpCodecError`, `/stream`
+  kebab-case (`non-canonical`, `invalid-key`, `unknown-key`, ...): `/ilp` and `/ildcp` with `IlpCodecError` (and `/ilp`'s `postPrepare` with `IlpHttpError`), `/stream`
   with `StreamError | IlpCodecError`, `/http-signatures` with `HttpSignatureError`, `/open-payments` with
   `OpenPaymentsError`, `/gnap` with `GnapClientFieldError` (an unusable `client` field only), `/webhooks` with
   `WebhookError`. `/gnap/server` fails with `GnapRouteError` (the HTTP `status` and GNAP `code` of a failed exchange, no
   `reason`), `/hono` throws `GnapAuthError` (untagged, `status` and `code`), and `/better-auth` throws Better Auth's
-  `APIError`. Protocol strings (GNAP error `code`s, ILP error codes) are wire values and keep the protocol's spelling.
+  `APIError` from its consent endpoints (the GNAP protocol routes answer with GNAP error bodies). Protocol strings (GNAP error `code`s, ILP error codes) are wire values and keep the protocol's spelling.
 - **Explicit time.** Anything that reads the current time takes `clock?: () => Date` (default `new Date()`):
-  `verifyRequest`, `signWebhook`, `verifyWebhookSignature`, `isValidWebhookSignature`, the Open Payments clients (the
+  `verifyRequest`, `signWebhook`, `verifyWebhookSignature`, `isValidWebhookSignature`, `fetchIldcp`, the Open Payments clients (the
   `created` of their signatures), `createGnapServer`, the `/better-auth` plugin and `/hono`. Pure codecs and helpers take
   the value itself: `expiresAt`, `serveIldcp({ now })`, `currentAccessIntervalStart(anchor, interval, now)` and
   `SignOptions.created`.
 - **Tree-shakeable.** `sideEffects: false`; each subpath is its own entry point.
 
+## Plain Promises and exceptions: `open-payments-ilp/plain/*`
+
+**`effect` is still a required peer dependency**: these entry points run the Effect code internally, so only your own
+code is free of Effect. npm 7+, pnpm and Bun install required peers on their own, so `npm i open-payments-ilp@alpha` is enough
+there; install `effect` yourself on tooling that does not (npm 6, `legacy-peer-deps`).
+
+Every subpath that returns `Effect` or `Result` has a plain counterpart (except the OER primitives `OerReader`,
+`OerWriter`, `readOer` and `writeOer` of `/ilp`, which stay `Result`-based) with the same behaviour and no Effect types in
+your code, shaped after `ilp-packet`, `ilp-protocol-ildcp`, `@interledger/http-signature-utils` and
+`@interledger/open-payments`:
+
+| Plain entry                        | Counterpart                          | What changes                                                                                   |
+| ---------------------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `/plain/ilp`, `/plain/ildcp`       | `/ilp`, `/ildcp`                     | Codecs return the value or throw `IlpCodecError`; `postPrepare` returns a `Promise`.            |
+| `/plain/stream`                    | `/stream`                            | Crypto and receiver return `Promise`; `accept()` / `temporaryDecline()` / `finalDecline()` too. |
+| `/plain/http-signatures`           | `/http-signatures`                   | `Promise`s; `resolveKey` is a plain (async) function; `importPrivateKey` takes key, JWK or PEM. |
+| `/plain/open-payments`             | `/open-payments`                     | `await createAuthenticatedClient(...)`; every route returns a `Promise`.                        |
+| `/plain/webhooks`                  | `/webhooks`                          | Sign and verify return `Promise`s; `canonicalizeJson` throws `WebhookError`.                    |
+| `/plain/gnap`                      | `/gnap`                              | Digest helpers return `Promise`s; client-field parsers throw `GnapClientFieldError`.            |
+| `/plain/gnap/server`               | `/gnap/server`                       | `GnapStore` and every hook (`tenants`, `resolveClientKeys`, `authorize`, `onError`, ...) may be `async`; handlers return `Promise`s. |
+| `/plain/gnap/server/testing`       | `/gnap/server/testing`               | `storeContract` for a Promise `GnapStore`.                                                      |
+| `/plain/better-auth`               | `/better-auth`                       | `gnap({ ...async hooks })` and a Promise `betterAuthGnapStore`.                                 |
+
+`/hono` and `/better-auth/client` never used Effect in their API, so they have no plain entry. The pure helpers that never
+returned `Effect` or `Result` (wire types, `/gnap` access helpers) are re-exported unchanged; the `/open-payments` amount
+helpers, which return `Result` in the main entry, return their value or throw in `/plain/open-payments`.
+
+- I/O and WebCrypto functions return a `Promise` that rejects with the tagged error (`HttpSignatureError`,
+  `OpenPaymentsError`, `IlpHttpError`, ...).
+- Codecs return the value and throw `IlpCodecError`; there is no `Result`.
+- Clients are created with `await`. `privateKey` is a `CryptoKey`, a private JWK or a PKCS#8 PEM string; nothing reads a
+  file.
+- `verifyRequest(request, { resolveKey })` takes a plain, possibly async, function that returns the JWK, or
+  `null`/`undefined` for an unknown key (`unknown-key`). A thrown `HttpSignatureError` passes through as it is; any other
+  throw is a defect and rejects with that error.
+- `ilp-packet` spellings (`serializeIlpPrepare`, `deserializeIlpReply`, ...) are exported next to the short names.
+  Amounts stay `bigint`, bytes stay `Uint8Array` and expiries stay `Date`, so this is the same API shape, not a byte-for-byte
+  drop-in.
+
+```ts
+import { deserializeIlpPrepare, serializeIlpPrepare } from "open-payments-ilp/plain/ilp";
+
+const wire = serializeIlpPrepare({
+  amount: 100n,
+  expiresAt: new Date("2030-01-01T00:00:00.000Z"),
+  executionCondition: new Uint8Array(32),
+  destination: "g.alice",
+  data: new Uint8Array(0),
+});
+const prepare = deserializeIlpPrepare(wire); // throws IlpCodecError on malformed bytes
+```
+
+```ts
+import { createAuthenticatedClient } from "open-payments-ilp/plain/open-payments";
+
+const client = await createAuthenticatedClient({
+  walletAddressUrl: "https://wallet.example/alice",
+  keyId: "my-key",
+  privateKey, // CryptoKey, private JWK or PKCS#8 PEM string
+});
+const incomingPayment = await client.incomingPayment.create(
+  { url: "https://wallet.example/rs", accessToken },
+  { walletAddress: "https://wallet.example/alice" },
+);
+```
+
+The plain entry points are a layer over the Effect implementation, so `effect` is still a required peer dependency and
+the thrown errors are the same tagged `Error` classes. A Promise `GnapStore` method that rejects is a defect, as an
+Effect store that dies: the request is answered `500` and `onError` receives the original error.
+
 ## Subpaths
 
 ### `open-payments-ilp/ilp`
 
-RFC 27 packets (Prepare, Fulfill, Reject), the OER subset of RFC 30, ILP addresses, fulfillment/condition helpers, and an ILP-over-HTTP (RFC 35) client.
+RFC 27 packets (Prepare, Fulfill, Reject), the OER subset of RFC 30, ILP addresses, fulfillment/condition helpers, and a synchronous ILP-over-HTTP client for the peer-to-peer profile of RFC 35 (the reply is the response body; the
+asynchronous `Request-Id` / `Callback-Url` mode is not implemented). `postPrepare` checks `timeoutMs` (finite, at most 2^31-1
+ms) and `maxReplyBytes`; a bad value is `invalid-option`. A Reject `message` over 8191 bytes cannot be serialized.
 
 ```ts
 import * as Result from "effect/Result";
@@ -109,8 +185,13 @@ RFC 29 STREAM: packet and frame codecs, AES-256-GCM packet encryption, SPSP-styl
 connection is re-derived from the destination address), a receiver (`createStreamReply`) and sender helpers
 (`planStreamChunks`, `buildStreamPrepare`). `buildStreamPrepare` takes `minDestinationAmount` (default `amount`) and
 `unfulfillable` (a rate probe: the receiver answers `F05` with the amount it received); `decryptStreamPacket` reads
-replies, `decodeStreamReceipt` / `verifyStreamReceipt` handle RFC 39 receipts, and `decodeStreamPaymentTag` reads the
-payment tag from a destination address. Imported keys, server-secret derivations and authenticated connection tokens are
+replies (pass `{ expect: { sequence, ilpPacketType } }` to refuse a reply that does not belong to its request: a connector
+can replay an older encrypted reply, `unexpected-packet`), `decodeStreamReceipt` / `verifyStreamReceipt` handle RFC 39 receipts
+(the `secret` lookup may be async), and `decodeStreamPaymentTag` reads the
+payment tag from a destination address. `sourceAddress` of `buildStreamPrepare` may be left out: the Prepare then carries
+the empty `ConnectionNewAddress` that `@interledger/pay` sends for asset probes. `connectionId` of a pending reply is the
+hash of the whole destination address, so trailing segments or another spelling of the token give another id: do not key
+per-connection state on it without normalising. Imported keys, server-secret derivations and authenticated connection tokens are
 cached in small bounded in-memory maps (only authenticated tokens).
 
 ```ts
@@ -151,7 +232,10 @@ structured-field parser. `verifyRequest` calls `resolveKey` only after every str
 the time from its `clock` option (default `new Date()`). `HttpSignatureError` has an optional `cause`: what actually went wrong underneath a `resolveKey` failure.
 `importEd25519PrivateKeyPem` imports a PKCS#8 PEM, and `exportPublicJwk(key, { keyId })` returns the publishable
 Open Payments JWK (`kid`, `alg: "EdDSA"`, `kty`, `crv`, `x`). A server that enforces once-only `nonce`s must remember
-each one for `SIGNATURE_REPLAY_WINDOW_SECONDS` (331 s, exported), the longest a signature can still verify.
+each one for `SIGNATURE_REPLAY_WINDOW_SECONDS` (331 s, exported), the longest a signature can still verify with the
+default `maxAgeSeconds`; `VerifiedSignature.replayWindowSeconds` is the window of the options actually used. The body is
+read, capped at `maxBodyBytes` (64 KiB by default), only when a `content-digest` is covered. A verifier option that is not
+a finite number, or a clock that returns an Invalid Date, fails with reason `invalid-config`.
 
 ```ts
 import * as Effect from "effect/Effect";
@@ -175,11 +259,15 @@ Wire types generated from the Open Payments OpenAPI documents, amount helpers, a
 `createUnauthenticatedClient`. Pass your own `fetch` to test or to run behind a proxy. Options: `validateResponses`
 (default `true`; bodies are validated and returned unchanged), `requestTimeoutMs` (default 5000), `clock` (the time of the
 signatures' `created`, default `new Date()`) and `maxResponseBytes`
-(default 1 MiB; a longer response, announced or streamed, is a `transport` error). Retries are opt-in: `retry: { maxAttempts,
+(default 1 MiB; a longer response, announced or streamed, is a `transport` error). Every request URL must be `https:` (`useHttp: true`,
+for tests and local servers, sends them over `http:`), without credentials or fragment; any other URL fails with
+`invalid-request` before anything is sent, and `urlPolicy: (url) => boolean` can refuse more. A redirect is never followed
+(`transport`). Retries are opt-in: `retry: { maxAttempts,
 baseDelayMs, maxDelayMs, jitter, retryOn, retryNonIdempotent, sleep, random }` retries network errors, timeouts and
 `408`/`429`/`502`/`503`/`504` of `GET`/`HEAD`/`PUT`/`DELETE` with exponential backoff and jitter, honours `Retry-After`
-(capped by `maxDelayMs`) and signs every attempt again with a fresh `created` and `nonce`. A `POST` may already have been
-processed, so it is repeated only with `retryNonIdempotent: true` (client-wide or per request). The last error carries
+of `429` and `503` (a longer wait than `maxDelayMs` ends the retries) and signs every attempt again with a fresh `created` and `nonce`. A `POST` or `PATCH` may already have been
+processed, so it is repeated only with `retryNonIdempotent: true` (client-wide or per request); `token.rotate` and
+`grant.continue` use up what they were given and are repeated only with the per-request flag. The last error carries
 `attempts`. Without `retry` a failed request fails at once. Get the signing key with `importEd25519PrivateKeyPem(pem)` or
 `importEd25519PrivateJwk` from `/http-signatures`, then pass it as `privateKey` to `createAuthenticatedClient`.
 
@@ -285,13 +373,14 @@ and is not cached; host names are not resolved and any port is allowed, so pass 
 egress policy if DNS rebinding or request volume matters; token management also checks the presented
 `GNAP` token; the interaction is looked up (`404`) before `x-idp-secret` is checked, as in Rafiki; the interaction expiry is also checked at
 start; the consent URL's `clientName` / `clientUri` come from the stored grant, not from the query; the session cookie
-value is the interaction nonce (it ties the browser to the URL, but anyone who knows the nonce can set it; Rafiki's is a signed session); finishing a finalized grant redirects again without reopening it. Not in this server:
+value is the interaction nonce (it ties the browser to the URL, but anyone who knows the nonce can set it; Rafiki's is a signed session), so a store with `interactionBinding` also binds the interaction to the first browser that opens it (see **Interaction binding**); finishing a finalized grant redirects again without reopening it. Not in this server:
 wallet address document resolution (keys come from `{walletAddress}/jwks.json`), and Rafiki's separate
 introspection port (`/introspect` is served on the same mount, off unless `introspection.authorize` is set; the hook answers
 `false` to refuse a caller, `true` to let it ask about any token, or `{ tenantId }` to scope it: tokens of other tenants are `{ active: false }`; any other answer is refused).
 
 **Observing failures.** The server logs nothing: causes can embed SQL parameters. `onError(cause)` is called with the
-`Cause` of every unexpected failure answered with a `500` (a store outage, a throwing callback, a bug); it never sees
+`Cause` of every `500` the route answers: a defect (a store outage, a throwing callback, a bug) or the server's own `500`
+(three lost optimistic-lock attempts, a grant without a consent URL), whose cause is a `GnapRouteError`; it never sees
 the request, the host decides what to redact and log, and a failure inside the hook never changes the response. A
 client whose keys cannot be fetched gets `400 invalid_client` and does not reach `onError`: wrap the default key fetch
 to log why. Its `HttpSignatureError` (`unknown-key`) carries the timeout, status, size or not-a-JWK-set error as
@@ -350,6 +439,18 @@ import { storeContract } from "open-payments-ilp/gnap/server/testing";
 
 storeContract({ describe, it }, "my database", async () => createMyStore(await freshDatabase()));
 ```
+
+**Interaction binding.** The nonce in `/interact/:id/:nonce` and in the consent URL is not a secret, so the cookie Rafiki
+sets (whose value is that nonce) cannot tell which browser opened the interaction. A store that persists
+`GrantRecord.interactBinding` and sets `interactionBinding: true` (`memoryGnapStore()` and `betterAuthGnapStore()` do; the
+contract kit checks it) gets a stronger check: the first visit to `/interact/:id/:nonce` receives a random secret in the
+`gnap-binding-<interactId>` cookie (HttpOnly, `SameSite=Lax`, scoped to the server's base path) and only its hash is stored;
+a later visit by another browser gets none. `/finish` is refused (`401`) to a browser without that cookie, and
+`decideInteraction` with a `userId` is refused (`403`) without `binding` (`bindingFromRequest(request, interactId)`) once an
+interaction is bound, so a user who opens the consent URL in another browser cannot approve a grant that browser's owner
+then collects. A replaced interaction (`PATCH`) starts unbound. Not covered: the `x-idp-secret` back channel and
+`decideInteraction` without `userId`, where your consent page vouches for the browser; and a store without the flag keeps
+Rafiki's nonce-cookie check.
 
 **Extended records.** Grant modification (`PATCH /continue/:id`), `access_token` arrays and `finish.method: "push"` need
 a store that keeps the optional fields `GrantRecord.finishMethod` / `tokenRequests` and `TokenRecord.access` / `label`.
@@ -431,8 +532,9 @@ const auth = betterAuth({
 });
 ```
 
-Run the Better Auth CLI migration to create the three tables (`gnapGrant` with a nullable `tenantId`, `gnapAccessToken` and
-`gnapNonce`; unique indexes on every lookup column). `gnapNonce` gets a row for each signed request that carries a
+Run the Better Auth CLI migration to create the three tables (`gnapGrant` with a nullable `tenantId` and a nullable
+`interactBinding`, `gnapAccessToken` and `gnapNonce`; unique indexes on every lookup column). A database created by an
+earlier alpha needs the migration for the new `interactBinding` column before the plugin runs. `gnapNonce` gets a row for each signed request that carries a
 `nonce` (every request of this package's own client): delete the rows whose `expiresAt` has passed now and then.
 Endpoints live under the Better Auth base path (`/api/auth` by default) and delegate to
 [`open-payments-ilp/gnap/server`](#open-payments-ilpgnapserver) with a Better Auth `GnapStore`:
@@ -451,9 +553,11 @@ The options of `gnap()` are those of `createGnapServer` without `baseUrl` and `s
 `expiresInSeconds`, `authorize`), `idpSecret`, `introspection` (`authorize`), `policy` (`requiresInteraction`),
 `waitSeconds`, `accessTokenExpiresInSeconds`, `resolveClientKeys`, `finishHashEncoding` (`"base64"` default, as Rafiki
 sends it; `"base64url"` is the RFC 9635 encoding), `maxBodyBytes`, `fetch`, `clock`, `onError` (as for the core, it
-sees the failures of the GNAP routes) and `generateToken`. Grant requests
-(20 a minute) and continue requests (30 a minute) are limited per client IP and per URL while Better Auth's rate limiter is
-on (by default in production) and knows the client IP: Better Auth keys the bucket by IP and path, so continue requests are
+sees the failures of the GNAP routes, not those of the consent endpoints) and `generateToken`, plus `rateLimit`
+(`{ grantRequest?: { window, max }, continue?: { window, max } }`, or `false` for none). Grant requests
+(20 a minute) and continue requests (30 a minute) by default are limited per client IP and per URL while Better Auth's
+rate limiter is on (by default in production). Without a client IP Better Auth uses one shared bucket per path, so set
+`advanced.ipAddress` (and `trustedProxies`) for a deployment behind a proxy: Better Auth keys the bucket by IP and path, so continue requests are
 counted per continue URL and, with `tenants`, grant requests per tenant segment; changing the id or tenant segment starts a
 new bucket. Volume limiting belongs at the edge. The consent URL carries `interactId`, `nonce`, `clientName` and `clientUri`; the
 session consent API takes `interactId` and `nonce`. Server-side,
@@ -469,13 +573,19 @@ With `tenants` (Rafiki v2 multi-tenancy) the grant endpoint is `POST /gnap/:tena
 custom `GnapStore` or Better Auth migration needs a nullable `tenantId` column on the grant (`gnapGrant.tenantId`;
 the schema field is optional).
 
-**Consent.** The consent endpoints decide for the signed-in user, which proves nothing about who owns the wallet address
+**Consent.** The consent endpoints (the `GET` that shows the grant as well as accept and reject) work for the signed-in user,
+which proves nothing about who owns the wallet address
 a grant names (sign-up is open in the example). They answer `403` until you set `interaction.authorize`: it receives the
 `userId` and the grant's `details` and must answer `true` only if that user owns every wallet address the grant names,
 in `details.access` and in `details.subject` (a grant may carry only a subject, with no access items). The consent page
 has to reach these endpoints with the session cookie: serve it from the same site
 as the auth server (a shared parent domain with cross-subdomain cookies), or set up Better Auth's `trustedOrigins`, CORS
 and cookie attributes for the cross-site case.
+
+Accept and reject also need the browser to be the one that opened `interact.redirect`: that visit sets the `gnap-binding-<interactId>`
+cookie (HttpOnly, scoped to the plugin's base path), and a user who opens the consent URL in another browser gets
+`403`. `/finish` needs the same cookie. With your own consent endpoint around `decideInteraction`, pass
+`binding: bindingFromRequest(request, interactId)` from `open-payments-ilp/gnap/server`.
 
 ### `open-payments-ilp/better-auth/client`
 
@@ -499,7 +609,8 @@ A GNAP **client** middleware for [Hono](https://hono.dev), modelled on
 `/callback` route, a refresh interval, a session lifetime, a refresh error hook. It works against a Rafiki / Open
 Payments authorisation server and against a generic RFC 9635 one. It needs the optional peer `hono`.
 
-1. No session: a `GET` navigation (`Sec-Fetch-Mode` absent or `navigate`) makes the middleware POST a signed grant
+1. No session: a `GET` navigation (`Sec-Fetch-Mode: navigate`, or no `Sec-Fetch-Mode` and `Accept: text/html`; never a
+   prefetch, `Sec-Purpose` or `Purpose: prefetch`) makes the middleware POST a signed grant
    request (`interact.start: ["redirect"]`, `interact.finish` with a fresh nonce and your callback URL) and redirect
    the user to `interact.redirect`; any other request without a session (an SPA's `fetch`, a `POST`) gets `401`. The
    encrypted, short-lived state (continue URI and token, nonces, the grant endpoint, where to return to) goes into one
@@ -518,8 +629,8 @@ Payments authorisation server and against a generic RFC 9635 one. It needs the o
    with the one-time `interact_ref`) and, while the server says pending, waits its `wait` and polls without
    `interact_ref` a bounded number of times, then stores the session. An RFC 9635 server reports a denial through the
    same finish redirect and answers the continue call with `user_denied` (or `request_denied`): `401`, like Rafiki's
-   `result=grant_rejected`. A bearer token that comes with a key, an `access_token` array and an access token past its
-   `expires_in` are refused.
+   `result=grant_rejected`. A bearer token that comes with a key and an `access_token` array are refused. An access token already past its
+   `expires_in` is accepted at the callback and rotated on the next request, or the session ends when it cannot be.
 3. The session is an AES-256-GCM encrypted value (key derived from `secret` with HKDF; an HS256 JWT with `encryptCookies: false`) in an httpOnly, Secure, `SameSite=Lax` cookie: the access token, its `manage` and
    `continue` credentials and two times. After the refresh interval (or when the token is about to expire) the
    access token is rotated through its management URI and the cookie re-issued; when the session lifetime is over it is
@@ -595,13 +706,16 @@ app.use(
 app.use("*", gnapAuthMiddleware());
 ```
 
-Everything but `access` can come from environment variables instead; a value in the config wins over its variable,
+Everything but `access`, `fetch`, `clock`, `requestTimeoutMs` and `encryptCookies` (default `true`; changing it logs every
+user out) can come from environment variables instead; a value in the config wins over its variable,
 except that the private key is resolved as a unit (passing `privateKey` or `privateJwk` ignores both `GNAP_PRIVATE_KEY`
 and `GNAP_PRIVATE_JWK`): `GNAP_AUTH_SECRET` (random, at least 32 characters: never this README's placeholders),
 `GNAP_GRANT_ENDPOINT`, `GNAP_KEY_ID`, `GNAP_PRIVATE_KEY` (PEM), `GNAP_PRIVATE_JWK` (JWK as JSON), `GNAP_CLIENT`,
 `GNAP_REDIRECT_URI` (default `/callback`), `GNAP_COOKIE_NAME` (`gnap-auth`), `GNAP_COOKIE_PATH` (`/`),
 `GNAP_COOKIE_DOMAIN`, `GNAP_AUTH_REFRESH_INTERVAL` (seconds, 900), `GNAP_AUTH_EXPIRES` (seconds, 86400, at most
-34 560 000) and `GNAP_AUTH_EXTERNAL_URL` (public origin of this app; required on any host that is not loopback, unless `redirectUri` is absolute). `access` and `grantEndpoint` may be
+34 560 000) and `GNAP_AUTH_EXTERNAL_URL` (public origin of this app, may carry a path prefix; required on any host that is not
+loopback, also with an absolute `redirectUri`, because the post-login URL is built from it). An empty or blank
+`GNAP_AUTH_REFRESH_INTERVAL` or `GNAP_AUTH_EXPIRES` counts as unset. `access` and `grantEndpoint` may be
 functions of the request context. `fetch`, `clock` and `requestTimeoutMs` (default 10 000 ms: it aborts every call to
 the authorisation server and the read of its answer, which is capped at 64 KiB) are set in the config (tests, Workers).
 
@@ -609,13 +723,13 @@ What you pass to `initGnapAuthMiddleware` is checked when it is called, not on t
 fewer than 32 characters, a negative or non-numeric `refreshInterval`, an `expires` that is not positive or exceeds 34 560 000, a
 `requestTimeoutMs` that is not a positive finite number, an `externalUrl` that is no URL, a `redirectUri` that is neither
 path nor URL (or that is known to be neither HTTPS/`localhost` nor free of a fragment), a `grantEndpoint` or `client`
-that is no http(s) URL, a `privateKey` that is no unencrypted PKCS #8 PEM and a `privateJwk` that is no Ed25519 key with
+that is no http(s) URL (a non-loopback `grantEndpoint` must be `https:`), a `__Host-` cookie name with a `GNAP_COOKIE_PATH` other than `/` or with a domain, a `privateKey` that is no unencrypted PKCS #8 PEM and a `privateJwk` that is no Ed25519 key with
 `d` throw an `Error` at once (the message names the option, never the key). Values that come from the environment
 are checked by the same code on the first request they are seen in (`500`, same messages), as is a relative callback on a public request host without `externalUrl`. The private key is imported once and reused for every grant, rotation and revocation (an
 environment key again only when its text changes).
 
 The middleware serves the callback itself when mounted on the `redirectUri` path; behind a path-prefixing proxy mount
-`app.get("/callback", processGnapCallback)` yourself. With `externalUrl` (or an absolute `redirectUri`) the state cookie
+`app.get("/callback", processGnapCallback)` yourself. With `externalUrl` the state cookie
 is scoped to the public callback path and the callback is matched on its path alone, so a proxy that strips a prefix
 works. A failing callback throws an `HTTPException` (`400` for a missing, forged or expired state or a failed
 interaction, `401` for a denied one or a wrong `hash`, `502` for a server that fails the continue request, `502` / `503`
@@ -642,10 +756,11 @@ app.use("*", async (c, next) => {
 
 Security notes:
 
-- The session cookie is **signed, not encrypted**: the user's browser can read the access, management and continue
-  tokens in it (httpOnly only hides them from scripts). Use a long random `secret`, serve over HTTPS (cookies are
-  `Secure`), and give the grant only the access the user's session needs. Signed state cookies stop a forged or
-  replayed callback and bind it to the browser that started the grant (RFC 9635 §11.24); `SameSite=Lax` is needed
+- The session cookie is AES-256-GCM encrypted by default (key derived from `secret` with HKDF), so the browser stores the
+  access, management and continue tokens but cannot read them. With `encryptCookies: false` it is only signed (an HS256
+  JWT) and the browser's owner can read them (httpOnly only hides them from scripts). Use a long random `secret`, serve
+  over HTTPS (cookies are `Secure`), and give the grant only the access the user's session needs. Protected state
+  cookies stop a forged or replayed callback and bind it to the browser that started the grant (RFC 9635 §11.24); `SameSite=Lax` is needed
   for the cross-site redirect back.
 - The `hash` is verified in constant time and accepts padded base64 (Rafiki) and unpadded base64url (RFC 9635).
   `hash_method` is not sent, so the default `sha-256` applies; Rafiki rejects nothing else.
@@ -656,16 +771,23 @@ Security notes:
   `too_fast` answer is an error, not a retry.
 - `https:` or `localhost` only for the URIs a browser follows (RFC 9635 §2.5.2.1, §4.1.1): the callback URI (also
   without fragment) and `interact.redirect`. A relative `redirectUri` is resolved against `externalUrl`, or against
-  the request URL only when that host is loopback. On any other host set `externalUrl` or an absolute `redirectUri`;
-  the request host is not registered as the finish origin and is not used as the post-login URL.
-- The grant endpoint, `continue` URI and `manage` URI must be http(s) URLs without userinfo. Redirects are not
-  followed. A `continue` or `manage` host other than the grant endpoint is the server's to name (RFC 9635), so serve
-  that server over TLS (§11.1).
+  the request URL only when that host is loopback. On any other host set `externalUrl`;
+  the request host is neither registered as the finish origin nor used as the post-login URL, and `externalUrl` is needed
+  even with an absolute `redirectUri`, because the post-login URL is built from it.
+- The grant endpoint must be `https:` (`http:` only on loopback); the `continue` and `manage` URIs too, and all three are
+  URLs without userinfo. Redirects are not followed, and an error answer never repeats the server's text or URLs. A
+  `continue` or `manage` host other than the grant endpoint is the server's to name (RFC 9635), so serve that server
+  over TLS (§11.1).
 - The session is stateless: a copy of the signed cookie stays valid until the next rotation check, up to
   `refreshInterval` (900 s by default) after `revokeGnapSession`, so use a small `refreshInterval` for sensitive apps.
   Log out with a `POST` (`SameSite=Lax` sends the cookie on a cross-site `GET` navigation, so a `GET` logout can be
   triggered by any page). `revokeGnapSession` uses the session of the current request, so it can be mounted before or
   after the middleware; it throws when the server refuses the revocation, but the cookie is deleted either way.
+- Cookie names may carry the `__Secure-` or `__Host-` prefix (`__Host-` needs path `/` and no domain); the middleware
+  deletes a cookie with the attributes it set it with. The login state cookie that does not fit in 4096 bytes keeps the
+  return URL without its query string.
+- Concurrent requests with the same expired session merge into one rotation per process: a page load that still loses
+  the race to another instance is redirected once to the same URL, an API call gets `401`.
 - The whole session lives in one cookie: keep `access` small. A session over 4096 bytes fails with a `500` (browsers
   would drop the cookie silently). An interaction URL too long for the pending-login pointer (over 4096 bytes with the
   cookie name) is left out of it: a second tab then requests its own grant, as it would without the pointer.
@@ -678,107 +800,7 @@ the `manage` URI) and cancel the grant (`DELETE` the `continue` URI) instead of 
 
 ## Compatibility
 
-The ILP, IL-DCP, STREAM, HTTP-signature and Open Payments client rows were differentially tested against the official
-packages (byte for byte, on seeded random input, or against one shared HTTP server). The GNAP server rows are checked by
-[`test/gnap-server/rafiki-parity.test.ts`](https://github.com/dayjobdoor/open-payments-ilp/blob/main/test/gnap-server/rafiki-parity.test.ts), a hand-ported table of cases from Rafiki's auth tests (Rafiki `58430af8`,
-2026-10-09; nothing links it to Rafiki, so a Rafiki change goes unnoticed) and by the official client's flows; the
-webhook rows by a reimplementation of Rafiki's signer. **match** = same observable behaviour; **deviation** =
-deliberate, with the reason.
-
-### ILP, IL-DCP, STREAM
-
-| Counterpart                                                                                                                                               | Status    | Notes                                                                                                                                                                                                                                                              |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `/ilp` vs [`ilp-packet`](https://www.npmjs.com/package/ilp-packet) codec, addresses, OER                                                                  | match     | Byte-identical both directions; accepts nothing `ilp-packet` rejects except an epoch `expiresAt` (`19700101000000000`).                                                                                                                                            |
-| `/ilp` leniency                                                                                                                                           | deviation | Rejects calendar-invalid timestamps, non-ASCII in ASCII fields, non-printable reject codes, data over 32767. Years 0000–0099 stay literal (`ilp-packet` maps to 19xx).                                                                                             |
-| `/ildcp` vs [`ilp-protocol-ildcp`](https://www.npmjs.com/package/ilp-protocol-ildcp)                                                                      | match     | Byte-identical; `serveIldcp` answers `F00` for bad, foreign or expired requests.                                                                                                                                                                                   |
-| `/ildcp` clock and `fetch(sendData)`                                                                                                                      | deviation | The codec never reads the clock (`expiresAt`, `now` are explicit) and there is no transport; compose `serializeIldcpRequest`, `deserializeReply`, `deserializeIldcpResponse`.                                                                                      |
-| `/stream` packets, frames, crypto vs [`ilp-protocol-stream`](https://www.npmjs.com/package/ilp-protocol-stream)                                           | match     | Byte-identical, cross-decryptable; receipts (RFC 39) interoperate both ways.                                                                                                                                                                                       |
-| `/stream` receiver, credentials, `decodeStreamPaymentTag` vs [`@interledger/stream-receiver`](https://www.npmjs.com/package/@interledger/stream-receiver) | match     | Same decision order and encoding; an empty `paymentTag` means no tag. Pending replies always carry `dataFrames` (possibly empty).                                                                                                                                  |
-| `/stream` token decoding                                                                                                                                  | deviation | Exact base64url alphabet; a malformed segment is `F06`.                                                                                                                                                                                                            |
-| `/stream` sender vs `@interledger/pay`                                                                                                                    | deviation | No quote, rate probe loop or `pay` loop (they need a transport, timers, congestion state). Primitives are provided: probes, `minDestinationAmount`, `decryptStreamPacket`, receipts, `planStreamChunks`. `minDestinationAmount` defaults to `amount` (same asset). |
-
-### HTTP signatures and webhooks
-
-| Counterpart                                                                                                                          | Status    | Notes                                                                                                                                                                                                                                                                                                                                        |
-| ------------------------------------------------------------------------------------------------------------------------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/http-signatures` signing vs [`@interledger/http-signature-utils`](https://www.npmjs.com/package/@interledger/http-signature-utils) | match     | Same components, `sha-512` digest, `sig1`; both verify each other's signatures. `Content-Digest` is over the exact bytes sent (compact JSON from this client); Rafiki's verifiers digest `JSON.stringify` of the parsed body, so only compact JSON verifies there. Optional `tag`.                                                           |
-| `/http-signatures` verification                                                                                                      | deviation | Stricter: strict RFC 8941, `created` required (300 s age, 30 s skew), non-empty body must be digest-covered, `alg` must be `ed25519`. Looser: no content-length/type demand when the digest is covered; the digest is checked over the exact body bytes; signatures under a label other than `sig1` are accepted (Rafiki reads `sig1` only). |
-| `/http-signatures` keys                                                                                                              | match     | `importEd25519PrivateKeyPem` (PKCS#8), `exportPublicJwk(key, { keyId })`. Base64-wrapped PEM (`loadBase64Key`): decode first.                                                                                                                                                                                                                |
-| `/webhooks` vs Rafiki `generateWebhookSignature`                                                                                     | match     | Same HMAC over `<t>.<JCS body>` and header `t=<ms>, v<N>=<hex>` (the version is only a label in Rafiki); default `v1`; tested against a reimplementation of the signer. JCS and event types from the OpenAPI document.                                                                                                                       |
-| `/webhooks` verification                                                                                                             | deviation | Requires the header, enforces a replay window (300 s) and future skew (30 s); Rafiki's POS middleware accepts a missing header and ignores the timestamp.                                                                                                                                                                                    |
-| `/webhooks` receiving                                                                                                                | n/a       | Rafiki sends `{ id, type, data }` with a 2 s timeout and counts only HTTP `200` as delivered (up to 10 retries): answer `200`.                                                                                                                                                                                                               |
-
-### Open Payments client
-
-| Counterpart ([`@interledger/open-payments`](https://www.npmjs.com/package/@interledger/open-payments) 7.4) | Status    | Notes                                                                                                                                                                                                      |
-| ---------------------------------------------------------------------------------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Routes, URLs, verbs, query handling, signing rule, headers                                                 | match     | Every route; both clients run against one verifying server.                                                                                                                                                |
-| Types, constants, payment invariants, grant-request checks, `OpenPaymentsClientError` fields               | match     | Mutual type assignability asserted; checks return an `invalid-request`/`invalid-amount` error instead of throwing.                                                                                         |
-| Response validation                                                                                        | deviation | Effect Schema validation, body returned as received (unknown members kept). Schemas that forbid extra members upstream (quote, outgoing-payment, ilp-payment-method, page-info, JWKS) accept them here.    |
-| Factory                                                                                                    | deviation | Synchronous, takes a `CryptoKey` (no filesystem/`Buffer`). No pino logger, no `authenticatedRequestInterceptor` (experimental upstream).                                                                   |
-| Retry                                                                                                      | deviation | Opt-in `retry` option (backoff + jitter, `Retry-After`, re-signed per attempt; `POST` only with `retryNonIdempotent`); off by default, `Effect.retry` still composes (errors expose `status`, `attempts`). |
-
-### GNAP
-
-| Counterpart ([Rafiki auth](https://github.com/interledger/rafiki))                    | Status    | Notes                                                                                                                                                                                                                                                                                                                                |
-| ------------------------------------------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Routes, grant state machine, tokens, interaction, finish hash, reference-client flows | match     | All `@interledger/open-payments` client flows pass against the single- and multi-tenant server. Finish hash is padded base64 by default (Rafiki); `finishHashEncoding: "base64url"` for RFC 9635. `/gnap` `computeInteractionHash` defaults to RFC 9635 unpadded base64url; pass `encoding: "base64"` for Rafiki.                    |
-| Multi-tenancy (`POST /:tenantId`, per-tenant `idpConsentUrl`/`idpSecret`)             | match     | Optional via `tenants`; the finish hash covers the tenant segment.                                                                                                                                                                                                                                                                   |
-| Introspection access matching, `limits.interval` (`R12/start/P1M`)                    | match     | Same as Rafiki's `compareRequestAndGrantAccessItems` and `getInterval` (expected values recorded from Rafiki's functions). A plain duration is accepted as an extension; unknown members of a requested item are ignored (Rafiki compares the raw item).                                                                             |
-| Client key lookup                                                                     | match     | `GET {wallet}/jwks.json` by `kid`, once per request and not cached. `https` only, no credentials, query or fragment, IP literals or internal host names, no redirects, 64 KiB cap, 10 s timeout; host names are not resolved and any port is allowed.                                                                                |
-| Wallet address document                                                               | deviation | Only `jwks.json` is fetched; `clientName` is the verified host, `clientName`/`clientUri` come from the stored grant, not the editable query.                                                                                                                                                                                         |
-| Receiver and amount limits (RS helpers)                                               | deviation | `validateOutgoingPaymentReceiver` also allows child paths of the limit (not with an encoded `.`, `/` or `\`); `validateOutgoingPaymentAmounts` is a per-payment cap (cumulative sum is yours); both refuse an empty list of matched access.                                                                                          |
-| `GET /discovery`, rate limiting                                                       | deviation | Not served; only the `/better-auth` adapter rate-limits.                                                                                                                                                                                                                                                                             |
-| Identifier rule                                                                       | deviation | Identifier required for every interactive item (Rafiki checks until the first).                                                                                                                                                                                                                                                      |
-| Finish `hash` encoding                                                                | deviation | RFC 9635 §4.2.3: unpadded base64url; Rafiki/Open Payments wire: padded base64 (`finishHashEncoding` picks). `verifyInteractionHash` accepts both.                                                                                                                                                                                    |
-| `access_token.manage`                                                                 | deviation | RFC 9635 §3.2.1: object with its own management token; Rafiki/Open Payments wire: a URL string authorised by the access token itself.                                                                                                                                                                                                |
-| Continue token                                                                        | deviation | RFC 9635 §5: SHOULD be new on each response; Rafiki/Open Payments wire: unchanged.                                                                                                                                                                                                                                                   |
-| `interact.finish` on polling grants                                                   | deviation | RFC 9635 §3.3.5: only when the client sent `finish`; Rafiki/Open Payments wire: always present.                                                                                                                                                                                                                                      |
-| Server nonce in the interaction URL                                                   | deviation | RFC 9635 §4.1.1/§4.2.3: `finish` nonce should not be browser-visible; Rafiki/Open Payments wire: one nonce for URL, cookie and `finish`.                                                                                                                                                                                             |
-| Denied finish redirect                                                                | deviation | RFC 9635 §4.2.3: `hash` always provided; Rafiki/Open Payments wire: only `result=grant_rejected`.                                                                                                                                                                                                                                    |
-| No usable `interact`                                                                  | deviation | RFC 9635 §2.5: `invalid_interaction`; Rafiki/Open Payments wire: `400 invalid_request`.                                                                                                                                                                                                                                              |
-| Continuation error codes                                                              | deviation | RFC 9635 §3.6/§5: `too_many_attempts`, `user_denied`; Rafiki/Open Payments wire: `request_denied` / `invalid_request` for those cases (`invalid_continuation` for an unknown, revoked or mismatching grant, as in the RFC).                                                                                                          |
-| Inactive interaction start                                                            | deviation | RFC 9635 §4.1.1: no redirect to the client; Rafiki/Open Payments wire: redirect with `result=invalid_interaction`.                                                                                                                                                                                                                   |
-| Repeated revocation                                                                   | deviation | RFC 9635 §6.2: SHOULD be honoured; Rafiki/Open Payments wire: `401` for a revoked token.                                                                                                                                                                                                                                             |
-| Continuation/management key                                                           | deviation | RFC 9635 §5/§7.3: bound to the request's key; Rafiki/Open Payments wire: any key of the wallet address.                                                                                                                                                                                                                              |
-| Token management                                                                      | deviation | RFC 9635 §6: the request must present the managed token (`Authorization: GNAP`), not only a valid signature; Rafiki checks the signature and the management id.                                                                                                                                                                      |
-| Interaction start                                                                     | deviation | Writes nothing (the grant is `PENDING` from the start; Rafiki's `markPending` and its failure redirect do not exist), and does not forward an expired interaction to the consent page (Rafiki forwards, the decision then fails).                                                                                                    |
-| Repeated finish                                                                       | deviation | Finishing an interaction whose grant is already finalised redirects again but never re-approves it; Rafiki's `approve` sets `APPROVED` unconditionally.                                                                                                                                                                              |
-| Introspection endpoint                                                                | deviation | RFC 9767 §3.5: off unless `introspection.authorize` is set (Rafiki: unauthenticated, served at `/` of its own port; a Rafiki backend POSTs to its `AUTH_SERVER_INTROSPECTION_URL` as given, so set that to the full `…/introspect` URL). In-process `introspectToken` also returns `tenantId` and `grantAccess` for an active token. |
-| Signature `tag`                                                                       | deviation | RFC 9635 §7.3.1: `tag="gnap"` required; Rafiki/Open Payments wire: not checked (our client sends it).                                                                                                                                                                                                                                |
-| Introspection response                                                                | deviation | RFC 9767 §3.3: `iss`, `key`, `exp`, `active:false` for uncovered `access`; Rafiki/Open Payments wire: `grant`, `access`, `client` only.                                                                                                                                                                                              |
-| Finalized `continue.wait`                                                             | deviation | RFC 9635 §5.2: SHOULD include `wait`; Rafiki/Open Payments wire: omitted.                                                                                                                                                                                                                                                            |
-| `DELETE /continue/:id` after issuance                                                 | deviation | RFC 9635 §5.4: finalized grants never change state; Open Payments extension: it revokes the grant and its tokens.                                                                                                                                                                                                                    |
-| `interact.finish.uri` scheme                                                          | deviation | RFC 9635 §2.5.2.1: HTTPS, localhost or an application-specific scheme; Rafiki: any absolute URI. Here `https`, or `http` on `localhost`, `127.0.0.1` or `[::1]`; anything else is `400`.                                                                                                                                             |
-| Interaction start is not one-time-use                                                 | deviation | RFC 9635 §4: the AS MUST treat an interact request as one-time-use; here (as in Rafiki) the start URL works until the owner has decided.                                                                                                                                                                                             |
-| Interaction session cookie                                                            | deviation | Rafiki: a signed server-side session. Here the cookie value is the interaction nonce: it ties the browser to the URL but proves nothing, since anyone who knows id and nonce can set it.                                                                                                                                             |
-| Identity provider back channel                                                        | deviation | Rafiki serves `/grant/:id/:nonce…` on a private interaction port; here they are on the public mount, guarded by `x-idp-secret` alone (no attempt limit). Use a long random secret, or serve `handlers.idpGetGrant` / `handlers.idpDecide` from a private router instead of `route`.                                                  |
-| Consent by a signed-in user (`decideInteraction`, Better Auth endpoints)              | deviation | Not in Rafiki (its identity provider is a separate service). Refused (`403`) unless `interaction.authorize` allows the user.                                                                                                                                                                                                         |
-| `PATCH /continue/:id`                                                                 | supported | RFC 9635 §5.3: replaces `access_token` / `subject` / `interact` of a `PENDING` or `APPROVED` grant and re-evaluates it. A change that needs consent starts a new interaction and invalidates the old consent URL; earlier tokens are never widened. Needs a store with `extendedRecords`, else `501 invalid_request`.                |
-| `access_token` array                                                                  | supported | RFC 9635 §2.1.2, §3.2.2: up to 10 labelled tokens, each with its own access; one consent covers the union; the response is an array whenever the request used one. Needs `extendedRecords`.                                                                                                                                          |
-| `finish.method: "push"`                                                               | supported | RFC 9635 §2.5.2.2, §4.2.2: `{ hash, interact_ref }` is POSTed once on approval to a public https URL (no redirects, 5 s timeout); the browser gets `202`; failures go to `onError`. Needs `extendedRecords`.                                                                                                                         |
-| Not implemented                                                                       | n/a       | String access references, the `bearer` flag (it would let a resource server skip signature checks; stays `400 invalid_flag`), `user_code` / `app` start, `user` / `display` claims, key proofs other than `httpsig`, subject assertions.                                                                                             |
-
-### GNAP client (`open-payments-ilp/hono`)
-
-RFC 9635 is the standard the middleware follows; where Rafiki / Open Payments servers differ it accepts both.
-
-| RFC 9635 client behaviour                      | Status    | Notes                                                                                                                                                                                                                                                                                                                           |
-| ---------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Grant request, continuation, token management  | match     | Signed as §7.3.1 (components, `created`, `keyid`, `nonce`, `tag="gnap"`, no `alg`; sha-256 digest for the inline key, sha-512 for a wallet-address `client` like the official client), `Authorization: GNAP`, `wait` (5 s default) never cut short, one-time `interact_ref`.                                                    |
-| Denial                                         | match     | `user_denied` / `request_denied` on the continue call (§3.6, §4.2) and Rafiki's `result=grant_rejected` both end in `401`.                                                                                                                                                                                                      |
-| `client` as a wallet address URL               | deviation | §2.3: a string is an instance identifier the AS already knows; Open Payments: the wallet address whose `jwks.json` holds the key. Without `client` the key is sent inline.                                                                                                                                                      |
-| `access_token.manage` as a URL string          | deviation | §3.2.1: object with a management token that differs from the access token; Rafiki/Open Payments: a URL authorised by the access token itself. Both are accepted.                                                                                                                                                                |
-| Finish `hash` encoding and `result=` redirects | deviation | §4.2.1, §4.2.3: unpadded base64url, `hash` and `interact_ref` always; Rafiki/Open Payments: padded base64, and `result=grant_rejected` without `hash` for a denial. Both are accepted.                                                                                                                                          |
-| `http:` grant, continue and manage URIs        | deviation | §11.1: TLS; Rafiki's local environments talk plain HTTP between containers. Callback and interaction URIs must be `https:` or `localhost` (§2.5.2.1, §4.1.1).                                                                                                                                                                   |
-| Cookies hold the pending grant and the session | match     | §11.26: the cookies are AES-256-GCM encrypted (key derived from `secret` with HKDF), httpOnly, Secure and `SameSite=Lax`, so the browser's owner cannot read them; still storage-less like `oidc-auth`. `encryptCookies: false` stores them signed only (readable).                                                             |
-| Polling without `finish`                       | match     | §5.2, §3.1: a grant with `continue` and no `interact.finish` is polled by the browser's next navigations, never before `wait`. Pending: `302` to `interact.redirect` (`202` + `Retry-After` when none is offered); denial `401`; approval continues the request.                                                                |
-| `interact.expires_in`                          | match     | §3.3: shortens the ten minutes of the pending state and pointer (whole seconds); 0 or less is `502`.                                                                                                                                                                                                                            |
-| Signing-key rotation                           | n/a       | §6.1.1 (rebinding a token's key with two signatures) is not implemented. Swapping `keyId` and the key keeps sessions when the server accepts the new key for existing grants (Open Payments: publish it in `jwks.json` first; an inline-key RFC server binds the grant to its key, so users log in again at the next rotation). |
-| Not implemented                                | n/a       | `push` finish, grant modification (`PATCH`), `user_code`/`app` start, multiple access tokens, subject information, rebinding a token's key (§6.1.1).                                                                                                                                                                            |
-
-Interop tests live in the package's [`test/`](https://github.com/dayjobdoor/open-payments-ilp/tree/main/test) directory and run in CI.
+How each part behaves against the packages and servers it is compared with (`ilp-packet`, `ilp-protocol-ildcp`, `ilp-protocol-stream`, `@interledger/open-payments`, `@interledger/http-signature-utils`, Rafiki's auth server and webhooks), with every deliberate deviation and the reason, is in [docs/compatibility.md](https://github.com/dayjobdoor/open-payments-ilp/blob/main/docs/compatibility.md).
 
 ## Versioning
 

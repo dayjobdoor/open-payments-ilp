@@ -1,6 +1,6 @@
 # Workflow
 
-How changes get into `main` and onto npm. History is managed with [jj](https://jj-vcs.github.io/jj/) colocated with git (`.jj/` and `.git/` both exist). Use jj commands; avoid `git commit`, `git add`, `git checkout`, `git reset` and `git stash` (they confuse jj's state; park work with `jj new`).
+How changes get into `main` and onto npm. History is managed with [jj](https://jj-vcs.github.io/jj/) colocated with git (in a fresh git clone run `jj git init --colocate` first, then `.jj/` and `.git/` both exist). Use jj commands; avoid `git commit`, `git add`, `git checkout`, `git reset` and `git stash` (they confuse jj's state; park work with `jj new`).
 
 ## jj
 
@@ -40,7 +40,7 @@ The repository belongs to one GitHub account; the machine may hold several. Keep
 
 Releases are keyless: `.github/workflows/publish.yml` runs on every push to `main`, publishes only when npm does not yet have the `package.json` version, and authenticates with npm trusted publishing (OIDC, no token).
 
-1. Bump `version` in `package.json` and add a `## <version> (date)` heading to `CHANGELOG.md`. The dist-tag follows the version: `x.y.z-alpha.N` → `alpha`, `-beta.N` → `beta`, another prerelease id → `next`, a plain version → `latest`.
+1. Bump `version` in `package.json` and add a `## <version> (date)` heading to `CHANGELOG.md`. The dist-tag follows the version: a prerelease whose first identifier is lowercase letters becomes that tag (`x.y.z-alpha.N` → `alpha`, `-beta.N` → `beta`, `-rc.N` → `rc`), any other prerelease (`-0`, `-RC.1`, `-alpha1`) → `next`, and a plain version → `latest`.
 2. `mise run check`, commit, push to `main`.
 3. The `plan` and `verify` jobs run; the `publish` job waits for the maintainer's approval in the `npm-publish` GitHub environment (required reviewers). After approval it publishes with provenance, pushes the tag `v<version>` and creates a GitHub Release from that version's CHANGELOG section (a prerelease for any non-`latest` dist-tag).
 4. Check: `npm view open-payments-ilp dist-tags versions --json`; `npm view open-payments-ilp@<version> dist.attestations`.
