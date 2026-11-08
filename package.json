@@ -96,19 +96,21 @@
     "@interledger/open-payments": "^7.4.0",
     "@interledger/openapi": "2.0.4",
     "@interledger/stream-receiver": "^0.3.3-alpha.4",
-    "@types/node": "^26.6.5",
-    "better-auth": "^1.7.10",
-    "effect": "^4.0.5",
-    "hono": "^4.13.13",
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "better-auth": "^1.7.16",
+    "effect": "^4.1.2",
+    "hono": "^4.13.16",
     "ilp-packet": "^3.1.4-alpha.2",
     "ilp-protocol-ildcp": "^2.2.4-alpha.2",
     "ilp-protocol-stream": "^2.7.2-alpha.3",
     "json-canonicalize": "3.0.1",
     "openapi-typescript": "7.13.0",
+    "pg": "^8.23.1",
     "publint": "^0.3.25",
     "typescript": "^7.0.2",
-    "vite-plus": "1.1.0",
-    "vitest": "5.0.3"
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.5.0",
+    "vite-plus": "1.5.0"
   },
   "peerDependencies": {
     "better-auth": "^1.6.19",
@@ -124,7 +126,6 @@
     }
   },
   "overrides": {
-    "vite": "npm:@voidzero-dev/vite-plus-core@1.1.0",
-    "vitest": "5.0.3"
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.5.0"
   }
 }
