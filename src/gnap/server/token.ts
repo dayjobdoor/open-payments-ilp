@@ -33,6 +33,9 @@ const authenticateManagement = (core: Core, request: Request, managementId: stri
     if (
       found === null ||
       found.token.revokedAt !== null ||
+      // A revoked or rejected grant has no live tokens; one that still shows up is a race with its revocation.
+      found.grant.state === "REVOKED" ||
+      found.grant.state === "REJECTED" ||
       presented === null ||
       !constantTimeEqualText(yield* hashToken(presented), found.token.valueHash)
     ) {
@@ -137,8 +140,8 @@ export type TokenIntrospection =
     });
 
 /**
- * Introspection result for `accessToken`; any token that is unknown, expired or revoked is `inactive`, and with a
- * `tenantId` so is one whose grant belongs to another tenant.
+ * Introspection result for `accessToken`; any token that is unknown, expired or revoked is `inactive`, and so is
+ * one whose grant is `REVOKED` or `REJECTED`; with a `tenantId` so is one whose grant belongs to another tenant.
  */
 export const introspect = (
   core: Core,

@@ -49,6 +49,7 @@ describe("parseClientField", () => {
     [true, "client-invalid-type"],
     [{}, "client-invalid-shape"],
     [{ walletAddress: 1 }, "client-invalid-shape"],
+    [{ walletAddress: "" }, "client-invalid-shape"],
     [{ jwk: { ...JWK, crv: "P-256" } }, "client-invalid-shape"],
     [[], "client-invalid-shape"],
   ])("reports %j as %s", (input, reason) => {

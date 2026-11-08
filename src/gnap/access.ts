@@ -231,10 +231,10 @@ export function parseAccessIntervalMs(value: string): number | null {
  * (`R12/2019-08-24T14:15:22Z/P1M`, `R/2017-03-01T13:00:00Z/2018-05-11T15:30:00Z`, `R-1/P1Y2M10DT2H30M/2022-05-11T15:30:00Z`)
  * with Rafiki's semantics: windows are half-open, the first one plus `n` repetitions (all of them for `R` and `R-1`),
  * and `null` when `now` lies in none (before the first window, after the last). A plain duration (`P1M`) is also
- * accepted: windows of that length repeating from `anchor`, the grant's creation time; `null` when `anchor` is not in
- * the past. A malformed `interval` is `null`.
+ * accepted: windows of that length repeating from `anchor`, the grant's creation time; `null` when `anchor` is after
+ * `now` (at `anchor` the first window starts). A malformed `interval` is `null`.
  *
- * @see https://openpayments.dev/concepts/grant-limits
+ * @see https://openpayments.dev/guides/outgoing-grant-future-payments/
  */
 export function currentAccessIntervalStart(anchor: Date, interval: string, now: Date = new Date()): Date | null {
   if (interval.startsWith("R")) {
@@ -363,7 +363,7 @@ export function validateOutgoingPaymentReceiver(matchedAccess: AccessMatchItem[]
  * requested action's `-all` variant is preferred so handlers can tell the grant covers every client's resources.
  * An absent or empty request returns all grant items.
  *
- * @see https://openpayments.dev/apis/token-introspection/
+ * @see https://www.rfc-editor.org/rfc/rfc9767
  */
 export function compareRequestAndGrantAccessItems(
   requestAccess: AccessMatchItem[] | undefined,

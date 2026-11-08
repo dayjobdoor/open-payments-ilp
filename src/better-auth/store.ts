@@ -9,12 +9,23 @@ const TOKEN_DATES: ReadonlyArray<string> = ["expiresAt", "revokedAt", "createdAt
 
 type Row = Record<string, unknown>;
 
-/** `GnapStore` timestamps are epoch milliseconds; the tables use `date` columns. */
-const toRow = (record: object, dates: ReadonlyArray<string>): Row =>
+/** The `json` columns of the grant table (see `gnapSchema`). */
+const GRANT_JSON: ReadonlyArray<string> = ["jwk", "access", "subject"];
+
+/**
+ * `GnapStore` timestamps are epoch milliseconds; the tables use `date` columns. A `json` column gets its value as JSON
+ * text: Better Auth hands an array to PostgreSQL's driver as it is, which writes it as a PostgreSQL array
+ * (`invalid input syntax for type json`), while the other dialects store the text and read it back parsed.
+ */
+const toRow = (record: object, dates: ReadonlyArray<string>, json: ReadonlyArray<string> = []): Row =>
   Object.fromEntries(
     Object.entries(record).map(([key, value]) => [
       key,
-      dates.includes(key) && typeof value === "number" ? new Date(value) : value,
+      dates.includes(key) && typeof value === "number"
+        ? new Date(value)
+        : json.includes(key) && typeof value === "object" && value !== null
+          ? JSON.stringify(value)
+          : value,
     ]),
   );
 
@@ -47,10 +58,12 @@ export const betterAuthGnapStore = (db: GnapDb): GnapStore => {
     });
 
   return {
+    // The grant table has the `interactBinding` column of `gnapSchema`.
+    interactionBinding: true,
     createGrant: (grant) =>
-      Effect.promise(() => db.create({ model: "gnapGrant", data: toRow(grant, GRANT_DATES), forceAllowId: true })).pipe(
-        Effect.asVoid,
-      ),
+      Effect.promise(() =>
+        db.create({ model: "gnapGrant", data: toRow(grant, GRANT_DATES, GRANT_JSON), forceAllowId: true }),
+      ).pipe(Effect.asVoid),
     findGrant: (by, value) => find<GrantRecord>("gnapGrant", GRANT_DATES, by, value),
     updateGrant: (id, version, patch) =>
       Effect.promise(
@@ -59,7 +72,7 @@ export const betterAuthGnapStore = (db: GnapDb): GnapStore => {
             model: "gnapGrant",
             where: [equals("id", id), equals("version", version)],
             increment: { version: 1 },
-            set: toRow(patch, GRANT_DATES),
+            set: toRow(patch, GRANT_DATES, GRANT_JSON),
           })) !== null,
       ),
     createToken: (token) =>

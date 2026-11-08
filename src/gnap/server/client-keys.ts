@@ -17,6 +17,19 @@ const MAX_KEYS_RESPONSE_BYTES = 64 * 1024;
 
 const IPV4_HOST = /^\d{1,3}(\.\d{1,3}){3}$/;
 
+/** Name suffixes that resolve inside a private network (mDNS, search domains, Kubernetes services, RFC 8375). */
+const PRIVATE_SUFFIXES: ReadonlyArray<string> = [
+  ".localhost",
+  ".local",
+  ".internal",
+  ".lan",
+  ".corp",
+  ".intranet",
+  ".private",
+  ".home.arpa",
+  ".svc",
+];
+
 /**
  * A URL the server may contact on a client's behalf: `https`, no credentials, no fragment, and a public-looking host
  * name. WHATWG parsing has already normalised numeric hosts (`2130706433`, `0x7f.1`) to dotted IPv4, and IPv6
@@ -36,9 +49,7 @@ export const isPublicHttpsUrl = (candidate: string): boolean => {
     !hostname.endsWith(".") &&
     !hostname.startsWith("[") &&
     !IPV4_HOST.test(hostname) &&
-    !hostname.endsWith(".localhost") &&
-    !hostname.endsWith(".local") &&
-    !hostname.endsWith(".internal")
+    !PRIVATE_SUFFIXES.some((suffix) => hostname.endsWith(suffix))
   );
 };
 

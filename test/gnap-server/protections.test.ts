@@ -15,6 +15,8 @@ import {
   incoming,
   json,
   jsonBody,
+  seedGrant,
+  seedToken,
   startGrant,
   walletFetch,
   withToken,
@@ -226,6 +228,10 @@ describe("default client key fetch", () => {
       "https://app.localhost/alice",
       "https://printer.local/alice",
       "https://db.internal/alice",
+      "https://printer.lan/alice",
+      "https://wiki.corp/alice",
+      "https://nas.home.arpa/alice",
+      "https://api.default.svc/alice",
       "https://intranet/alice",
       "https://wallet.test./alice",
     ]) {
@@ -384,5 +390,22 @@ describe("single-use steps under concurrency", () => {
       .sort((left, right) => left - right);
 
     expect(statuses).toEqual([202, 400]);
+  });
+
+  it.each(["REVOKED", "REJECTED"] as const)("refuses to rotate a live token of a %s grant", async (state) => {
+    const h = await createServerHarness({ unvalidated: true });
+    const { grant } = await seedGrant(h, { state, client: WALLET });
+    const token = await seedToken(h, grant);
+
+    const response = await h.signedCall(token.manage, withToken({ method: "POST" }, token.value));
+
+    expect(await errorOf(response)).toMatchObject({ status: 401, code: "invalid_client" });
+  });
+
+  it("verifies a signed body above the verifier's own 64 KiB default when maxBodyBytes allows it", async () => {
+    const h = await createServerHarness({ unvalidated: true, maxBodyBytes: 256 * 1024 });
+    const body = { ...grantBody([incoming]), padding: "x".repeat(100 * 1024) };
+
+    expect((await h.signedCall(h.baseUrl, json("POST", body))).status).toBe(200);
   });
 });

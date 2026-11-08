@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { computeInteractionHash, verifyInteractionHash } from "../../src/gnap/index";
 import type { GrantRecord } from "../../src/gnap/server/index";
 import type { SigningKey } from "../../src/http-signatures";
+import { signRequest } from "../../src/http-signatures/sign";
 import { createContentDigest } from "../../src/http-signatures/digest";
 import { createSignatureBase, serializeSignatureParams } from "../../src/http-signatures/signature-base";
 import { encodeBase64, utf8Encode } from "../../src/internal/bytes";
@@ -11,9 +12,10 @@ import {
   BASE_URL,
   CONSENT_URL,
   SEED,
-  approve,
+  idp,
   browserFinish,
   browserStart,
+  clientJwk,
   continueWith,
   createClientKey,
   createServerHarness,
@@ -214,7 +216,7 @@ describe("finish hash (§2.5.2, §4.2.3)", () => {
     const pending = await startGrant(h, grantBody([outgoing], { interact: { ...interact, finish } }));
     const start = await browserStart(h, pending);
 
-    await approve(h, pending);
+    await idp(h, pending, "accept");
     const back = new URL((await browserFinish(h, pending, start.cookie)).headers.get("location") ?? "");
 
     const input = {
@@ -444,6 +446,25 @@ describe("HTTP message signatures (§7.3.1)", () => {
     const other = await signedPost(h, body, [["nonce", "n-2"]]);
 
     expect((await other()).status).toBe(200);
+  });
+
+  it("keeps the nonces of two clients that chose the same keyid apart", async () => {
+    const h = await createServerHarness({ unvalidated: true });
+
+    for (const key of [await createClientKey("shared"), await createClientKey("shared")]) {
+      const request = await Effect.runPromise(
+        signRequest(
+          new Request(
+            h.baseUrl,
+            json("POST", { client: { jwk: clientJwk(key) }, access_token: { access: [incoming] } }),
+          ),
+          key.signingKey,
+          { created: h.clock.now(), nonce: "same-nonce" },
+        ),
+      );
+
+      expect((await h.call(request)).status).toBe(200);
+    }
   });
 
   it.each([

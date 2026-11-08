@@ -7,7 +7,7 @@
  * Rafiki's route tests call the route handlers directly. Over the wire a request first passes its signature
  * middleware (`signature/middleware.ts`), and where the middleware answers before the route does, the case asserts what
  * a client really sees (noted as "wire"). A case marked `deviation` is one where this server deliberately answers
- * differently; it names the README Compatibility row, and asserts what this server does instead. Rafiki tests that
+ * differently; it names the Compatibility row of docs/compatibility.md, and asserts what this server does instead. Rafiki tests that
  * exercise only Rafiki's ORM, locks or logging have no case. The `mirrors:` titles are hand-typed and nothing checks
  * them against Rafiki: this table is a regression suite modelled on Rafiki's tests, not machine-checked parity.
  */
@@ -34,6 +34,7 @@ import {
   clientJwk,
   createClientKey,
   createServerHarness,
+  unboundStore,
   errorOf,
   grantBody,
   idp,
@@ -61,7 +62,7 @@ interface Case {
   /** The Rafiki test this mirrors, relative to `rafiki/packages/auth/src/`. */
   readonly mirrors: string;
   readonly name: string;
-  /** Set when this server intentionally differs: the Compatibility row of the README that says why. */
+  /** Set when this server intentionally differs: the Compatibility row of docs/compatibility.md that says why. */
   readonly deviation?: string;
   readonly options?: HarnessOptions;
   readonly act: (h: ServerHarness) => Promise<Response>;
@@ -79,7 +80,8 @@ const runCases = (cases: ReadonlyArray<Case>): void => {
         ] as const,
     ),
   )("%s", async (_title, candidate) => {
-    const h = await createServerHarness(candidate.options);
+    // Rafiki has no browser binding: the table runs against a store that does not persist one.
+    const h = await createServerHarness({ store: unboundStore(), ...candidate.options });
     const response = await candidate.act(h);
 
     if (typeof candidate.expected === "function") await candidate.expected(response, h);
@@ -99,7 +101,7 @@ const grantOf = async (h: ServerHarness, id: string): Promise<GrantRecord> => {
   return grant;
 };
 
-const dying = (overrides: Partial<GnapStore>): GnapStore => ({ ...memoryGnapStore(), ...overrides });
+const dying = (overrides: Partial<GnapStore>): GnapStore => ({ ...unboundStore(), ...overrides });
 
 /** A continue request, signed by the harness client. `token: null` omits the Authorization header. */
 const continueRequest = (

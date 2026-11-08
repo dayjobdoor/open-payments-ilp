@@ -28,20 +28,25 @@ export const fail = (status: number, code: GnapErrorCode, description: string): 
 export const errorResponse = ({ status, code, description }: GnapRouteErrorFields): Response =>
   Response.json(gnapErrorBody(code, description), { status });
 
+/** Tells `config.onError` (whose own failure never reaches the client). */
+const report = (core: Core, cause: Cause.Cause<never>): Effect.Effect<void> =>
+  Effect.suspend(() => core.config.onError?.(cause) ?? Effect.void).pipe(Effect.ignoreCause);
+
 /**
- * Turns a handler's failures into responses: route errors as themselves, anything unexpected as `500`, after
- * telling `config.onError` (whose own failure never reaches the client).
+ * Turns a handler's failures into responses: route errors as themselves, anything unexpected as `500`. Every `500`,
+ * the server's own as well as a defect, is told to `config.onError` first.
  */
 export const respond = (core: Core, program: Effect.Effect<Response, GnapRouteError>): Effect.Effect<Response> =>
   program.pipe(
-    Effect.catch((error) => Effect.succeed(errorResponse(error))),
+    Effect.catch((error) =>
+      (error.status >= 500 ? report(core, Cause.die(error)) : Effect.void).pipe(Effect.as(errorResponse(error))),
+    ),
     Effect.catchCauseIf(Cause.hasDies, (cause) =>
-      Effect.suspend(() => core.config.onError?.(cause) ?? Effect.void).pipe(
-        Effect.ignoreCause,
+      report(core, cause).pipe(
         Effect.as(errorResponse({ status: 500, code: "request_denied", description: "internal server error" })),
       ),
     ),
-    // RFC 9635 §3: every AS response MUST carry `Cache-Control: no-store`.
+    // RFC 9635 §3 requires `no-store` on grant responses; every response of this server carries it, which is stricter.
     Effect.tap((response) => Effect.sync(() => response.headers.set("cache-control", "no-store"))),
   );
 
@@ -58,7 +63,12 @@ export const readBody = (
   Effect.gen(function* () {
     const bytes = announcesMoreThan(request.headers, maxBytes)
       ? null
-      : yield* Effect.promise((signal) => readCapped(request.body, maxBytes, signal));
+      : yield* Effect.tryPromise({
+          try: (signal) => readCapped(request.body, maxBytes, signal),
+          // A body that cannot be read (the client went away mid-request) is the client's failure, not a crash.
+          catch: () =>
+            new GnapRouteError({ status: 400, code: "invalid_request", description: "request body could not be read" }),
+        });
 
     if (bytes === null) return yield* fail(413, "invalid_request", "request body too large");
 

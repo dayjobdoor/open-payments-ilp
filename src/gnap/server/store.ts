@@ -49,6 +49,12 @@ export interface GrantRecord {
   /** `access_token.label` of the request, echoed on every token issued for the grant (RFC 9635 §2.1.1). */
   readonly label: string | null;
   /**
+   * Optional, persisted only by stores that set {@link GnapStore.interactionBinding}. SHA-256 (as {@link hashToken}) of the
+   * secret in the `gnap-binding-{interactId}` cookie of the browser that first opened `interact.redirect`; `null` and
+   * an absent value mean no browser is bound. A grant whose interaction is replaced starts unbound again.
+   */
+  readonly interactBinding?: string | null;
+  /**
    * Optional, persisted only by stores that set {@link GnapStore.extendedRecords}. `interact.finish.method` of the
    * request: `redirect` (also what `null` and an absent value mean) or `push` (RFC 9635 §2.5.2.2: the server POSTs
    * the finish payload to {@link GrantRecord.finishUri} instead of redirecting the browser).
@@ -97,7 +103,10 @@ export interface TokenRecord {
    * absent value mean the access of the grant.
    */
   readonly access?: ReadonlyArray<AccessItem> | null;
-  /** Optional like {@link TokenRecord.access}: the `label` echoed with this token. `null`: none (or the grant's). */
+  /**
+   * Optional like {@link TokenRecord.access}, but `null` and absent differ: absent (a store without `extendedRecords`)
+   * means the grant's `label`, `null` means this token has none. The `label` echoed with this token.
+   */
   readonly label?: string | null;
 }
 
@@ -109,7 +118,7 @@ export interface TokenRecord {
  *
  * The server never needs a transaction: every multi-step change is ordered so that a crash between steps leaves a
  * harmless leftover (an unreferenced token), never a lost or doubled grant. Only the three conditional writes
- * ({@link updateGrant}, {@link revokeTokens} and {@link claimNonce}) must be atomic.
+ * ({@link GnapStore.updateGrant}, {@link GnapStore.revokeTokens} and {@link GnapStore.claimNonce}) must be atomic.
  *
  * The contract kit (`storeContract` from `open-payments-ilp/gnap/server/testing`, which takes your test runner's
  * `describe` and `it`) checks an implementation.
@@ -154,7 +163,7 @@ export interface TokenRecord {
  *   changed.
  *
  * No transaction is needed anywhere, and the server never lists or counts records, so retention is yours: a token
- * can be deleted once it expired, a nonce row once its `expires_at` passed, a grant once it has no live token and its client no longer continues it.
+ * can be deleted once it is revoked (rotation revokes the old one; an expired token that was not revoked can still be rotated, RFC 9635 §6.1, so deleting it forces a new grant), a nonce row once its `expires_at` passed, a grant once it has no live token and its client no longer continues it.
  *
  * ## Optional capabilities
  *
@@ -165,6 +174,13 @@ export interface TokenRecord {
  * modification, RFC 9635 §5.3), `access_token` arrays (§2.1.2) and `finish.method: "push"` (§2.5.2.2). Without it
  * the server never writes those fields, and a request for such a feature is answered `501 invalid_request`
  * (records that silently dropped them would turn a modified or multi-token grant into a privilege escalation).
+ *
+ * A store that persists {@link GrantRecord.interactBinding} (one more nullable column, `interact_binding TEXT`, on the
+ * grant table) sets {@link GnapStore.interactionBinding}. The server then ties an interaction to the browser that
+ * opened it: `/finish` is refused to any other browser, and so is an authenticated decision made from another one.
+ * Without it the server keeps Rafiki's weaker check, a cookie whose value is the nonce that anyone who knows the
+ * nonce can set (a browser other than the one the client sent to `interact.redirect` can then collect
+ * `interact_ref`).
  */
 export interface GnapStore {
   /** Inserts a grant. A duplicate `id`, `continueId` or `interactId` is a defect. */
@@ -205,4 +221,9 @@ export interface GnapStore {
    * {@link TokenRecord} (see "Optional capabilities" above). `storeContract` then checks that round trip.
    */
   readonly extendedRecords?: true;
+  /**
+   * Set to `true` by a store that persists and returns {@link GrantRecord.interactBinding}. `storeContract` then
+   * checks that round trip.
+   */
+  readonly interactionBinding?: true;
 }

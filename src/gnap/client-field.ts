@@ -10,7 +10,7 @@ export type ParsedClientField = { client: string; jwk?: never } | { client?: nev
 
 const rawClient = Schema.Union([
   Schema.NonEmptyString,
-  Schema.Struct({ walletAddress: Schema.String }),
+  Schema.Struct({ walletAddress: Schema.NonEmptyString }),
   Schema.Struct({ jwk: schemas.jwk }),
 ]);
 

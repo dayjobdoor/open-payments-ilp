@@ -128,6 +128,17 @@ describe("interact.finish.method push (RFC 9635 §4.2.2)", () => {
     expect(client.pushes).toHaveLength(1);
   });
 
+  it("does not send the browser of a push client to its push endpoint when the interaction cannot start", async () => {
+    const { h, pending, client } = await withPush();
+
+    h.clock.advance(601);
+    const start = await browserStart(h, pending);
+
+    expect(start.response.status).toBe(403);
+    expect(start.location).toBe("");
+    expect(client.pushes).toHaveLength(0);
+  });
+
   it("does not push a refusal, and does not push before the owner decided", async () => {
     const { h, pending, client } = await withPush();
     const { cookie } = await browserStart(h, pending);

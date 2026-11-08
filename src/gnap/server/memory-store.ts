@@ -5,6 +5,8 @@ import type { GnapStore, GrantRecord, TokenRecord } from "./store";
  * A {@link GnapStore} in process memory, for tests and local development. Nothing survives a restart and lookups
  * scan every record (O(n)); use a database-backed store in production.
  */
+const NONCE_SWEEP_SIZE = 1024;
+
 export function memoryGnapStore(): GnapStore {
   const grants = new Map<string, GrantRecord>();
   const tokens = new Map<string, TokenRecord>();
@@ -25,6 +27,7 @@ export function memoryGnapStore(): GnapStore {
   return {
     // Records are kept as they are, so every optional field of them survives.
     extendedRecords: true,
+    interactionBinding: true,
     createGrant: (grant) =>
       Effect.sync(() => {
         unique(grants, grant, ["id", "continueId", "interactId"]);
@@ -70,6 +73,12 @@ export function memoryGnapStore(): GnapStore {
         const claimed = nonces.get(key);
 
         if (claimed !== undefined && claimed > now) return false;
+
+        // Expired claims are dropped once the map has grown, so a long-lived process does not keep every nonce it saw.
+        if (nonces.size >= NONCE_SWEEP_SIZE) {
+          for (const [other, until] of nonces) if (until <= now) nonces.delete(other);
+        }
+
         nonces.set(key, expiresAt);
 
         return true;

@@ -12,6 +12,7 @@ import { isPublicHttpsUrl } from "./client-keys";
 import type { GnapGrantRequest, GnapInteractRequest, TenantConfig } from "./config";
 import {
   hasExtendedRecords,
+  hasInteractionBinding,
   issueToken,
   requireSignatureHeaders,
   tenantConfig,
@@ -91,7 +92,7 @@ const isAcceptableFinish = (finish: {
 /** Rafiki's rule for one item: outgoing payments and `list-all` access need the owner's consent. */
 const itemNeedsInteraction = (item: AccessItem): boolean =>
   // SAFETY: widening the action literals of every access item type to `string` for a membership test.
-  item.type === "outgoing-payment" || (item.actions as ReadonlyArray<string>).includes("list-all");
+  item.type === "outgoing-payment" || item.actions.some((action) => action === "list-all");
 
 /** Rafiki's default policy: a subject, or any item that {@link itemNeedsInteraction}, needs the owner's consent. */
 export const defaultRequiresInteraction = (request: GnapGrantRequest): boolean =>
@@ -114,7 +115,8 @@ const parseAccessItems = (token: TokenBody) =>
   Effect.gen(function* () {
     const flags = token.flags ?? [];
 
-    // RFC 9635 §2.1.1: a repeated flag is `invalid_flag`; `bearer` tokens are not issued, `durable` is always true.
+    // RFC 9635 §2.1.1: a repeated flag is `invalid_flag`. Only `durable` is tolerated, and ignored (rotation revokes the old
+    // token, so tokens are not durable in the §3.2.1 sense); `bearer` and any other flag are refused.
     if (new Set(flags).size !== flags.length || flags.some((flag) => flag !== "durable")) {
       return yield* fail(400, "invalid_flag", "invalid access token flags");
     }
@@ -247,7 +249,7 @@ const continueBlock = (core: Core, grant: GrantRecord, token: string, wait?: num
 export const grantIdentity = (grant: GrantRecord): Effect.Effect<ParsedClientField, never> => {
   const identity = getGrantClientIdentity({ client: grant.client, jwk: grant.jwk });
 
-  // A stored grant always has one of the two (the request parser guarantees it).
+  // A stored grant always has one of the two: `parseClientField` refuses a request with neither.
   return Result.isSuccess(identity) ? Effect.succeed(identity.success) : Effect.die("grant without client identity");
 };
 
@@ -487,6 +489,15 @@ const continueGrant = (core: Core, request: Request, continueId: string) =>
 /** RFC 9635 §5.3: only a grant request that is pending or approved can be modified. */
 const isModifiable = (grant: GrantRecord): boolean => grant.state === "PENDING" || grant.state === "APPROVED";
 
+/**
+ * Whether `current` still holds the request `seen` was read with. A modification is computed from the grant as read
+ * and replaces `access`, `subject`, `label` and `tokenRequests` as a whole: applied to a grant that another
+ * modification changed in the meantime it would write back stale members.
+ */
+const sameRequest = (current: GrantRecord, seen: GrantRecord): boolean =>
+  JSON.stringify([current.access, current.subject, current.label, current.tokenRequests ?? null]) ===
+  JSON.stringify([seen.access, seen.subject, seen.label, seen.tokenRequests ?? null]);
+
 /** Fields an owner-less grant carries once nothing is left to decide. */
 const NO_INTERACTION = {
   interactId: null,
@@ -585,10 +596,14 @@ const modifyGrant = (core: Core, request: Request, continueId: string) =>
             finishMethod: finish?.method ?? null,
           }
         : { state: "APPROVED" as const, ...NO_INTERACTION }),
+      // The browser bound to the interaction that is replaced does not carry over to the new one.
+      ...(hasInteractionBinding(core) && { interactBinding: null }),
     };
 
     const decide = (current: GrantRecord) =>
-      isModifiable(current) ? Effect.succeed(patch) : fail(401, "request_denied", "grant cannot be modified");
+      isModifiable(current) && sameRequest(current, grant)
+        ? Effect.succeed(patch)
+        : fail(401, "request_denied", "grant cannot be modified");
 
     if (interactive) return Response.json(pendingResponse(core, yield* updateGrant(core, grant, decide), token));
 

@@ -14,8 +14,10 @@ import {
   createServerHarness,
   errorOf,
   grantBody,
+  idp,
   incoming,
   json,
+  startGrant,
   walletFetch,
 } from "./support";
 
@@ -60,6 +62,41 @@ describe("onError", () => {
     const [cause] = causes;
 
     expect(cause && Cause.squash(cause)).toMatchObject({ message: expect.stringContaining("down") });
+  });
+
+  it("is told about a 500 the server answers itself: the optimistic lock is lost three times", async () => {
+    const { causes, onError } = recorder();
+    const store = { ...memoryGnapStore(), updateGrant: () => Effect.succeed(false) };
+    const h = await createServerHarness({ unvalidated: true, store, onError });
+    const pending = await startGrant(h);
+
+    const response = await idp(h, pending, "accept");
+
+    expect(await errorOf(response)).toMatchObject({ status: 500, code: "request_denied" });
+    expect(causes).toHaveLength(1);
+    expect(Cause.squash(causes[0] as Cause.Cause<never>)).toMatchObject({ _tag: "GnapRouteError", status: 500 });
+  });
+
+  it("treats a request body that cannot be read as a 400 of the client, not a crash", async () => {
+    const { causes, onError } = recorder();
+    const h = await createServerHarness({ unvalidated: true, onError });
+    const body = new ReadableStream<Uint8Array>({
+      start: (controller) => controller.error(new Error("socket hang up")),
+    });
+
+    const response = await Effect.runPromise(
+      h.server.route(
+        new Request(h.baseUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body,
+          duplex: "half",
+        } as RequestInit),
+      ),
+    );
+
+    expect(await errorOf(response)).toMatchObject({ status: 400, code: "invalid_request" });
+    expect(causes).toEqual([]);
   });
 
   it("is not told about failures the server answers on purpose", async () => {

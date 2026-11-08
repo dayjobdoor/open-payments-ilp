@@ -13,7 +13,7 @@
  * `GET /grant/:id/:nonce` and `POST /grant/:id/:nonce/:choice` (identity provider back channel, `x-idp-secret`) ·
  * `POST /introspect` (token introspection; Rafiki serves it on a separate port at `/`).
  *
- * @see https://openpayments.dev/apis/auth-server/
+ * @see https://openpayments.dev/apis/auth-server/operations/post-request/
  * @see https://www.rfc-editor.org/rfc/rfc9635
  * @module
  */
@@ -23,7 +23,7 @@ import type { GnapServerConfig, InteractionDetails } from "./config";
 import { createCore, relativePath } from "./core";
 import { grantHandlers, type GrantHandlers } from "./grant";
 import { fail, respond, type GnapRouteError, type ParamHandler, type RequestHandler } from "./http";
-import { decideInteraction, getInteraction, interactionHandlers } from "./interaction";
+import { bindingFromRequest, decideInteraction, getInteraction, interactionHandlers } from "./interaction";
 import { introspect, tokenHandlers, type TokenIntrospection } from "./token";
 
 export { fetchClientKeys } from "./client-keys";
@@ -38,6 +38,7 @@ export type {
 } from "./config";
 
 export { defaultRequiresInteraction } from "./grant";
+export { bindingFromRequest };
 
 export { GnapRouteError } from "./http";
 
@@ -86,7 +87,9 @@ export interface GnapServer {
   /**
    * Records the decision (`choice` is `accept` or `reject`) of the resource owner, for a consent page that
    * authenticates them itself. With their `userId` `interaction.authorize` must allow it (no hook: `403`); without a
-   * `userId` the caller vouches for the decision. Returns the URL of
+   * `userId` the caller vouches for the decision. With a `userId`, and a store with `interactionBinding`, the decision
+   * must also carry `binding`, the value of the `gnap-binding-{interactId}` cookie of the user's request (`403`
+   * otherwise): the browser that decides is the one that opened the interaction. Returns the URL of
    * `/interact/:id/:nonce/finish`, where the owner's browser goes next (it carries the session cookie of the start step).
    */
   readonly decideInteraction: (args: {
@@ -94,6 +97,7 @@ export interface GnapServer {
     readonly nonce: string;
     readonly choice: string;
     readonly userId?: string;
+    readonly binding?: string;
   }) => Effect.Effect<{ readonly redirect: string }, GnapRouteError>;
   /**
    * Introspection result for an access token value; unknown, expired and revoked tokens are `{ active: false }`.
@@ -166,7 +170,7 @@ export function createGnapServer(config: GnapServerConfig): GnapServer {
       const segment = segments[index] ?? "";
 
       if (part.startsWith(":")) {
-        // SAFETY: `part` is one of the `:id` / `:nonce` / `:choice` placeholders of the route table below.
+        // SAFETY: `part` is one of the `:id` / `:nonce` / `:choice` / `:tenantId` placeholders of the route table above.
         params[part.slice(1) as keyof Params] = segment;
       } else if (part !== segment) return null;
     }

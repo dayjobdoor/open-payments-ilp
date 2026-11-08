@@ -104,8 +104,9 @@ export interface GnapServerConfig {
    * are used.
    *
    * The default is `GET {walletAddress}/jwks.json` with {@link GnapServerConfig.fetch}, hardened against SSRF: it
-   * refuses wallet addresses that are not `https`, carry credentials, or whose host is an IP literal, `localhost`
-   * or `*.localhost`, `*.local`, `*.internal`, a single label, or has a trailing dot; it never follows redirects
+   * refuses wallet addresses that are not `https`, carry credentials, a query or a fragment, or whose host is an IP
+   * literal, `localhost` or `*.localhost`, `*.local`, `*.internal`, `*.lan`, `*.corp`, `*.intranet`, `*.private`,
+   * `*.home.arpa`, `*.svc`, a single label, or has a trailing dot; it never follows redirects
    * and rejects responses over 64 KiB. DNS rebinding is NOT covered (Web Standards give no way to inspect the
    * resolved address): where clients must not reach private networks, resolve keys here yourself, with an egress
    * policy, a pinned allow-list or a cache.
@@ -117,7 +118,8 @@ export interface GnapServerConfig {
   readonly resolveClientKeys?: (walletAddress: string) => Effect.Effect<ReadonlyArray<JWK>, HttpSignatureError>;
   /**
    * `fetch` used by the default key resolver and for the `finish.method: "push"` callback (a `POST` that never
-   * follows redirects, times out after 5 seconds and is only made to public `https` URLs). Default: global `fetch`.
+   * follows redirects, times out after 5 seconds and is only made to `https` URLs whose host name passes the checks of
+   * {@link GnapServerConfig.resolveClientKeys}; the name is not resolved, so DNS rebinding is not covered). Default: global `fetch`.
    */
   readonly fetch?: typeof globalThis.fetch;
   readonly policy?: {
@@ -183,8 +185,10 @@ export interface GnapServerConfig {
    */
   readonly maxBodyBytes?: number;
   /**
-   * Called with the cause of every unexpected failure that {@link GnapServer.route} (or a handler) answers with a
-   * `500`: a store outage, a throwing callback, a bug. It never receives request data (the cause itself may embed
+   * Called with the cause of every `500` that {@link GnapServer.route} (or a handler) answers: a defect (a store
+   * outage, a throwing callback, a bug) and the server's own `500`, exhausted optimistic-lock retries or a missing consent
+   * URL, whose cause is a `GnapRouteError`. {@link GnapServer.getInteraction} and the other in-process helpers are not
+   * wrapped: their failures are returned to the caller. It never receives request data (the cause itself may embed
    * what the failing code put in it, such as SQL parameters), and the library logs nothing by default: the host
    * decides what to redact and where to log. A failure or defect inside the hook is swallowed and never changes the
    * client's response. It also receives a failed `finish.method: "push"` delivery (a `die` of an `Error` that names

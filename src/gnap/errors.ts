@@ -3,7 +3,7 @@ import * as Data from "effect/Data";
 
 /** Why a GNAP request could not be understood. */
 export type GnapClientFieldErrorReason =
-  /** The `client` field is absent. */
+  /** The `client` field is absent or falsy (`null`, `""`, `0`, `false`). */
   | "client-missing"
   /** The `client` field is neither a string nor an object. */
   | "client-invalid-type"

@@ -5,7 +5,7 @@ import type { ParsedClientField } from "../client-field";
 import type { AccessItem, GrantAccessToken } from "../index";
 import { HttpSignatureError } from "../../http-signatures/errors";
 import { parseDictionary } from "../../http-signatures/structured-fields";
-import { SIGNATURE_REPLAY_WINDOW_SECONDS, verifyRequest } from "../../http-signatures/verify";
+import { verifyRequest } from "../../http-signatures/verify";
 import { encodeBase64Url } from "../../internal/bytes";
 import type { JWK } from "../../open-payments/types";
 import type { GnapServerConfig, TenantConfig } from "./config";
@@ -102,7 +102,8 @@ const signatureLabels = (request: Request): ReadonlyArray<string> => {
 
 /**
  * Verifies the RFC 9421 signature of `request` as `identity`, against the body already read. Any one acceptable
- * signature of several suffices (RFC 9635 §7.3.1); a `nonce` may be used once (a replay is `401`).
+ * signature of several suffices (RFC 9635 §7.3.1), but at most the first three labels are tried; a `nonce` may be used
+ * once per client (a replay is `401`).
  */
 export const verifyClient = (
   core: Core,
@@ -132,6 +133,8 @@ export const verifyClient = (
             label,
             resolveKey: (keyId) => Effect.flatMap(clientKeys, (candidates) => selectKey(candidates, keyId)),
             clock: () => new Date(core.now()),
+            // The body was already read within this limit; the verifier's own cap must not be the smaller one.
+            maxBodyBytes: core.maxBodyBytes,
           },
         ),
       );
@@ -142,13 +145,18 @@ export const verifyClient = (
         continue;
       }
 
-      const { keyId, nonce } = result.success;
+      const { keyId, nonce, replayWindowSeconds } = result.success;
 
       if (nonce === undefined) return;
       const now = core.now();
 
-      // The nonce is only remembered once the signature verified, so nobody can burn another client's nonces.
-      if (yield* core.store.claimNonce(`${keyId}\n${nonce}`, now + SIGNATURE_REPLAY_WINDOW_SECONDS * 1000, now)) return;
+      // The nonce is only remembered once the signature verified, so nobody can burn another client's nonces. A `keyid`
+      // is the client's own choice, so the client identity is part of the key: two clients may both use `key-1`.
+      const client = identity.client ?? `jwk:${identity.jwk.x}`;
+
+      if (yield* core.store.claimNonce(`${client}\n${keyId}\n${nonce}`, now + replayWindowSeconds * 1000, now)) {
+        return;
+      }
 
       return yield* fail(401, "invalid_client", "invalid signature");
     }
@@ -161,7 +169,7 @@ export const verifyClient = (
 /**
  * Changes a grant atomically, starting from `initial` (already read by the caller: no extra round trip). `decide`
  * sees the grant and returns the patch (or fails); if somebody else changed the grant meanwhile, the write loses and
- * `decide` runs again on the freshly read grant, up to three times.
+ * `decide` runs again on the freshly read grant: three attempts in all, then `500`.
  */
 export const updateGrant = <E>(
   core: Core,
@@ -218,6 +226,9 @@ export interface TokenSpec {
 
 /** Whether the store persists the optional record fields (see {@link GnapStore.extendedRecords}). */
 export const hasExtendedRecords = (core: Core): boolean => core.store.extendedRecords === true;
+
+/** Whether the store persists the browser binding of an interaction (see {@link GnapStore.interactionBinding}). */
+export const hasInteractionBinding = (core: Core): boolean => core.store.interactionBinding === true;
 
 /** Issues one token for `grant`: of the grant's access and label unless `spec` says otherwise. */
 export const issueToken = (

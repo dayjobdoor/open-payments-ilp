@@ -35,7 +35,7 @@ const run = <A>(effect: Effect.Effect<A>): Promise<A> => Effect.runPromise(effec
 
 /**
  * Key-sorted JSON: records compare by structure, `undefined` fields count as absent. So do the optional record
- * fields (see `GnapStore.extendedRecords`) when `null`: a store that has the columns reads `null` back for a record
+ * fields (see `GnapStore.extendedRecords` and `GnapStore.interactionBinding`) when `null`: a store that has the columns reads `null` back for a record
  * written without them, one that has not reads nothing.
  */
 const canonical = <A>(value: A): string =>
@@ -43,7 +43,11 @@ const canonical = <A>(value: A): string =>
     if (item?.constructor !== Object) return item;
 
     const optional =
-      "continueId" in item ? ["finishMethod", "tokenRequests"] : "valueHash" in item ? ["access", "label"] : [];
+      "continueId" in item
+        ? ["finishMethod", "tokenRequests", "interactBinding"]
+        : "valueHash" in item
+          ? ["access", "label"]
+          : [];
 
     return Object.fromEntries(
       Object.entries(item)
@@ -190,6 +194,24 @@ export function storeContract(
         equal(
           await run(store.findGrant("id", "g1")),
           grant("g1", { version: 1, state: "APPROVED", userId, updatedAt: T0 + 1 }),
+        );
+      });
+
+      it("updateGrant moves the version up by one on every update and leaves what the patch does not name alone", async () => {
+        const store = await makeStore();
+
+        await run(store.createGrant(grant("g1", { tenantId: "tenant-1" })));
+
+        for (const version of [0, 1, 2]) {
+          equal(await run(store.updateGrant("g1", version, { updatedAt: T0 + version + 1 })), true);
+          equal((await run(store.findGrant("id", "g1")))?.version, version + 1);
+        }
+
+        const kept = await run(store.findGrant("id", "g1"));
+
+        equal(
+          [kept?.id, kept?.tenantId, kept?.continueId, kept?.createdAt, kept?.client],
+          [grant("g1").id, "tenant-1", grant("g1").continueId, grant("g1").createdAt, grant("g1").client],
         );
       });
 
@@ -360,6 +382,30 @@ export function storeContract(
         equal(withAccess?.token, token("t1", "g1", { access: first.access, label: "first" }));
         equal(without?.token.access ?? null, null);
         equal(without?.token.label ?? null, null);
+      });
+    });
+
+    describe("interaction binding", () => {
+      // Only a store that sets `interactionBinding` has to keep the field: for any other this case does nothing.
+      it("keeps interactBinding of a grant: unset, set by a patch, replaced and cleared", async () => {
+        const store = await makeStore();
+
+        if (store.interactionBinding !== true) return;
+        await run(store.createGrant(grant("g1")));
+
+        equal((await run(store.findGrant("id", "g1")))?.interactBinding ?? null, null);
+
+        await run(store.updateGrant("g1", 0, { interactBinding: "hash-1" }));
+        equal((await run(store.findGrant("id", "g1")))?.interactBinding, "hash-1");
+
+        await run(store.updateGrant("g1", 1, { interactBinding: "hash-2" }));
+        equal((await run(store.findGrant("id", "g1")))?.interactBinding, "hash-2");
+
+        await run(store.updateGrant("g1", 2, { interactBinding: null }));
+        equal((await run(store.findGrant("id", "g1")))?.interactBinding ?? null, null);
+
+        await run(store.createGrant(grant("g2", { interactBinding: "hash-3" })));
+        equal((await run(store.findGrant("id", "g2")))?.interactBinding, "hash-3");
       });
     });
 

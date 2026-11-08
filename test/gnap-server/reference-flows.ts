@@ -9,6 +9,7 @@ import { createAuthenticatedClient, isFinalizedGrantWithAccessToken, isPendingGr
 import * as Effect from "effect/Effect";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import { computeInteractionHash, type AccessItem } from "../../src/gnap/index";
+import { cookiesOf } from "../support/cookies";
 import { FINISH_URI, KEY_ID, WALLET, type ClientKey } from "./support";
 
 /** What the flows need from the server under test. */
@@ -66,7 +67,7 @@ export function describeReferenceClient(name: string, start: () => Promise<Refer
     const browser = async (redirect: string, choice: "accept" | "reject") => {
       const start = await globalThis.fetch(redirect, { redirect: "manual" });
       const consent = new URL(start.headers.get("location") ?? "");
-      const cookie = (start.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+      const cookie = cookiesOf(start);
       const [interactId = "", nonce = ""] = new URL(redirect).pathname.split("/").slice(-2);
 
       expect(start.status).toBe(302);

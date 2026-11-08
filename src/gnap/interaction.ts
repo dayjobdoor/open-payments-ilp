@@ -45,7 +45,7 @@ export function computeInteractionHash(input: InteractionHashInput): Effect.Effe
  * Client side of the finish redirect: recomputes the hash and compares it to the `hash` query parameter in
  * constant time. Accepts the unpadded base64url form of RFC 9635 §4.2.3 and the padded base64 form Rafiki sends,
  * so the caller need not know which authorisation server it talks to. A client MUST NOT continue the grant when
- * this is `false`.
+ * this is `false` (RFC 9635 §4.2.1).
  *
  * @see https://www.rfc-editor.org/rfc/rfc9635#section-4.2.3
  */

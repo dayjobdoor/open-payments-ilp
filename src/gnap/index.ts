@@ -3,7 +3,7 @@
  * bodies, token helpers, and the interaction finish `hash`. Web Standards only.
  *
  * @see https://www.rfc-editor.org/rfc/rfc9635
- * @see https://openpayments.dev/apis/auth-server/
+ * @see https://openpayments.dev/apis/auth-server/operations/post-request/
  * @module
  */
 export {

@@ -11,6 +11,7 @@ import {
 } from "../../src/gnap/server/index";
 import { generateEd25519KeyPair, signRequest, type SigningKey } from "../../src/http-signatures/index";
 import { expectConformsToSpec } from "./openapi";
+import { cookiesOf } from "../support/cookies";
 
 export const BASE_URL = "https://as.test/gnap";
 
@@ -97,6 +98,22 @@ export interface HarnessOptions extends Partial<GnapServerConfig> {
   /** Answers the requests the server makes to anything but the wallet's JWKS (the finish push). */
   readonly outbound?: (url: string, init: RequestInit | undefined) => Response | Promise<Response>;
 }
+
+/** The in-memory store of a deployment that does not persist the browser binding (Rafiki's weaker interaction check). */
+export const unboundStore = (): GnapStore => {
+  const store = memoryGnapStore();
+
+  return {
+    extendedRecords: true,
+    createGrant: store.createGrant,
+    findGrant: store.findGrant,
+    updateGrant: store.updateGrant,
+    createToken: store.createToken,
+    findTokenWithGrant: store.findTokenWithGrant,
+    revokeTokens: store.revokeTokens,
+    claimNonce: store.claimNonce,
+  };
+};
 
 /** A store as the ones written before the optional record fields: the same behaviour, without `extendedRecords`. */
 export const legacyStore = (): GnapStore => {
@@ -238,6 +255,8 @@ export const idp = (
     }),
   );
 
+export { cookiesOf };
+
 /** The browser following `interact.redirect`: returns the consent redirect and the session cookie it was given. */
 export const browserStart = async (h: ServerHarness, pending: Pending) => {
   const response = await h.call(new Request(pending.interactUrl, { redirect: "manual" }));
@@ -245,7 +264,7 @@ export const browserStart = async (h: ServerHarness, pending: Pending) => {
   return {
     response,
     location: response.headers.get("location") ?? "",
-    cookie: (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "",
+    cookie: cookiesOf(response),
   };
 };
 

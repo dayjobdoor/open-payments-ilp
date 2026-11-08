@@ -1,9 +1,10 @@
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import { buildFinishUrl, computeInteractionHash } from "../interaction";
+import { hashToken } from "../token";
 import { constantTimeEqualText } from "../../internal/bytes";
 import type { ConsentUrlParams, InteractionDetails } from "./config";
-import { grantEndpoint, tenantConfig, updateGrant, type Core } from "./core";
+import { grantEndpoint, hasInteractionBinding, tenantConfig, updateGrant, type Core } from "./core";
 import { fail, redirect, respond, type GnapRouteError, type ParamHandler } from "./http";
 import { postFinish } from "./push";
 import type { GrantRecord, GrantState } from "./store";
@@ -35,6 +36,14 @@ const findInteraction = (
     return grant;
   });
 
+/**
+ * Whether `current` is still the interaction `seen` was read from. A `PATCH /continue/:id` keeps a grant `PENDING` but
+ * issues a new interaction (id and nonce) for a different request, so a decision that lost an optimistic-lock race
+ * must not be applied to whatever the grant has become: the owner decided on what `seen` named.
+ */
+const sameInteraction = (current: GrantRecord, seen: GrantRecord): boolean =>
+  current.interactId === seen.interactId && current.interactNonce === seen.interactNonce;
+
 const isExpired = (core: Core, grant: GrantRecord): boolean =>
   grant.interactExpiresAt !== null && core.now() > grant.interactExpiresAt;
 
@@ -56,7 +65,7 @@ const detailsOf = (grant: GrantRecord): InteractionDetails => ({
   expiresAt: new Date(grant.interactExpiresAt ?? grant.createdAt).toISOString(),
 });
 
-/** The client's finish URI with `result` (and `message`) appended. */
+/** The client's finish URI with `result` (and `message`) set; a query parameter of that name already on it is replaced. */
 const finishWith = (finishUri: string, result: string, message?: string): string => {
   const url = new URL(finishUri);
 
@@ -89,8 +98,9 @@ const approvedRedirect = (core: Core, grant: GrantRecord, finishUri: string): Ef
   Effect.map(finishPayload(core, grant), (payload) => buildFinishUrl(finishUri, payload));
 
 /**
- * `finish.method: "push"` (RFC 9635 §4.2.2): hands the client the finish payload in a `POST`. A delivery that fails
- * is reported to `onError` and nothing else: the owner's decision stands and the client can still poll its grant.
+ * `finish.method: "push"` (RFC 9635 §4.2.2): hands the client the finish payload in one `POST`. A delivery that fails
+ * is reported to `onError` and not retried: the owner's decision stands, but the client never receives its
+ * `interact_ref` and cannot poll the grant (a grant with a finish URI is refused polling), so it starts a new grant.
  */
 const pushFinish = (core: Core, grant: GrantRecord, finishUri: string) =>
   Effect.gen(function* () {
@@ -114,23 +124,85 @@ const cookieValue = (request: Request, name: string): string | undefined =>
     .find((pair) => pair.startsWith(`${name}=`))
     ?.slice(name.length + 1);
 
+const bindingCookieName = (interactId: string): string => `gnap-binding-${interactId}`;
+
+/**
+ * The binding secret the browser of `request` presents for `interactId`: pass it as `binding` to
+ * {@link GnapServer.decideInteraction} when a signed-in user decides through your own consent endpoint.
+ */
+export const bindingFromRequest = (request: Request, interactId: string): string | undefined =>
+  cookieValue(request, bindingCookieName(interactId));
+
+/** The `Set-Cookie` value of the binding secret. Scoped to the whole server, so the consent endpoints see it too. */
+const bindingCookie = (core: Core, interactId: string, secret: string): string =>
+  [
+    `${bindingCookieName(interactId)}=${secret}`,
+    `Path=${core.basePath === "" ? "/" : core.basePath}`,
+    `Max-Age=${core.interactionExpiresInSeconds}`,
+    "HttpOnly",
+    "SameSite=Lax",
+    ...(core.baseUrl.startsWith("https:") ? ["Secure"] : []),
+  ].join("; ");
+
+/** Whether `presented` is the binding secret whose hash the grant stores. */
+const matchesBinding = (grant: GrantRecord, presented: string | undefined) =>
+  Effect.gen(function* () {
+    if (grant.interactBinding === undefined || grant.interactBinding === null || presented === undefined) return false;
+
+    return constantTimeEqualText(yield* hashToken(presented), grant.interactBinding);
+  });
+
+/**
+ * Ties the interaction to the first browser that opens it (`GET /interact/:id/:nonce`): that visit gets a random
+ * secret in a cookie, and only its hash is stored. A later visit keeps (re-sets) the secret it presents, and gets none
+ * when another browser bound first. Returns the `Set-Cookie` value, or `null` for an unbound visit.
+ */
+const bindBrowser = (core: Core, request: Request, grant: GrantRecord) =>
+  Effect.gen(function* () {
+    const interactId = grant.interactId ?? "";
+    const presented = cookieValue(request, bindingCookieName(interactId));
+
+    if (grant.interactBinding !== undefined && grant.interactBinding !== null) {
+      return (yield* matchesBinding(grant, presented)) && presented !== undefined
+        ? bindingCookie(core, interactId, presented)
+        : null;
+    }
+
+    const secret = core.generateToken();
+    const hash = yield* hashToken(secret);
+
+    // First visit wins: a grant that was bound, replaced or decided in the meantime leaves this visit unbound.
+    const bound = yield* updateGrant(core, grant, (current) =>
+      current.state === "PENDING" && sameInteraction(current, grant) && (current.interactBinding ?? null) === null
+        ? Effect.succeed({ interactBinding: hash })
+        : fail(409, "invalid_interaction", "interaction already bound"),
+    ).pipe(
+      Effect.as(true),
+      Effect.catch(() => Effect.succeed(false)),
+    );
+
+    return bound ? bindingCookie(core, interactId, secret) : null;
+  });
+
 /** `GET /interact/:id/:nonce`: where `interact.redirect` points; binds the browser and forwards to the consent page. */
-const startInteraction = (core: Core, { id, nonce }: InteractionParams) =>
+const startInteraction = (core: Core, request: Request, { id, nonce }: InteractionParams) =>
   Effect.gen(function* () {
     const grant = yield* findInteraction(core, id, nonce, 400);
+    // Only a redirect client is sent back through the browser: a push client's `finishUri` takes a `POST` from the server.
+    const finishUri = grant.finishMethod === "push" ? null : grant.finishUri;
 
     if (grant.state !== "PENDING" || isExpired(core, grant)) {
-      if (grant.finishUri === null) return yield* fail(403, "invalid_interaction", "invalid interaction");
+      if (finishUri === null) return yield* fail(403, "invalid_interaction", "invalid interaction");
 
-      return redirect(finishWith(grant.finishUri, "invalid_interaction", "invalid interaction"));
+      return redirect(finishWith(finishUri, "invalid_interaction", "invalid interaction"));
     }
 
     const consentUrl = (yield* tenantConfig(core, grant.tenantId))?.consentUrl;
 
     if (consentUrl === undefined) {
-      if (grant.finishUri === null) return yield* fail(500, "request_denied", "internal server error");
+      if (finishUri === null) return yield* fail(500, "request_denied", "internal server error");
 
-      return redirect(finishWith(grant.finishUri, "request_denied", "internal server error"));
+      return redirect(finishWith(finishUri, "request_denied", "internal server error"));
     }
 
     const clientUri = grant.client ?? "";
@@ -165,7 +237,12 @@ const startInteraction = (core: Core, { id, nonce }: InteractionParams) =>
       ...(core.baseUrl.startsWith("https:") ? ["Secure"] : []),
     ].join("; ");
 
-    return redirect(location, { "set-cookie": cookie });
+    const response = redirect(location, { "set-cookie": cookie });
+    const binding = hasInteractionBinding(core) ? yield* bindBrowser(core, request, grant) : null;
+
+    if (binding !== null) response.headers.append("set-cookie", binding);
+
+    return response;
   });
 
 /**
@@ -206,6 +283,11 @@ const finishInteraction = (core: Core, request: Request, { id, nonce }: Interact
     const session = cookieValue(request, cookieName(id));
 
     if (session === undefined || !constantTimeEqualText(session, nonce)) {
+      return yield* fail(401, "invalid_request", "invalid session");
+    }
+
+    // The nonce cookie only proves knowledge of the nonce; the binding proves this is the browser that opened the URL.
+    if (hasInteractionBinding(core) && !(yield* matchesBinding(grant, cookieValue(request, bindingCookieName(id))))) {
       return yield* fail(401, "invalid_request", "invalid session");
     }
 
@@ -251,7 +333,8 @@ const requireIdpSecret = (
     if (secret === undefined || secret === "") return yield* fail(404, "unknown_interaction", "unknown interaction");
     const presented = request.headers.get("x-idp-secret");
 
-    if (presented === null || !constantTimeEqualText(presented, secret)) {
+    // Digests have one length whatever was presented, so the comparison time does not tell how long the secret is.
+    if (presented === null || !constantTimeEqualText(yield* hashToken(presented), yield* hashToken(secret))) {
       return yield* fail(401, code, "invalid x-idp-secret");
     }
   });
@@ -273,7 +356,7 @@ export const getInteraction = (
 const decide = (
   core: Core,
   grant: GrantRecord,
-  args: { readonly choice: string; readonly userId?: string },
+  args: { readonly choice: string; readonly userId?: string; readonly binding?: string },
 ): Effect.Effect<{ readonly redirect: string }, GnapRouteError> =>
   Effect.gen(function* () {
     if (grant.state === "REJECTED" || grant.state === "REVOKED") {
@@ -288,6 +371,17 @@ const decide = (
       return yield* fail(400, "invalid_request", "invalid interaction choice");
     }
 
+    // A signed-in user decides in the browser that opened the interaction, or not at all: the consent URL is not secret.
+    if (
+      args.userId !== undefined &&
+      hasInteractionBinding(core) &&
+      grant.interactBinding !== undefined &&
+      grant.interactBinding !== null &&
+      !(yield* matchesBinding(grant, args.binding))
+    ) {
+      return yield* fail(403, "request_denied", "the user may not decide on this interaction");
+    }
+
     const authorize = core.config.interaction?.authorize;
 
     // A signed-in user owns nothing the grant names (a wallet, a subject) until the hook says so: no hook, no decision.
@@ -298,7 +392,7 @@ const decide = (
     }
 
     yield* updateGrant(core, grant, (current) =>
-      current.state === "PENDING"
+      current.state === "PENDING" && sameInteraction(current, grant)
         ? Effect.succeed({
             state: args.choice === "accept" ? ("ACCEPTED" as const) : ("DENIED" as const),
             userId: args.userId ?? null,
@@ -322,10 +416,15 @@ export const decideInteraction = (
     readonly nonce: string;
     readonly choice: string;
     readonly userId?: string;
+    readonly binding?: string;
   },
 ): Effect.Effect<{ readonly redirect: string }, GnapRouteError> =>
   Effect.flatMap(findInteraction(core, args.interactId, args.nonce), (grant) =>
-    decide(core, grant, { choice: args.choice, ...(args.userId !== undefined && { userId: args.userId }) }),
+    decide(core, grant, {
+      choice: args.choice,
+      ...(args.userId !== undefined && { userId: args.userId }),
+      ...(args.binding !== undefined && { binding: args.binding }),
+    }),
   );
 
 const idpGetGrant = (core: Core, request: Request, { id, nonce }: InteractionParams) =>
@@ -362,7 +461,7 @@ export interface InteractionHandlers {
 
 /** Handlers of the front channel (`/interact/…`) and the identity provider's back channel (`/grant/…`). */
 export const interactionHandlers = (core: Core): InteractionHandlers => ({
-  startInteraction: (_request, params) => respond(core, startInteraction(core, params)),
+  startInteraction: (request, params) => respond(core, startInteraction(core, request, params)),
   finishInteraction: (request, params) => respond(core, finishInteraction(core, request, params)),
   idpGetGrant: (request, params) => respond(core, idpGetGrant(core, request, params)),
   idpDecide: (request, params) => respond(core, idpDecide(core, request, params)),

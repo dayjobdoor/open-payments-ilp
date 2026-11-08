@@ -21,6 +21,7 @@ export const gnapSchema: NonNullable<BetterAuthPlugin["schema"]> = {
       interactId: { type: "string", required: false, unique: true },
       interactNonce: { type: "string", required: false },
       interactRef: { type: "string", required: false },
+      interactBinding: { type: "string", required: false },
       interactExpiresAt: { type: "date", required: false },
       finishUri: { type: "string", required: false },
       clientNonce: { type: "string", required: false },

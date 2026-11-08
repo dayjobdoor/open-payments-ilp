@@ -27,7 +27,7 @@ export interface GnapErrorResponse {
 /**
  * Builds `{ error: { code, description } }`. Rafiki's auth server always sends a description, so it is required.
  *
- * @see https://openpayments.dev/apis/auth-server/
+ * @see https://openpayments.dev/apis/auth-server/operations/post-request/
  */
 export function gnapErrorBody(code: GnapErrorCode | (string & {}), description: string): GnapErrorResponse {
   return { error: { code, description } };
