@@ -5,11 +5,14 @@ bun = "1.4.4"
 [tasks.check]
 description = "Everything CI runs, in order"
 run = [
-    "npx tsc -p tsconfig.json --noEmit",
-    "npx tsc -p tsconfig.test.json",
-    "bunx vp test run",
-    "bunx vp pack",
-    "node scripts/smoke-dist.mjs",
+  "bunx vp fmt --check",
+  "bunx vp lint --deny-warnings",
+  "node scripts/check-casts.mjs",
+  "npx tsc -p tsconfig.json --noEmit",
+  "npx tsc -p tsconfig.test.json",
+  "bunx vp test run",
+  "bunx vp pack",
+  "node scripts/smoke-dist.mjs",
 ]
 
 [tasks.dryrun]

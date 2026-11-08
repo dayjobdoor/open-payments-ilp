@@ -40,6 +40,22 @@ export default defineConfig({
     publint: true,
     attw: { profile: "esm-only", level: "error" },
   },
+  // `vp fmt` and `vp lint` read these; `mise run check` runs both in check mode.
+  fmt: {
+    printWidth: 120,
+    ignorePatterns: [
+      "dist/**",
+      "src/open-payments/generated/**",
+      "openapi/**",
+      "bun.lock",
+      "CHANGELOG.md",
+      "README.md",
+      "docs/compatibility.md",
+    ],
+  },
+  lint: {
+    ignorePatterns: ["dist/**", "src/open-payments/generated/**"],
+  },
   test: {
     include: ["test/**/*.test.ts"],
     // Generous and explicit: CI and shared machines are slow, and the first gnap-server test compiles the OpenAPI documents.

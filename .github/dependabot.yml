@@ -8,10 +8,11 @@ updates:
   - package-ecosystem: bun
     directory: /
     schedule: { interval: weekly }
-    # Pinned twice (devDependencies and `overrides`); Dependabot would bump only one. Bump by hand.
+    # `vite` is pinned twice (devDependencies and `overrides`) and moves together with `vite-plus`; Dependabot would bump
+    # only one of them. Bump by hand.
     ignore:
+      - dependency-name: vite
       - dependency-name: vite-plus
       - dependency-name: "@voidzero-dev/*"
-      - dependency-name: vitest
     groups:
       minor-and-patch: { update-types: [minor, patch] }
