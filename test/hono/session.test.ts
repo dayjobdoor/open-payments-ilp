@@ -14,7 +14,7 @@ import {
 } from "../../src/hono/index";
 import { decodeBase64Url, encodeBase64Url } from "../../src/internal/bytes";
 import { BASE_URL, KEY_ID, createClientKey, outgoing } from "../gnap-server/support";
-import { APP, SECRET, createBrowser, createRafikiHarness, exportPrivateKey } from "./support";
+import { APP, PAGE, SECRET, createBrowser, createRafikiHarness, exportPrivateKey } from "./support";
 
 const incoming: GrantRequestAccessItem = { type: "incoming-payment", actions: ["create", "read"] };
 
@@ -32,6 +32,8 @@ interface Setup {
   readonly browser?: Parameters<typeof createBrowser>[1];
   /** The format of the client key in the config. Default `pem`. */
   readonly key?: "pem" | "jwk";
+  /** Leaves out the short `refreshInterval` the app passes by default: the environment and the default decide. */
+  readonly withoutRefreshInterval?: boolean;
 }
 
 /** The package's own Rafiki-compatible authorisation server behind a Hono app that requires a login. */
@@ -54,7 +56,7 @@ const createApp = async (overrides: Partial<GnapAuthConfig> = {}, setup: Setup =
       ...(setup.key === "jwk" ? { privateJwk: jwk } : { privateKey: pem }),
       fetch: setup.wrapFetch?.(h.fetch) ?? h.fetch,
       clock: h.clock.now,
-      refreshInterval: 60,
+      ...(setup.withoutRefreshInterval !== true && { refreshInterval: 60 }),
       ...overrides,
     }),
   );
@@ -152,7 +154,7 @@ describe("a signed session cookie (encryptCookies: false)", () => {
     const segment = (value: GnapAuth | Record<"alg" | "typ", string>): string =>
       encodeBase64Url(new TextEncoder().encode(JSON.stringify(value)));
 
-    const visit = (jwt: string) => h.app.request(`${APP}/`, { headers: { cookie: `gnap-auth=${jwt}` } });
+    const visit = (jwt: string) => h.app.request(`${APP}/`, { headers: { ...PAGE, cookie: `gnap-auth=${jwt}` } });
 
     return { session, segment, visit };
   };
@@ -241,7 +243,7 @@ describe("cookie protection", () => {
   };
 
   const visitWith = (h: TestApp, cookie: string) =>
-    h.app.request(`${APP}/`, { headers: { cookie: `gnap-auth=${cookie}` } });
+    h.app.request(`${APP}/`, { headers: { ...PAGE, cookie: `gnap-auth=${cookie}` } });
 
   it.each([
     ["encrypts the cookies by default", {}, false],
@@ -326,6 +328,13 @@ describe("configuration passed to initGnapAuthMiddleware", () => {
     expect(() => initGnapAuthMiddleware(passed)).not.toThrow();
   });
 
+  it.each(["http://localhost:3000/gnap", "http://127.0.0.1/gnap", "http://[::1]:3000/gnap"])(
+    "takes the http grant endpoint %s of the user's own machine",
+    (grantEndpoint) => {
+      expect(() => initGnapAuthMiddleware({ ...passed, grantEndpoint })).not.toThrow();
+    },
+  );
+
   it.each([
     ["a short secret", { secret: "x".repeat(31) }, "Session secrets must be at least 32 characters long"],
     ["a negative refresh interval", { refreshInterval: -1 }, "Invalid refresh interval or expiry"],
@@ -340,6 +349,21 @@ describe("configuration passed to initGnapAuthMiddleware", () => {
     ["a redirect URI with a fragment", { redirectUri: `${APP}/callback#x` }, "no fragment"],
     ["a path below an insecure external URL", { externalUrl: "http://app.test/" }, "must use HTTPS"],
     ["a grant endpoint that is no URL", { grantEndpoint: "as" }, "The GNAP grant endpoint must be an http(s) URL"],
+    [
+      "a grant endpoint that is http on a public host",
+      { grantEndpoint: "http://as.example/gnap" },
+      "The GNAP grant endpoint must use HTTPS",
+    ],
+    [
+      "a __Host- cookie name with a path",
+      { cookieName: "__Host-gnap", cookiePath: "/app" },
+      "__Host- cookie name needs",
+    ],
+    [
+      "a __Host- cookie name with a domain",
+      { cookieName: "__Host-gnap", cookieDomain: "app.test" },
+      "__Host- cookie name needs",
+    ],
     ["a client that is no URL", { client: "alice" }, "The GNAP client must be the http(s) URL"],
     ["a key that is no PEM", { privateKey: "not a pem" }, "must be an unencrypted PKCS #8 PEM"],
     [
@@ -375,7 +399,7 @@ describe("configuration passed to initGnapAuthMiddleware", () => {
     // Nothing throws here: the secret is not in the config.
     app.use("*", initGnapAuthMiddleware({ grantEndpoint: BASE_URL, access: [outgoing] }));
     app.use("*", gnapAuthMiddleware());
-    const response = await app.request(`${APP}/`);
+    const response = await app.request(`${APP}/`, { headers: PAGE });
 
     expect(response.status).toBe(500);
     expect(await response.text()).toBe("Session secrets must be at least 32 characters long");
@@ -390,7 +414,7 @@ describe("configuration", () => {
     app.use("*", initGnapAuthMiddleware(config));
     app.use("*", gnapAuthMiddleware());
 
-    return app.request(`${APP}/`);
+    return app.request(`${APP}/`, { headers: PAGE });
   };
 
   const base: GnapAuthConfig = { grantEndpoint: BASE_URL, access: [outgoing] };
@@ -470,7 +494,7 @@ describe("configuration", () => {
     app.use("*", initGnapAuthMiddleware(usable));
     app.use("*", initGnapAuthMiddleware(usable));
     app.use("*", gnapAuthMiddleware());
-    const response = await app.request(`${APP}/`);
+    const response = await app.request(`${APP}/`, { headers: PAGE });
 
     expect(response.status).toBe(500);
     expect(await response.text()).toBe("GNAP auth is already configured");
@@ -629,26 +653,132 @@ describe("rotating the access token", () => {
     });
   };
 
-  it("keeps the session of the request that lost a race against another rotation", async () => {
+  const rotations = (h: TestApp): number => h.calls.filter((call) => call.startsWith("POST /gnap/token/")).length;
+
+  it("shares one rotation between requests that carry the same cookie: none of them loses its session", async () => {
     const hooked: Array<string> = [];
     const h = await createApp({}, { before: withHook(hooked) });
 
     await login(h);
     h.clock.advance(61);
+    const before = rotations(h);
 
     // Two requests with the same cookie, as a page with two API calls sends them after the tab was idle.
     const responses = await Promise.all([h.browser.get(`${APP}/`, XHR), h.browser.get(`${APP}/`, XHR)]);
 
-    expect(responses.map((response) => response.status).sort((a, b) => a - b)).toEqual([200, 401]);
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(rotations(h) - before).toBe(1);
 
     for (const response of responses) expect(deletes(response, "gnap-auth")).toBe(false);
 
+    const [first, second]: Array<GnapAuth> = await Promise.all(responses.map((response) => response.json()));
+
+    // Both got the one new token, and it is the live one.
+    expect(second?.accessToken).toBe(first?.accessToken);
     expect(hooked).toEqual([]);
-    expect(h.browser.cookies.has("gnap-auth")).toBe(true);
+    expect(await introspect(h, first?.accessToken ?? "")).toMatchObject({ active: true });
+  });
 
-    const session: GnapAuth = await (await h.browser.get(`${APP}/`, XHR)).json();
+  it("shares one rotation between page loads too: no new grant, no consent screen", async () => {
+    const h = await createApp();
 
-    expect(await introspect(h, session.accessToken)).toMatchObject({ active: true });
+    await login(h);
+    h.clock.advance(61);
+
+    const responses = await Promise.all([h.browser.get(`${APP}/`), h.browser.get(`${APP}/`)]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(grantRequests(h)).toBe(1);
+    expect(rotations(h)).toBe(1);
+  });
+
+  it("rotates again once the rotation in flight is over (the merge is not a cache)", async () => {
+    const h = await createApp();
+
+    await login(h);
+    h.clock.advance(61);
+    expect((await h.browser.get(`${APP}/`, XHR)).status).toBe(200);
+    h.clock.advance(61);
+    expect((await h.browser.get(`${APP}/`, XHR)).status).toBe(200);
+    expect(rotations(h)).toBe(2);
+  });
+
+  describe("a request that arrives with the cookie another request has just replaced", () => {
+    /** The browser's cookie before the rotation, and the app after one request rotated it. */
+    const stale = async () => {
+      const h = await createApp();
+
+      await login(h);
+      const old = h.browser.cookies.get("gnap-auth") ?? "";
+
+      h.clock.advance(61);
+      expect((await h.browser.get(`${APP}/`, XHR)).status).toBe(200);
+
+      const send = (url: string, headers: Record<string, string>) =>
+        h.app.request(url, {
+          headers: { ...headers, cookie: ["gnap-auth=" + old, headers["cookie"]].filter(Boolean).join("; ") },
+        });
+
+      return { h, send };
+    };
+
+    it("is an API call that gets 401 and keeps the cookie", async () => {
+      const { h, send } = await stale();
+      const response = await send(`${APP}/`, XHR);
+
+      expect(response.status).toBe(401);
+      expect(deletes(response, "gnap-auth")).toBe(false);
+      expect(grantRequests(h)).toBe(1);
+    });
+
+    it("is a page load that goes to the same URL once, instead of to a new grant", async () => {
+      const { h, send } = await stale();
+      const response = await send(`${APP}/?tab=1`, PAGE);
+
+      expect(response.status).toBe(302);
+      expect(response.headers.get("location")).toBe(`${APP}/?tab=1`);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(attributesOf(cookieLine(response, "gnap-auth-retry"))).toEqual(
+        expect.arrayContaining(["httponly", "secure", "path=/", "max-age=30"]),
+      );
+
+      expect(deletes(response, "gnap-auth")).toBe(false);
+      expect(grantRequests(h)).toBe(1);
+
+      // The browser took the winner's cookie meanwhile: the second request is served, and the mark is gone.
+      const again = await h.browser.get(`${APP}/?tab=1`);
+
+      expect(again.status).toBe(200);
+    });
+
+    it("is sent to a new grant when the retry fails as well (no redirect loop), and the mark is used up", async () => {
+      const { h, send } = await stale();
+      const response = await send(`${APP}/page`, { ...PAGE, cookie: "gnap-auth-retry=1" });
+
+      expect(response.status).toBe(302);
+      expect(response.headers.get("location")).toContain("/interact/");
+      expect(deletes(response, "gnap-auth-retry")).toBe(true);
+      expect(
+        attributesOf(response.headers.getSetCookie().find((line) => line.startsWith("gnap-auth-retry=;"))),
+      ).toContain("secure");
+
+      expect(grantRequests(h)).toBe(2);
+    });
+
+    it("is no lost race when the server is down: the page goes to log in again, with no retry mark", async () => {
+      const state: Flaky = { failure: "unavailable" };
+      const h = await createApp({ requestTimeoutMs: 20 }, { wrapFetch: failing(state) });
+
+      await login(h);
+      h.clock.advance(61);
+
+      const page = await h.browser.get(`${APP}/`);
+
+      // An outage is no lost race: the request goes to log in again, as before.
+      expect(page.status).toBe(302);
+      expect(page.headers.get("location")).toContain("/interact/");
+      expect(cookieLine(page, "gnap-auth-retry")).toBeUndefined();
+    });
   });
 
   it.each(["unavailable", "overloaded", "unreachable", "silent"] as const)(
@@ -934,7 +1064,7 @@ describe("a second tab while a login is pending", () => {
       foreign: stranger.browser.cookies.get("gnap-auth-pending") ?? "",
     });
 
-    const response = await h.app.request(`${APP}/`, { headers: { cookie: `gnap-auth-pending=${pending}` } });
+    const response = await h.app.request(`${APP}/`, { headers: { ...PAGE, cookie: `gnap-auth-pending=${pending}` } });
     const location = response.headers.get("location");
 
     expect(response.status).toBe(302);
@@ -1061,4 +1191,404 @@ describe("the lifetime of a pending login (interact.expires_in)", () => {
       expect(response.headers.getSetCookie()).toEqual([]);
     },
   );
+});
+
+describe("cookie name prefixes (RFC 6265bis §4.1.3)", () => {
+  const session = (name: string, jar: Map<string, string>) => jar.has(name);
+
+  it.each(["__Secure-gnap", "__Host-gnap"])("log in and out with the cookie name %s", async (cookieName) => {
+    const h = await createApp({ cookieName });
+    const { first, back } = await login(h);
+
+    // The jar is a browser that drops a prefixed cookie without the attributes it promises.
+    expect(session(`${cookieName}-state`, h.browser.cookies)).toBe(false);
+    expect(session(cookieName, h.browser.cookies)).toBe(true);
+    expect(attributesOf(cookieLine(first, `${cookieName}-state`))).toEqual(expect.arrayContaining(["secure"]));
+    expect(attributesOf(cookieLine(back, cookieName))).toEqual(expect.arrayContaining(["secure", "path=/"]));
+    expect(h.browser.stored().find((cookie) => cookie.name === cookieName)).toBeDefined();
+
+    const out = await h.browser.get(`${APP}/`, XHR);
+
+    expect(out.status).toBe(200);
+  });
+
+  it("scopes the login state of a __Host- name to /, not to the callback path (the prefix demands it)", async () => {
+    const h = await createApp({ cookieName: "__Host-gnap" });
+    const first = await h.browser.get(`${APP}/`);
+
+    expect(first.status).toBe(302);
+    expect(attributesOf(cookieLine(first, "__Host-gnap-state"))).toEqual(expect.arrayContaining(["secure", "path=/"]));
+    expect(attributesOf(cookieLine(first, "__Host-gnap-state"))).not.toContain("path=/callback");
+    expect(attributesOf(cookieLine(first, "__Host-gnap-pending"))).toEqual(
+      expect.arrayContaining(["secure", "path=/"]),
+    );
+    expect(h.browser.cookies.has("__Host-gnap-state")).toBe(true);
+    expect(h.browser.cookies.has("__Host-gnap-pending")).toBe(true);
+
+    const back = await h.browser.get(await h.consent(first.headers.get("location") ?? ""));
+
+    expect(back.status).toBe(302);
+    expect(deletes(back, "__Host-gnap-state")).toBe(true);
+    expect(h.browser.cookies.has("__Host-gnap-state")).toBe(false);
+    expect(h.browser.cookies.has("__Host-gnap")).toBe(true);
+  });
+
+  it.each(["__Secure-gnap", "__Host-gnap"])(
+    "drops a stale or forged %s cookie with a 302 to log in, not a 500, and deletes it as it was set",
+    async (cookieName) => {
+      const h = await createApp({ cookieName });
+
+      const response = await h.app.request(`${APP}/`, { headers: { ...PAGE, cookie: `${cookieName}=forged` } });
+
+      expect(response.status).toBe(302);
+      expect(deletes(response, cookieName)).toBe(true);
+
+      const line = response.headers.getSetCookie().find((entry) => entry.startsWith(`${cookieName}=;`));
+
+      expect(attributesOf(line)).toEqual(expect.arrayContaining(["secure", "path=/"]));
+      expect(attributesOf(line).some((attribute) => attribute.startsWith("domain="))).toBe(false);
+    },
+  );
+
+  it("deletes a __Secure- cookie with its Domain too, both variants Secure", async () => {
+    const h = await createApp({ cookieName: "__Secure-gnap", cookieDomain: "app.test", cookiePath: "/" });
+    const response = await h.app.request(`${APP}/`, { headers: { ...PAGE, cookie: "__Secure-gnap=forged" } });
+    const lines = response.headers.getSetCookie().filter((entry) => entry.startsWith("__Secure-gnap=;"));
+
+    expect(response.status).toBe(302);
+    expect(lines).toHaveLength(2);
+
+    for (const line of lines) expect(attributesOf(line)).toContain("secure");
+    expect(lines.some((line) => attributesOf(line).includes("domain=app.test"))).toBe(true);
+  });
+
+  it("logs out with a __Host- name: the cookie is deleted, not a 500", async () => {
+    const h = await createApp(
+      { cookieName: "__Host-gnap" },
+      { routes: (app) => app.get("/logout", async (c) => (await revokeGnapSession(c), c.text("bye"))) },
+    );
+
+    await login(h);
+    const response = await h.browser.get(`${APP}/logout`);
+
+    expect(response.status).toBe(200);
+    expect(deletes(response, "__Host-gnap")).toBe(true);
+    expect(h.browser.cookies.has("__Host-gnap")).toBe(false);
+  });
+
+  it("refuses a __Host- name with a path or domain from the environment, on the request", async () => {
+    vi.stubEnv("GNAP_COOKIE_PATH", "/app");
+
+    const h = await createApp({ cookieName: "__Host-gnap" });
+    const response = await h.app.request(`${APP}/`, { headers: PAGE });
+
+    expect(response.status).toBe(500);
+    expect(await response.text()).toContain("__Host- cookie name needs");
+  });
+});
+
+describe("the login state in its cookie", () => {
+  const callbackOf = async (h: TestApp, first: Response) => h.consent(first.headers.get("location") ?? "");
+
+  it("keeps a query string that fits", async () => {
+    const h = await createApp();
+    const first = await h.browser.get(`${APP}/?tab=1&q=${"a".repeat(500)}`);
+    const back = await h.browser.get(await callbackOf(h, first));
+
+    expect(back.headers.get("location")).toBe(`${APP}/?tab=1&q=${"a".repeat(500)}`);
+  });
+
+  it("drops a query string that does not fit a cookie, and the login still works", async () => {
+    const h = await createApp();
+    const first = await h.browser.get(`${APP}/?q=${"a".repeat(4000)}`);
+    const line = cookieLine(first, "gnap-auth-state") ?? "";
+
+    expect(first.status).toBe(302);
+    expect(new TextEncoder().encode(line.split(";")[0]).length).toBeLessThanOrEqual(4096);
+    expect(h.browser.cookies.has("gnap-auth-state")).toBe(true);
+
+    const back = await h.browser.get(await callbackOf(h, first));
+
+    expect(back.status).toBe(302);
+    expect(back.headers.get("location")).toBe(`${APP}/`);
+    expect((await h.browser.get(`${APP}/`, XHR)).status).toBe(200);
+  });
+
+  it("fails with 500, not with a cookie the browser drops, when even the bare URL does not fit", async () => {
+    const h = await createApp();
+    const response = await h.browser.get(`${APP}/${"p".repeat(4100)}`);
+
+    expect(response.status).toBe(500);
+    expect(h.browser.cookies.has("gnap-auth-state")).toBe(false);
+  });
+
+  it("is left alone, with the pending interaction, by a callback request that has no state of its own", async () => {
+    const h = await createApp();
+    const first = await h.browser.get(`${APP}/`);
+
+    expect(h.browser.cookies.has("gnap-auth-pending")).toBe(true);
+
+    // A link to the callback from anywhere (no state cookie, or one that is not this deployment's).
+    for (const cookie of [
+      undefined,
+      "gnap-auth-state=garbage",
+      `gnap-auth-state=${tamper(h.browser.cookies.get("gnap-auth-state") ?? "")}`,
+    ]) {
+      const response = await h.app.request(`${APP}/callback?interact_ref=r&hash=h`, {
+        headers: cookie === undefined ? {} : { cookie },
+      });
+
+      expect(response.status).toBe(400);
+      expect(response.headers.getSetCookie()).toEqual([]);
+    }
+
+    // The browser's own cookies were never touched: the login in progress completes.
+    expect(h.browser.cookies.has("gnap-auth-pending")).toBe(true);
+
+    const back = await h.browser.get(await callbackOf(h, first));
+
+    expect(back.status).toBe(302);
+    expect((await h.browser.get(`${APP}/`, XHR)).status).toBe(200);
+  });
+
+  it("is used up by a callback that carries it (recognised state): both cookies are deleted", async () => {
+    const h = await createApp();
+
+    await h.browser.get(`${APP}/`);
+
+    const response = await h.browser.get(`${APP}/callback?result=grant_rejected`);
+
+    expect(response.status).toBe(401);
+    expect(deletes(response, "gnap-auth-state")).toBe(true);
+    expect(deletes(response, "gnap-auth-pending")).toBe(true);
+  });
+});
+
+describe("which requests start a login", () => {
+  it.each([
+    ["a navigation", { "Sec-Fetch-Mode": "navigate" }, 302],
+    ["a navigation that sends Accept: */*", { "Sec-Fetch-Mode": "navigate", accept: "*/*" }, 302],
+    ["a browser without Sec-Fetch headers that asks for a page", { accept: "text/html,application/xhtml+xml" }, 302],
+    ["curl", { accept: "*/*" }, 401],
+    ["a client that sends no Accept at all", { accept: "" }, 401],
+    [
+      "a script that asks for HTML without Sec-Fetch headers' navigate mode",
+      { "Sec-Fetch-Mode": "cors", accept: "text/html" },
+      401,
+    ],
+    ["a no-cors request", { "Sec-Fetch-Mode": "no-cors" }, 401],
+    ["a same-origin request", { "Sec-Fetch-Mode": "same-origin" }, 401],
+    ["a prefetch (Sec-Purpose)", { "Sec-Fetch-Mode": "navigate", "Sec-Purpose": "prefetch" }, 401],
+    ["a prerender (Sec-Purpose)", { "Sec-Fetch-Mode": "navigate", "Sec-Purpose": "prefetch;prerender" }, 401],
+    ["a prefetch of a browser without Sec-Fetch headers (Purpose)", { accept: "text/html", Purpose: "prefetch" }, 401],
+  ] as const)("%s", async (_name, headers, status) => {
+    const h = await createApp();
+    const response = await h.app.request(`${APP}/`, { headers });
+
+    expect(response.status).toBe(status);
+    expect(grantRequests(h)).toBe(status === 302 ? 1 : 0);
+  });
+
+  it("does not make the authorisation server store a grant for each anonymous GET without a page request", async () => {
+    const h = await createApp();
+
+    for (let index = 0; index < 10; index += 1) await h.app.request(`${APP}/`, { headers: { accept: "*/*" } });
+
+    expect(h.calls).toEqual([]);
+  });
+
+  it("starts no login on a HEAD or a POST, even for a navigation", async () => {
+    const h = await createApp();
+
+    for (const method of ["HEAD", "POST"]) {
+      const response = await h.app.request(`${APP}/`, { method, headers: { ...PAGE, "Sec-Fetch-Mode": "navigate" } });
+
+      expect(response.status).toBe(401);
+    }
+
+    expect(h.calls).toEqual([]);
+  });
+});
+
+describe("the authorisation server named at run time or by its answers (trust)", () => {
+  const HTTP_URL = "http://internal.test/gnap";
+
+  /** Rewrites the JSON body of the answers to the requests `when` accepts. */
+  const rewriting =
+    (when: (request: Request) => boolean, change: (body: Record<string, unknown>) => Record<string, unknown>) =>
+    (inner: typeof globalThis.fetch): typeof globalThis.fetch =>
+    async (input, init) => {
+      const request = new Request(input);
+      const response = await inner(request, init);
+
+      if (!when(request)) return response;
+
+      return Response.json(change(await response.clone().json()), { status: response.status });
+    };
+
+  it("refuses a grant endpoint that is http on a public host when it is chosen per request, before any request", async () => {
+    const h = await createApp({ grantEndpoint: () => HTTP_URL });
+    const response = await h.browser.get(`${APP}/`);
+
+    expect(response.status).toBe(500);
+    expect(await response.text()).toContain("must use HTTPS");
+    expect(h.calls).toEqual([]);
+  });
+
+  it("refuses any scheme that is not http(s) too", async () => {
+    const h = await createApp({ grantEndpoint: () => "file:///etc/passwd" });
+
+    expect((await h.browser.get(`${APP}/`)).status).toBe(500);
+    expect(h.calls).toEqual([]);
+  });
+
+  it("takes an https endpoint chosen per request, and an http one of the user's own machine", async () => {
+    const https = await createApp({ grantEndpoint: async () => BASE_URL });
+
+    expect((await https.browser.get(`${APP}/`)).status).toBe(302);
+
+    // The test server answers only at its own URL: what matters is that the endpoint was accepted and called.
+    const local = await createApp({ grantEndpoint: async () => "http://localhost:3000/gnap" });
+    const response = await local.browser.get(`${APP}/`);
+
+    expect(await response.text()).not.toContain("must use HTTPS");
+    expect(local.calls).toHaveLength(1);
+  });
+
+  it("refuses a continuation URL that is not https, when the grant is requested", async () => {
+    const h = await createApp(
+      {},
+      {
+        wrapFetch: rewriting(
+          (request) => request.method === "POST" && new URL(request.url).pathname === "/gnap",
+          (body) => ({
+            ...body,
+            continue: { ...(body["continue"] as object), uri: "http://internal.test/continue/1" },
+          }),
+        ),
+      },
+    );
+
+    const response = await h.browser.get(`${APP}/`);
+
+    expect(response.status).toBe(502);
+    expect(h.browser.cookies.has("gnap-auth-state")).toBe(false);
+  });
+
+  it("refuses a token management URL that is not https, and says nothing of the URL", async () => {
+    const h = await createApp(
+      {},
+      {
+        wrapFetch: rewriting(
+          (request) => new URL(request.url).pathname.startsWith("/gnap/continue/"),
+          (body) => {
+            const token = body["access_token"] as Record<string, unknown>;
+
+            return { ...body, access_token: { ...token, manage: "http://internal.test/token/1" } };
+          },
+        ),
+      },
+    );
+
+    const first = await h.browser.get(`${APP}/`);
+    const back = await h.browser.get(await h.consent(first.headers.get("location") ?? ""));
+
+    expect(back.status).toBe(502);
+    expect(await back.text()).not.toContain("internal.test");
+    expect(h.browser.cookies.has("gnap-auth")).toBe(false);
+  });
+
+  it("takes credential URLs on the user's own machine over http", async () => {
+    const h = await createApp(
+      {},
+      {
+        wrapFetch: rewriting(
+          (request) => new URL(request.url).pathname.startsWith("/gnap/continue/"),
+          (body) => {
+            const token = body["access_token"] as Record<string, unknown>;
+
+            return { ...body, access_token: { ...token, manage: "http://localhost:3000/gnap/token/x" } };
+          },
+        ),
+      },
+    );
+
+    const { back } = await login(h);
+
+    expect(back.status).toBe(302);
+  });
+
+  it("does not repeat the authorisation server's error text in the 502", async () => {
+    const h = await createApp(
+      {},
+      {
+        wrapFetch: (inner) => async (input, init) => {
+          const request = new Request(input);
+
+          return new URL(request.url).pathname.startsWith("/gnap/continue/")
+            ? Response.json({ error: { code: "invalid_request", description: "leak-this-detail" } }, { status: 400 })
+            : inner(request, init);
+        },
+      },
+    );
+
+    const first = await h.browser.get(`${APP}/`);
+    const back = await h.browser.get(await h.consent(first.headers.get("location") ?? ""));
+
+    expect(back.status).toBe(502);
+    expect(await back.text()).toBe("GNAP continue failed");
+  });
+
+  it("reports a redirect (an opaque one in a browser-like fetch) as a refusal, not as an unreachable server", async () => {
+    const opaque = (): Response =>
+      Object.defineProperties(new Response(null, { status: 200 }), {
+        type: { value: "opaqueredirect" },
+        status: { value: 0 },
+      });
+
+    const h = await createApp({}, { wrapFetch: () => async () => opaque() });
+    const response = await h.browser.get(`${APP}/`);
+
+    expect(response.status).toBe(502);
+  });
+
+  it("reports a key that cannot sign as the app's own 500, not as a refusal by the server", async () => {
+    const h = await createApp({ keyId: "k\u00e9y" });
+    const response = await h.browser.get(`${APP}/`);
+
+    expect(response.status).toBe(500);
+    expect(await response.text()).toBe("The GNAP request could not be signed");
+    expect(h.calls).toEqual([]);
+  });
+});
+
+describe("the environment", () => {
+  it("does not read an empty GNAP_AUTH_REFRESH_INTERVAL as 0 (a rotation on every request)", async () => {
+    vi.stubEnv("GNAP_AUTH_REFRESH_INTERVAL", "");
+    vi.stubEnv("GNAP_AUTH_EXPIRES", " ");
+
+    const h = await createApp({}, { withoutRefreshInterval: true });
+    const { back } = await login(h);
+
+    expect(back.status).toBe(302);
+
+    const session: GnapAuth = await (await h.browser.get(`${APP}/`, XHR)).json();
+
+    const now = Math.floor(h.clock.now().getTime() / 1000);
+
+    // Not rotated at once (0 would be `now`): the token's own lifetime (600 s, less a margin) is the limit here.
+    expect(session.rtkexp).toBeGreaterThan(now + 300);
+    expect(session.ssnexp).toBeGreaterThan(now + 86_000);
+  });
+
+  it("still reads a number from it", async () => {
+    vi.stubEnv("GNAP_AUTH_REFRESH_INTERVAL", "120");
+
+    const h = await createApp({}, { withoutRefreshInterval: true });
+
+    await login(h);
+    const session: GnapAuth = await (await h.browser.get(`${APP}/`, XHR)).json();
+
+    expect(session.rtkexp - Math.floor(h.clock.now().getTime() / 1000)).toBe(120);
+  });
 });

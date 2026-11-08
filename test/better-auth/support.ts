@@ -6,6 +6,7 @@ import { gnap, type GnapOptions } from "../../src/better-auth/index";
 import { gnapSchema } from "../../src/better-auth/schema";
 import { signRequest, type SigningKey } from "../../src/http-signatures/index";
 import { expectConformsToSpec } from "../gnap-server/openapi";
+import { cookiesOf } from "../support/cookies";
 import {
   CONSENT_URL,
   IDP_SECRET,
@@ -69,16 +70,21 @@ export const createHarness = async (options: HarnessOptions = {}) => {
 
   const signUp = await auth.api.signUpEmail({ body: USER, asResponse: true });
 
-  const cookie = signUp.headers
-    .getSetCookie()
-    .map((line) => line.split(";")[0])
-    .join("; ");
+  const cookie = cookiesOf(signUp);
 
   const grantUrl = `${baseURL}${GNAP_PATH}`;
 
-  /** Calls the Better Auth handler as the signed-in resource owner (same-origin, with the session cookie). */
-  const asUser = (path: string, init: RequestInit = {}): Promise<Response> =>
-    auth.handler(new Request(`${baseURL}/api/auth${path}`, withHeaders(init, { cookie, origin: baseURL })));
+  /**
+   * Calls the Better Auth handler as the signed-in resource owner (same-origin, with the session cookie).
+   * `browserCookies` are the cookies the same browser got from the interaction start (nonce and binding).
+   */
+  const asUser = (path: string, init: RequestInit = {}, browserCookies = ""): Promise<Response> =>
+    auth.handler(
+      new Request(
+        `${baseURL}/api/auth${path}`,
+        withHeaders(init, { cookie: browserCookies === "" ? cookie : `${cookie}; ${browserCookies}`, origin: baseURL }),
+      ),
+    );
 
   /** Sends `request` to the handler; throws when a GNAP response is not what the OpenAPI documents allow. */
   const call = async (request: Request): Promise<Response> => {

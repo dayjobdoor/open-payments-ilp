@@ -15,7 +15,7 @@ import { isLoopbackHost } from "../internal/url";
 import type { Wire } from "./wire";
 
 /**
- * Configuration; every field but `access`, `requestTimeoutMs` and `encryptCookies` can come from the environment instead
+ * Configuration; every field but `access`, `fetch`, `clock`, `requestTimeoutMs` and `encryptCookies` can come from the environment instead
  * (`GNAP_AUTH_SECRET`, `GNAP_GRANT_ENDPOINT`, `GNAP_KEY_ID`, `GNAP_PRIVATE_KEY`, `GNAP_PRIVATE_JWK` (JSON),
  * `GNAP_CLIENT`, `GNAP_REDIRECT_URI`, `GNAP_COOKIE_NAME`, `GNAP_COOKIE_PATH`, `GNAP_COOKIE_DOMAIN`,
  * `GNAP_AUTH_REFRESH_INTERVAL`, `GNAP_AUTH_EXPIRES`, `GNAP_AUTH_EXTERNAL_URL`); configuration passed in wins. The
@@ -56,10 +56,16 @@ export interface GnapAuthConfig {
   readonly privateJwk?: JsonWebKey;
   /** Where the authorisation server sends the user back; a path or a URL. Default `/callback`. */
   readonly redirectUri?: string;
-  /** Default `gnap-auth`. */
+  /**
+   * Default `gnap-auth`. The login-state and pending-grant cookies add `-state` and `-pending`. A `__Secure-` or
+   * `__Host-` prefix works (every cookie is `Secure`, and is deleted with the attributes it was set with); `__Host-`
+   * needs `cookiePath` `/` and no `cookieDomain`, and then the login-state cookie is scoped to `/` too, not only to the
+   * callback path.
+   */
   readonly cookieName?: string;
   /** Default `/`. */
   readonly cookiePath?: string;
+  /** Sent as the `Domain` of the cookies; not allowed with a `__Host-` name. */
   readonly cookieDomain?: string;
   /** Seconds between access token rotations. Default 900. Rotation also happens when the token expires sooner. */
   readonly refreshInterval?: number;
@@ -94,7 +100,7 @@ type GnapAuthEnv = {
 export const httpError = (status: 400 | 401 | 500 | 502 | 503, message: string): HTTPException =>
   new HTTPException(status, { message });
 
-/** The longest a cookie may live (RFC 6265bis §5.5), and the largest name-and-value browsers store. */
+/** The longest cookie lifetime browsers honour (400 days, RFC 6265bis §5.5); Hono refuses longer. */
 const MAX_COOKIE_SECONDS = 34_560_000;
 
 const privateJwkSchema = Schema.Struct({
@@ -154,6 +160,9 @@ type Checked = {
       | "externalUrl"
       | "redirectUri"
       | "grantEndpoint"
+      | "cookieName"
+      | "cookiePath"
+      | "cookieDomain"
       | "client"
       | "privateKey"
       | "privateJwk"
@@ -168,6 +177,8 @@ type Checked = {
 export const validateConfig = (config: Checked): void => {
   const { secret, refreshInterval, expires, requestTimeoutMs, externalUrl, redirectUri, grantEndpoint, client } =
     config;
+
+  const { cookieName, cookiePath, cookieDomain } = config;
 
   if (secret !== undefined && secret.length < 32) {
     throw httpError(500, "Session secrets must be at least 32 characters long");
@@ -206,8 +217,18 @@ export const validateConfig = (config: Checked): void => {
     throw httpError(500, "The GNAP redirect URI must use HTTPS (or localhost) and have no fragment");
   }
 
-  if (grantEndpoint !== undefined && !(grantEndpoint instanceof Function) && !isHttpUrl(grantEndpoint)) {
-    throw httpError(500, "The GNAP grant endpoint must be an http(s) URL");
+  if (grantEndpoint !== undefined && !(grantEndpoint instanceof Function)) {
+    if (!isHttpUrl(grantEndpoint)) throw httpError(500, "The GNAP grant endpoint must be an http(s) URL");
+
+    // Signed requests go there: never in the clear, unless the server is on the user's own machine.
+    if (!isSecureUri(grantEndpoint)) {
+      throw httpError(500, "The GNAP grant endpoint must use HTTPS (http is only allowed for localhost)");
+    }
+  }
+
+  // RFC 6265bis §4.1.3: a `__Host-` cookie is `Secure`, has `Path=/` and no `Domain`; the browser drops it otherwise.
+  if (cookieName?.startsWith("__Host-") === true && ((cookiePath ?? "/") !== "/" || (cookieDomain ?? "") !== "")) {
+    throw httpError(500, "A __Host- cookie name needs the cookie path / and no cookie domain");
   }
 
   if (client !== undefined && !isHttpUrl(client)) {
@@ -257,7 +278,9 @@ export const setConfig = (c: Context, config: GnapAuthConfig, importer: KeyImpor
   if (c.get("gnapAuthConfig") !== undefined) throw httpError(500, "GNAP auth is already configured");
 
   const ev = env<GnapAuthEnv>(c);
-  const number = (value: string | undefined): number | undefined => (value === undefined ? undefined : Number(value));
+  // An empty (or blank) variable is not set: `Number("")` is 0, which would rotate the token on every request.
+  const number = (value: string | undefined): number | undefined =>
+    value === undefined || value.trim() === "" ? undefined : Number(value);
   // The key is resolved as a unit: a key in the config means the environment's key variables are not consulted.
   const keyInConfig = config.privateKey !== undefined || config.privateJwk !== undefined;
   const privateKey = keyInConfig ? config.privateKey : ev.GNAP_PRIVATE_KEY;
@@ -286,6 +309,9 @@ export const setConfig = (c: Context, config: GnapAuthConfig, importer: KeyImpor
     client,
     privateKey,
     privateJwk,
+    cookieName: config.cookieName ?? ev.GNAP_COOKIE_NAME,
+    cookiePath: config.cookiePath ?? ev.GNAP_COOKIE_PATH,
+    cookieDomain,
   });
 
   const resolved: Resolved = {

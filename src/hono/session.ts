@@ -11,7 +11,7 @@ import { encodeBase64Url, sha256 } from "../internal/bytes";
 import { accessItem } from "../open-payments/schemas";
 import { getConfig, httpError, isSecureUri, nowSeconds, resolveWire, type Resolved } from "./config";
 import { openCookie, sealCookie } from "./seal";
-import { GnapAuthError, revokeCredential, rotateToken, type Credential, type IssuedToken } from "./wire";
+import { GnapAuthError, revokeCredential, rotateToken, type Credential, type IssuedToken, type Wire } from "./wire";
 
 /**
  * The session in the cookie. Times are epoch seconds. The cookie is encrypted unless `encryptCookies` is `false`: then
@@ -133,6 +133,16 @@ export const pendingCookieName = (config: Resolved): string => `${config.cookieN
 const fitsInCookie = (name: string, value: string): boolean =>
   new TextEncoder().encode(`${name}=${value}`).length <= MAX_COOKIE_BYTES;
 
+/** `url` without its query string and fragment. */
+const withoutQuery = (url: string): string => {
+  const bare = new URL(url);
+
+  bare.search = "";
+  bare.hash = "";
+
+  return bare.toString();
+};
+
 /** Stores a session: seals it into the cookie, and remembers the value to re-set it after the handler ran. */
 export const saveSession = async (
   c: Context,
@@ -175,14 +185,30 @@ export const saveSession = async (
   return session;
 };
 
-/** Deletes cookie `name` (the session's by default), scoped like the cookies this module sets. */
-export const dropSessionCookie = (c: Context, config: Resolved, name: string = config.cookieName): void => {
-  deleteCookie(c, name, { path: config.cookiePath });
+/**
+ * The `Path` of the login-state cookie. It is sent to the callback only; a `__Host-` name must have `Path=/`
+ * (RFC 6265bis §4.1.3), so then it goes to every path.
+ */
+export const stateCookiePath = (config: Resolved, callbackPath: string): string =>
+  config.cookieName.startsWith("__Host-") ? "/" : callbackPath;
 
-  if (config.cookieDomain !== undefined) {
-    deleteCookie(c, name, { path: config.cookiePath, domain: config.cookieDomain });
-  }
+/**
+ * Deletes cookie `name` at `path`, with the attributes it was set with: `Secure` (a `__Secure-` or `__Host-` name is
+ * invalid without it) and the `Domain` too, when there is one (a cookie of another scope is not touched).
+ */
+const deleteScoped = (c: Context, config: Resolved, name: string, path: string): void => {
+  deleteCookie(c, name, { path, secure: true });
+
+  if (config.cookieDomain !== undefined) deleteCookie(c, name, { path, secure: true, domain: config.cookieDomain });
 };
+
+/** Deletes cookie `name` (the session's by default), scoped like the cookies this module sets. */
+export const dropSessionCookie = (c: Context, config: Resolved, name: string = config.cookieName): void =>
+  deleteScoped(c, config, name, config.cookiePath);
+
+/** Deletes the login-state cookie of a callback served at `callbackPath`. */
+export const dropStateCookie = (c: Context, config: Resolved, callbackPath: string): void =>
+  deleteScoped(c, config, stateCookieName(config), stateCookiePath(config, callbackPath));
 
 const readSession = (config: Resolved, cookie: string): Promise<GnapAuth | undefined> =>
   openCookie(config, "session", cookie, gnapAuthSchema);
@@ -216,17 +242,32 @@ const setPointer = async (c: Context, config: Resolved, pointer: PendingPointer)
  * Stores a grant waiting for the user's return. The state (continue credential and nonces) is scoped to the callback
  * `path`, the only place that needs it. Next to it goes a pointer to the interaction URL, scoped like the session, so
  * that another request of the browser (a second tab) is sent to the same interaction instead of requesting a second
- * grant, which would replace the state under the first one's feet. Neither outlives `state.stexp`.
+ * grant, which would replace the state under the first one's feet. Neither outlives `state.stexp`. The state cookie
+ * is scoped to `callbackPath` (to `/` with a `__Host-` name); a return URL whose query string does not fit the cookie
+ * is stored without it, and one that still does not fit is an error.
  */
 export const savePending = async (
   c: Context,
   config: Resolved,
   state: PendingState,
   reuse: { readonly redirect: string; readonly fingerprint: string },
-  path: string,
+  callbackPath: string,
 ): Promise<void> => {
-  setCookie(c, stateCookieName(config), await sealCookie(config, "state", state), {
-    ...cookieOptions(config, path),
+  const name = stateCookieName(config);
+  let value = await sealCookie(config, "state", state);
+
+  // The return URL carries the page's query string, which may be any length: without it the login still works and
+  // lands on the page, just without its query.
+  if (!fitsInCookie(name, value)) {
+    value = await sealCookie(config, "state", { ...state, rt: withoutQuery(state.rt) });
+
+    if (!fitsInCookie(name, value)) {
+      throw httpError(500, `The pending GNAP login does not fit in a cookie of ${MAX_COOKIE_BYTES} bytes`);
+    }
+  }
+
+  setCookie(c, name, value, {
+    ...cookieOptions(config, stateCookiePath(config, callbackPath)),
     maxAge: Math.max(state.stexp - nowSeconds(config), 1),
   });
 
@@ -279,19 +320,58 @@ export const readPendingPointer = async (
 };
 
 /**
- * A rotation answer that cannot be a lost race (another request rotated first: Rafiki and RFC 9635 servers answer
- * `401`/`404` to the old credential) nor an outage (`429`, `5xx`, no answer, timeout): the server understood the
+ * A rotation answer that cannot be a lost race (another request rotated first: Rafiki answers `401`/`404` to the old
+ * credential; RFC 9635 does not specify it) nor an outage (`429`, `5xx`, no answer, timeout): the server understood the
  * request and refuses it, so the session is gone. Every `4xx` but `401`, `404`, `408` and `429`.
  */
 const refusesRotation = (error: GnapAuthError): boolean =>
   error.status >= 400 && error.status < 500 && ![401, 404, 408, 429].includes(error.status);
 
 /**
+ * Rotations in flight in this process, by a hash of the management credential: requests that carry the same cookie
+ * (a page with several calls after the tab was idle) share one rotation instead of racing it, so that none of them
+ * loses its token to another (the server revokes the old one when it rotates).
+ */
+const rotations = new Map<string, Promise<IssuedToken>>();
+
+const rotateOnce = async (wire: Wire, manage: Credential): Promise<IssuedToken> => {
+  const key = encodeBase64Url(await sha256(new TextEncoder().encode(`${manage.uri}\n${manage.token}`)));
+  const running = rotations.get(key);
+
+  if (running !== undefined) return running;
+  const started = rotateToken(wire, manage).finally(() => rotations.delete(key));
+
+  rotations.set(key, started);
+
+  return started;
+};
+
+/** Requests whose rotation was refused as if another request had rotated first (`401`/`404`). */
+const lostRaces = new WeakSet<Context>();
+
+/**
+ * Whether the session of this request could not be rotated because the server no longer knows its credential, which is
+ * what a rotation by another request (another process, or one that finished just before this one began) looks like.
+ * Only meaningful after {@link getGnapAuth}.
+ */
+export const lostRotationRace = (c: Context): boolean => lostRaces.has(c);
+
+/** Marks a page load that was sent to the same URL once, to pick up a session rotated by another request. */
+export const retryCookieName = (config: Resolved): string => `${config.cookieName}-retry`;
+
+const RETRY_SECONDS = 30;
+
+/** Sets the mark of {@link retryCookieName}. */
+export const markRetry = (c: Context, config: Resolved): void =>
+  setCookie(c, retryCookieName(config), "1", { ...cookieOptions(config), maxAge: RETRY_SECONDS });
+
+/**
  * The current session, or `null` when there is none. Rotates the access token when the refresh interval (or the
  * token's lifetime) is over; when the session has expired (`ssnexp`), revokes it and returns `null`.
  *
- * A failed rotation does not end the session: another request may have rotated first (the winner's response sets
- * the new cookie), or the server may be unavailable. The request then goes on without a session (`null`) and
+ * Requests of this process that carry the same cookie share one rotation. A failed rotation does not end the
+ * session: another request (of another process) may have rotated first (the winner's response sets the new cookie),
+ * or the server may be unavailable. The request then goes on without a session (`null`) and
  * without touching the cookie. Only when the server definitively refuses (a `4xx` other than `401`, `404`, `408`,
  * `429`) is the cookie dropped and `gnapAuthRefreshErrorHook` called (set it with `c.set` before this runs; it may
  * throw to replace the re-login).
@@ -334,10 +414,12 @@ export const getGnapAuth = async (c: Context): Promise<GnapAuth | null> => {
       try {
         const wire = await resolveWire(config);
 
-        session = await saveSession(c, config, await rotateToken(wire, session.manage), session, undefined);
+        session = await saveSession(c, config, await rotateOnce(wire, session.manage), session, undefined);
       } catch (error) {
         if (!(error instanceof GnapAuthError)) throw error;
         c.set("gnapAuth", null);
+
+        if (error.status === 401 || error.status === 404) lostRaces.add(c);
 
         if (refusesRotation(error)) {
           dropSessionCookie(c, config);

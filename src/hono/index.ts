@@ -18,7 +18,7 @@
  */
 import * as Effect from "effect/Effect";
 import type { Context, MiddlewareHandler } from "hono";
-import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { getCookie, setCookie } from "hono/cookie";
 import { createMiddleware } from "hono/factory";
 import { HTTPException } from "hono/http-exception";
 import { verifyInteractionHash } from "../gnap/index";
@@ -39,11 +39,15 @@ import {
 import {
   cookieOptions,
   dropSessionCookie,
+  dropStateCookie,
   getGnapAuth,
   grantFingerprint,
+  lostRotationRace,
+  markRetry,
   pendingCookieName,
   readPending,
   readPendingPointer,
+  retryCookieName,
   saveSession,
   savePending,
   savePolling,
@@ -180,6 +184,11 @@ const startGrant = async (c: Context, config: Resolved): Promise<Response | unde
   const wire = await resolveWire(config);
   const endpoint = grantEndpoint instanceof Function ? await grantEndpoint(c) : grantEndpoint;
 
+  // Signed requests go there, so a per-request endpoint (from a wallet address, say) is held to the rule of a fixed one.
+  if (!isSecureUri(endpoint)) {
+    throw httpError(500, "The GNAP grant endpoint must use HTTPS (http is only allowed for localhost)");
+  }
+
   const client =
     config.client ?? (wire.jwk === undefined ? undefined : { key: { proof: "httpsig" as const, jwk: wire.jwk } });
 
@@ -281,7 +290,8 @@ const failureStatus = (result: string): 400 | 401 =>
   result === "grant_rejected" || result === "request_denied" || result === "user_denied" ? 401 : 400;
 
 /**
- * Handles the redirect back from the authorisation server: reads the state cookie, rejects a failed interaction
+ * Handles the redirect back from the authorisation server: reads the state cookie (a request without this browser's
+ * own state is refused and leaves every cookie alone; with it, the state and pending cookies are used up), rejects a failed interaction
  * (`result=…`, Rafiki's convention) and a wrong `hash`, waits out `continue.wait`, continues the grant, stores the
  * session and redirects to where the user came from. A denial in the RFC 9635 manner (§4.2: the finish callback
  * comes anyway, the `continue` answers `user_denied`) is `401`, like Rafiki's `result=grant_rejected`. Other failures
@@ -290,15 +300,17 @@ const failureStatus = (result: string): 400 | 401 =>
 export const processGnapCallback = async (c: Context): Promise<Response> => {
   const config = getConfig(c);
   const cookie = getCookie(c, stateCookieName(config));
-
-  deleteCookie(c, stateCookieName(config), cookieOptions(config, statePath(c, config)));
-  dropSessionCookie(c, config, pendingCookieName(config));
-
   const state = cookie === undefined ? undefined : await readPending(config, cookie);
 
+  // Nothing is cleared before the state is recognised as this browser's own: a link to the callback from anywhere
+  // must not cancel a login in progress.
   if (state === undefined || state.stexp < nowSeconds(config)) {
     throw httpError(400, "Missing, invalid or expired login state");
   }
+
+  // The state is single-use from here on, whatever the callback turns out to be.
+  dropStateCookie(c, config, statePath(c, config));
+  dropSessionCookie(c, config, pendingCookieName(config));
 
   const result = c.req.query("result");
 
@@ -334,22 +346,43 @@ export const processGnapCallback = async (c: Context): Promise<Response> => {
       throw httpError(401, `GNAP interaction failed: ${error.code}`);
     }
 
+    // What the server said, and the URLs it named, stay out of the response (`GnapAuthError.remote`).
     throw new HTTPException(error.status === 401 || error.status === 504 ? error.status : 502, {
-      message: `GNAP continue failed: ${error.message}`,
+      message: error.remote ? "GNAP continue failed" : `GNAP continue failed: ${error.message}`,
     });
   }
 
   return c.redirect(state.rt);
 };
 
-/** A navigation of the user's browser: the only request that may send the user off to log in. */
-const isNavigation = (c: Context): boolean =>
-  c.req.method === "GET" && [undefined, "navigate"].includes(c.req.header("Sec-Fetch-Mode"));
+/** A speculative load (`Sec-Purpose`, or the older `Purpose`): nobody is looking at the page yet. */
+const isPrefetch = (c: Context): boolean =>
+  [c.req.header("Sec-Purpose"), c.req.header("Purpose")].some((value) =>
+    (value ?? "")
+      .toLowerCase()
+      .split(";")
+      .some((token) => token.trim() === "prefetch"),
+  );
+
+/**
+ * A navigation of the user's browser: the only request that may send the user off to log in (and so make the
+ * authorisation server store a grant). A `GET` that is not a prefetch, with `Sec-Fetch-Mode: navigate`; or, for a
+ * browser that sends no `Sec-Fetch-*` headers, one that asks for a page (`Accept: text/html`). A bare `curl` or a
+ * script (no `Accept: text/html`, or `Sec-Fetch-Mode: cors`) is not.
+ */
+const isNavigation = (c: Context): boolean => {
+  if (c.req.method !== "GET" || isPrefetch(c)) return false;
+  const mode = c.req.header("Sec-Fetch-Mode");
+
+  return mode === undefined ? (c.req.header("Accept") ?? "").toLowerCase().includes("text/html") : mode === "navigate";
+};
 
 /**
  * Requires a GNAP session: valid session → handler; otherwise requests a grant and redirects the user to the
  * authorisation server (or, for a grant that needs no interaction, creates the session at once). Only a `GET`
- * navigation (`Sec-Fetch-Mode` absent or `navigate`) starts a grant; any other request without a session gets `401`.
+ * navigation starts a grant (`Sec-Fetch-Mode: navigate`, or, without that header, `Accept: text/html`; never a
+ * prefetch); any other request without a session gets `401`. A page load whose session could not be rotated because
+ * another request rotated it first is sent to the same URL once, to carry the new cookie, instead of to a new grant.
  * Serves the callback itself when mounted on the `redirectUri` path. A grant the server does not finish with a
  * callback (no `interact.finish`, RFC 9635 §5.2) is polled by the browser's next navigations instead, no earlier than
  * the server's `wait`: while it is pending the user is sent to `interact.redirect` again (`202` with `Retry-After`
@@ -361,8 +394,21 @@ export const gnapAuthMiddleware = (): MiddlewareHandler =>
 
     if (isCallbackRequest(c, config)) return processGnapCallback(c);
 
+    // The mark of a retry lasts for the one request that follows it.
+    const retried = getCookie(c, retryCookieName(config)) !== undefined;
+
+    if (retried) dropSessionCookie(c, config, retryCookieName(config));
+
     if ((await getGnapAuth(c)) === null) {
       if (!isNavigation(c)) throw httpError(401, "Authentication required");
+
+      if (lostRotationRace(c) && !retried) {
+        markRetry(c, config);
+        c.header("Cache-Control", "no-store");
+
+        return c.redirect(publicRequestUrl(c, config));
+      }
+
       const redirect = await startGrant(c, config);
 
       if (redirect !== undefined) return redirect;

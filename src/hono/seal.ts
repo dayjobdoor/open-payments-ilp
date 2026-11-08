@@ -10,7 +10,11 @@ import { sign, verify } from "hono/jwt";
 import { concatBytes, decodeBase64Url, encodeBase64Url, utf8Decode, utf8Encode } from "../internal/bytes";
 import type { Resolved } from "./config";
 
-/** Which cookie a value is for. It is authenticated with the value, so a value is refused in the cookie of another kind. */
+/**
+ * Which cookie a value is for. In the encrypted format it is AES-GCM additional data, so a value is refused in the
+ * cookie of another kind; the signed format (`encryptCookies: false`) does not bind it, and only each kind's schema
+ * tells them apart.
+ */
 type CookieKind = "session" | "state" | "pending";
 
 /** What is stored in a cookie: a JSON object. */
@@ -24,7 +28,7 @@ const IV_BYTES = 12;
 
 const JWT_ALG = "HS256";
 
-/** What the keys are derived from: the key of one format and version is no key of another. */
+/** The HKDF salt, so that the key of one format and version is no key of another (the signed format uses `secret` itself). */
 const KEY_LABEL = `open-payments-ilp/hono cookie v${VERSION}`;
 
 type Protection = Pick<Resolved, "secret" | "encryptCookies">;

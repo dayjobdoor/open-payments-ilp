@@ -1,33 +1,45 @@
 /**
  * The client side of GNAP on the wire (RFC 9635 as profiled by Open Payments / Rafiki): signed grant, continue,
- * token rotation and revocation requests, and tolerant parsing of both servers' responses. No Hono here.
+ * token rotation and revocation requests, and tolerant parsing of both servers' responses. Hono is only used for the
+ * `HTTPException` of a failure that is this app's own (an unusable signing key).
  * @internal Not exported from the public entry point.
  */
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import { HTTPException } from "hono/http-exception";
 import type { AccessItem, GrantRequestAccessItem } from "../gnap/index";
 import { accessItem } from "../open-payments/schemas";
 import type { JWK } from "../open-payments/types";
 import { signRequest, type SigningKey } from "../http-signatures/index";
 import { encodeBase64Url } from "../internal/bytes";
 import { bufferResponse } from "../internal/http";
+import { isSecureUri } from "./config";
 
 /** An authorisation server's answers are small JSON documents; anything longer is not one. */
 const MAX_RESPONSE_BYTES = 64 * 1024;
 
 /** A failed exchange with the authorisation server (or a response that is not GNAP). */
 export class GnapAuthError extends Error {
-  /** HTTP status of the authorisation server's answer; `502` when it was not understood, `503` when it could not be reached, `504` when it timed out. */
+  /**
+   * HTTP status of the authorisation server's answer; `502` when it was not understood, `503` when it could not be
+   * reached, `504` when it timed out (also for a `wait` too long to sit out and a grant still pending after the polls).
+   */
   readonly status: number;
   /** GNAP error code (`invalid_request`, `too_fast`, …) when the answer carried one. */
   readonly code: string | undefined;
+  /**
+   * Whether `message` quotes the authorisation server (its error text) or a URL it named. Such a message is for the
+   * log or the `gnapAuthRefreshErrorHook`; it is not repeated in a response to the user's browser.
+   */
+  readonly remote: boolean;
 
-  constructor(status: number, message: string, code?: string) {
+  constructor(status: number, message: string, code?: string, remote = false) {
     super(message);
     this.name = "GnapAuthError";
     this.status = status;
     this.code = code;
+    this.remote = remote;
   }
 }
 
@@ -117,7 +129,9 @@ const DEFAULT_WAIT_SECONDS = 5;
 const decodeAccess = Schema.decodeUnknownResult(Schema.Array(accessItem));
 
 /**
- * Runs a signing effect. Its failures (an unusable key) are configuration errors, so they throw. RFC 9635 §7.3.1:
+ * Runs a signing effect. Its failures (an unusable key) are this app's configuration errors, not the authorisation
+ * server's answer: they throw a `500` `HTTPException` (never a {@link GnapAuthError}, which callers read as "the server
+ * refused" or "no session"), without the key's details. RFC 9635 §7.3.1:
  * `tag="gnap"`, `created`, a fresh `nonce` per request, and the digest algorithm of {@link Wire.digest}.
  */
 const sign = async (request: Request, wire: Wire): Promise<Request> => {
@@ -127,7 +141,7 @@ const sign = async (request: Request, wire: Wire): Promise<Request> => {
     Effect.result(signRequest(request, wire.key, { created: wire.clock(), tag: "gnap", nonce, digest: wire.digest })),
   );
 
-  if (Result.isFailure(signed)) throw new GnapAuthError(500, signed.failure.message);
+  if (Result.isFailure(signed)) throw new HTTPException(500, { message: "The GNAP request could not be signed" });
 
   return signed.success;
 };
@@ -152,21 +166,33 @@ const send = async (
   let response: Response | null;
 
   try {
-    response = await bufferResponse(
-      await wire.fetch(signed, { redirect: "manual", signal: AbortSignal.timeout(wire.timeoutMs) }),
-      MAX_RESPONSE_BYTES,
-    );
+    const answer = await wire.fetch(signed, { redirect: "manual", signal: AbortSignal.timeout(wire.timeoutMs) });
+
+    // A browser-style `fetch` answers `redirect: "manual"` with an opaque redirect (status 0), which cannot be buffered.
+    if (answer.type === "opaqueredirect" || answer.status === 0) {
+      await answer.body?.cancel().catch(() => undefined);
+      throw new GnapAuthError(502, `${method} ${url} redirected`, undefined, true);
+    }
+
+    response = await bufferResponse(answer, MAX_RESPONSE_BYTES);
   } catch (error) {
+    if (error instanceof GnapAuthError) throw error;
+
     throw error instanceof Error && error.name === "TimeoutError"
-      ? new GnapAuthError(504, `${method} ${url} timed out after ${wire.timeoutMs} ms`)
-      : new GnapAuthError(503, `${method} ${url} could not reach the authorisation server`);
+      ? new GnapAuthError(504, `${method} ${url} timed out after ${wire.timeoutMs} ms`, undefined, true)
+      : new GnapAuthError(503, `${method} ${url} could not reach the authorisation server`, undefined, true);
   }
 
   if (response === null)
-    throw new GnapAuthError(502, `${method} ${url} answered with more than ${MAX_RESPONSE_BYTES} bytes`);
+    throw new GnapAuthError(
+      502,
+      `${method} ${url} answered with more than ${MAX_RESPONSE_BYTES} bytes`,
+      undefined,
+      true,
+    );
 
-  if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
-    throw new GnapAuthError(502, `${method} ${url} redirected`);
+  if (response.status >= 300 && response.status < 400) {
+    throw new GnapAuthError(502, `${method} ${url} redirected`, undefined, true);
   }
 
   if (response.ok) return response;
@@ -176,16 +202,24 @@ const send = async (
   const code = error === undefined || isString(error) ? error : error.code;
   const description = error === undefined || isString(error) ? parsed.error_description : error.description;
 
-  throw new GnapAuthError(response.status, description ?? code ?? `${method} ${url} answered ${response.status}`, code);
+  throw new GnapAuthError(
+    response.status,
+    description ?? code ?? `${method} ${url} answered ${response.status}`,
+    code,
+    true,
+  );
 };
 
-/** An http(s) URL with no userinfo. Cross-origin is the authorisation server's to name (RFC 9635). */
+/**
+ * An HTTPS URL (http only for localhost) with no userinfo: the signed request that follows carries the credential in
+ * `Authorization`, which must not travel in the clear. Cross-origin is the authorisation server's to name (RFC 9635).
+ */
 const credentialUrl = (uri: string, label: string): string => {
   if (!URL.canParse(uri)) throw new GnapAuthError(502, `${label} is not a URL`);
   const url = new URL(uri);
 
-  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username !== "" || url.password !== "") {
-    throw new GnapAuthError(502, `${label} must be an http(s) URL without credentials`);
+  if (!isSecureUri(uri) || url.username !== "" || url.password !== "") {
+    throw new GnapAuthError(502, `${label} must be an HTTPS URL (http only for localhost) without credentials`);
   }
 
   return url.toString();

@@ -18,7 +18,7 @@ const configuredOrigin = (c: Context, config: Resolved): string => {
   if (!isLoopbackHost(request.hostname)) {
     throw httpError(
       500,
-      "Set externalUrl or an absolute redirectUri; the request host is not the GNAP finish origin",
+      "Set externalUrl; the request host is neither the GNAP finish origin nor the origin of the post-login URL",
     );
   }
 

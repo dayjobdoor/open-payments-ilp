@@ -32,9 +32,9 @@ export interface GnapDecision {
 /** Actions added to the Better Auth client as `authClient.gnap.*`; `interactId` and `nonce` come from the consent URL. */
 export interface GnapClientActions {
   readonly gnap: {
-    /** Grant details for the consent page. Needs a signed-in user. */
+    /** Grant details for the consent page. Needs a signed-in user whom `interaction.authorize` allows (else `403`). */
     readonly getInteraction: (interactId: string, nonce: string) => Promise<GnapClientResult<InteractionDetails>>;
-    /** The user consents. Navigate to `data.redirect` afterwards: the finish step sends the browser back to the client. */
+    /** The user consents (`403` when `interaction.authorize` refuses). Navigate to `data.redirect` afterwards: the finish step sends the browser back to the client. */
     readonly acceptInteraction: (interactId: string, nonce: string) => Promise<GnapClientResult<GnapDecision>>;
     /** The user rejects. Navigate to `data.redirect` afterwards. */
     readonly rejectInteraction: (interactId: string, nonce: string) => Promise<GnapClientResult<GnapDecision>>;

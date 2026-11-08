@@ -10,6 +10,7 @@ import { gnapClient } from "../../src/better-auth/client";
 import { gnapSchema } from "../../src/better-auth/index";
 import { computeInteractionHash } from "../../src/gnap/index";
 import { signRequest } from "../../src/http-signatures/index";
+import { cookiesOf } from "../support/cookies";
 import {
   FINISH_URI,
   WALLET,
@@ -83,7 +84,7 @@ describe("schema", () => {
 const browserCookie = async (h: Awaited<ReturnType<typeof createHarness>>, interactUrl: string): Promise<string> => {
   const response = await h.call(new Request(interactUrl, { redirect: "manual" }));
 
-  return (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+  return cookiesOf(response);
 };
 
 describe("consent by the signed-in user", () => {
@@ -92,7 +93,7 @@ describe("consent by the signed-in user", () => {
     const pending = await startGrant(h);
 
     const consent = await h.call(new Request(pending.interactUrl, { redirect: "manual" }));
-    const cookie = (consent.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+    const cookie = cookiesOf(consent);
     const consentUrl = new URL(consent.headers.get("location") ?? "");
 
     expect(consentUrl.searchParams.get("interactId")).toBe(pending.interactId);
@@ -109,7 +110,7 @@ describe("consent by the signed-in user", () => {
       expiresAt: expect.any(String),
     });
 
-    const accepted = await h.asUser(consentPath(pending, "/accept"), { method: "POST" });
+    const accepted = await h.asUser(consentPath(pending, "/accept"), { method: "POST" }, cookie);
     const { redirect } = await jsonBody<{ redirect: string }>(accepted);
 
     // The consent API answers where the browser goes next: `/finish`, which is what approves the grant.
@@ -150,11 +151,33 @@ describe("consent by the signed-in user", () => {
     expect(granted.status).toBe(200);
   });
 
+  it("refuses a signed-in user who decides in another browser than the one that opened the interaction", async () => {
+    const h = await createHarness();
+    const pending = await startGrant(h);
+    // The attacker's browser is the one the client sent to `interact.redirect`: it holds the binding cookie.
+    const attacker = await browserCookie(h, pending.interactUrl);
+
+    // The victim is signed in and opens the consent URL elsewhere: only their session cookie, no binding.
+    const victim = await h.asUser(consentPath(pending, "/accept"), { method: "POST" });
+
+    expect(victim.status).toBe(403);
+
+    const finish = new URL(pending.interactUrl);
+
+    finish.search = "";
+    finish.pathname = `${finish.pathname}/finish`;
+
+    const collected = await h.call(new Request(finish, { redirect: "manual", headers: { cookie: attacker } }));
+
+    expect(collected.headers.get("location") ?? "").not.toContain("interact_ref");
+    expect(collected.status).not.toBe(200);
+  });
+
   it("rejects: the finish step redirects the client with grant_rejected", async () => {
     const h = await createHarness();
     const pending = await startGrant(h);
     const cookie = await browserCookie(h, pending.interactUrl);
-    const rejected = await h.asUser(consentPath(pending, "/reject"), { method: "POST" });
+    const rejected = await h.asUser(consentPath(pending, "/reject"), { method: "POST" }, cookie);
     const { redirect } = await jsonBody<{ redirect: string }>(rejected);
     const finished = await h.call(new Request(redirect, { redirect: "manual", headers: { cookie } }));
 
@@ -172,7 +195,7 @@ describe("consent by the signed-in user", () => {
     const pending = await jsonBody<{ interact: { redirect: string } }>(response);
     const [interactId = "", nonce = ""] = new URL(pending.interact.redirect).pathname.split("/").slice(-2);
     const cookie = await browserCookie(h, pending.interact.redirect);
-    const accepted = await h.asUser(`/gnap/interaction/${interactId}/${nonce}/accept`, { method: "POST" });
+    const accepted = await h.asUser(`/gnap/interaction/${interactId}/${nonce}/accept`, { method: "POST" }, cookie);
     const { redirect } = await jsonBody<{ redirect: string }>(accepted);
 
     expect((await h.call(new Request(redirect, { redirect: "manual", headers: { cookie } }))).status).toBe(202);
@@ -314,6 +337,95 @@ describe("consent by the signed-in user", () => {
     expect(await forbidden.json()).toMatchObject({ code: "request_denied" });
   });
 
+  it("asks `interaction.authorize` before showing the interaction: a user it refuses reads nothing (403)", async () => {
+    const asked: Array<{ userId: string; client: string }> = [];
+
+    const h = await createHarness({
+      interaction: {
+        consentUrl: "https://app.test/consent",
+        authorize: ({ userId, details }) => {
+          asked.push({ userId, client: details.client });
+
+          return Effect.succeed(false);
+        },
+      },
+    });
+
+    const pending = await startGrant(h);
+    const forbidden = await h.asUser(consentPath(pending));
+    const text = await forbidden.text();
+
+    expect(forbidden.status).toBe(403);
+    expect(JSON.parse(text)).toMatchObject({ code: "request_denied" });
+    expect(text).not.toContain(WALLET);
+    expect(asked).toEqual([{ userId: await h.userId(), client: WALLET }]);
+  });
+
+  it("shows the interaction to the user `interaction.authorize` allows, with the details it was asked about", async () => {
+    const seen: Array<string> = [];
+
+    const h = await createHarness({
+      interaction: {
+        consentUrl: "https://app.test/consent",
+        authorize: ({ details }) => {
+          seen.push(details.client);
+
+          return Effect.succeed(true);
+        },
+      },
+    });
+
+    const pending = await startGrant(h);
+    const shown = await h.asUser(consentPath(pending));
+
+    expect(shown.status).toBe(200);
+    expect(await shown.json()).toMatchObject({ client: WALLET });
+    expect(seen).toEqual([WALLET]);
+  });
+
+  it("refuses to show the interaction while no authorize hook is configured, like the decision", async () => {
+    const h = await createHarness({ withoutConsentHook: true });
+    const pending = await startGrant(h);
+    const forbidden = await h.asUser(consentPath(pending));
+
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.json()).toMatchObject({ code: "request_denied" });
+  });
+
+  it("answers an unknown interaction 404 without asking the hook", async () => {
+    let asked = 0;
+
+    const h = await createHarness({
+      interaction: {
+        consentUrl: "https://app.test/consent",
+        authorize: () => {
+          asked += 1;
+
+          return Effect.succeed(true);
+        },
+      },
+    });
+
+    const unknown = await h.asUser("/gnap/interaction/nope/nope");
+
+    expect(unknown.status).toBe(404);
+    expect(asked).toBe(0);
+  });
+
+  it("answers a decision on a grant that was cancelled 403 user_denied, not the 401 of an anonymous user", async () => {
+    const h = await createHarness();
+    const pending = await startGrant(h);
+
+    const cancelled = await h.signedCall(pending.continueUri, withToken({ method: "DELETE" }, pending.continueToken));
+
+    expect(cancelled.status).toBe(204);
+
+    const denied = await h.asUser(consentPath(pending, "/accept"), { method: "POST" });
+
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toMatchObject({ code: "user_denied" });
+  });
+
   it("is also decidable through the identity provider back channel", async () => {
     const h = await createHarness();
     const pending = await startGrant(h);
@@ -388,6 +500,68 @@ describe("rate limits", () => {
 
     expect(statuses.slice(0, 20).every((status) => status !== 429)).toBe(true);
     expect(statuses.slice(20)).toEqual([429, 429]);
+  });
+});
+
+describe("the rate limit option", () => {
+  const limited = { auth: { rateLimit: { enabled: true, storage: "memory" } } } as const;
+
+  const statuses = async (h: Harness, path: string, count: number, address: string): Promise<Array<number>> => {
+    const result: Array<number> = [];
+
+    for (let index = 0; index < count; index += 1) {
+      result.push(
+        (
+          await h.auth.handler(
+            new Request(`${h.baseURL}/api/auth${path}`, {
+              ...json("POST", {}),
+              headers: { "x-forwarded-for": address, "content-type": "application/json" },
+            }),
+          )
+        ).status,
+      );
+    }
+
+    return result;
+  };
+
+  it("sets the grant request limit", async () => {
+    const h = await createHarness({ ...limited, rateLimit: { grantRequest: { window: 60, max: 3 } } });
+    const result = await statuses(h, "/gnap", 5, "203.0.113.20");
+
+    expect(result.slice(0, 3).every((status) => status !== 429)).toBe(true);
+    expect(result.slice(3)).toEqual([429, 429]);
+  });
+
+  it("sets the continuation limit, and keeps the default of the grant request", async () => {
+    const h = await createHarness({ ...limited, rateLimit: { continue: { window: 60, max: 2 } } });
+
+    const continued = await statuses(h, "/gnap/continue/x", 3, "203.0.113.21");
+
+    expect(continued.slice(0, 2).every((status) => status !== 429)).toBe(true);
+    expect(continued[2]).toBe(429);
+
+    const grants = await statuses(h, "/gnap", 21, "203.0.113.22");
+
+    expect(grants.slice(0, 20).every((status) => status !== 429)).toBe(true);
+    expect(grants[20]).toBe(429);
+  });
+
+  it("is off with `false`: no rule of the plugin, so no 429 from it", async () => {
+    const h = await createHarness({ ...limited, rateLimit: false });
+
+    expect(h.auth.options.plugins?.[0]?.rateLimit).toEqual([]);
+    expect((await statuses(h, "/gnap", 25, "203.0.113.23")).every((status) => status !== 429)).toBe(true);
+    expect((await statuses(h, "/gnap/continue/x", 35, "203.0.113.23")).every((status) => status !== 429)).toBe(true);
+  });
+
+  it("keeps the defaults when the option is missing", async () => {
+    const h = await createHarness();
+
+    expect(h.auth.options.plugins?.[0]?.rateLimit).toMatchObject([
+      { window: 60, max: 20 },
+      { window: 60, max: 30 },
+    ]);
   });
 });
 

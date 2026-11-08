@@ -13,7 +13,7 @@ import {
   type GnapAuthConfig,
 } from "../../src/hono/index";
 import { KEY_ID, createClientKey } from "../gnap-server/support";
-import { APP, SECRET, createBrowser, exportPrivateKey, pump } from "./support";
+import { APP, PAGE, SECRET, createBrowser, exportPrivateKey, pump } from "./support";
 
 const AS = "https://as.example";
 
@@ -636,7 +636,7 @@ describe("RFC 9635 authorisation server", () => {
     app.use("*", initGnapAuthMiddleware({ access, fetch: h.as.fetch }));
     app.use("*", gnapAuthMiddleware());
 
-    const response = await app.request(`${APP}/page`);
+    const response = await app.request(`${APP}/page`, { headers: PAGE });
 
     expect(response.status).toBe(302);
     expect(h.as.calls[0]?.body).toMatchObject({
@@ -689,7 +689,7 @@ describe("front-channel URIs (RFC 9635 §2.5.2, §2.5.2.1, §4.1.1)", () => {
     );
 
     app.use("*", gnapAuthMiddleware());
-    const response = await pump(Promise.resolve(app.request(`${APP}/`)));
+    const response = await pump(Promise.resolve(app.request(`${APP}/`, { headers: PAGE })));
 
     expect(response.status).toBe(502);
     expect(response.headers.get("location")).toBeNull();
@@ -1023,7 +1023,9 @@ describe("a grant the server does not finish with a callback (RFC 9635 §5.2, po
 
     // The first grant's pointer, sent after its 30 seconds: a new grant, the server is not asked about the old one.
     seconds(30);
-    await pump(Promise.resolve(h.app.request(`${APP}/`, { headers: { cookie: `gnap-auth-pending=${cookie}` } })));
+    await pump(
+      Promise.resolve(h.app.request(`${APP}/`, { headers: { ...PAGE, cookie: `gnap-auth-pending=${cookie}` } })),
+    );
 
     expect(h.as.calls.map((call) => call.path)).toEqual(["/gnap", "/gnap", "/gnap"]);
   });

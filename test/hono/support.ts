@@ -3,6 +3,7 @@ import type { Hono } from "hono";
 import { vi } from "vite-plus/test";
 import { createGnapServer, memoryGnapStore } from "../../src/gnap/server/index";
 import { encodeBase64 } from "../../src/internal/bytes";
+import { cookiesOf } from "../support/cookies";
 import {
   BASE_URL,
   CONSENT_URL,
@@ -15,6 +16,9 @@ import {
 } from "../gnap-server/support";
 
 export const APP = "https://app.test";
+
+/** What a browser sends when it asks for a page: the only kind of request that starts a login. */
+export const PAGE = { accept: "text/html" };
 
 export const SECRET = "a-session-secret-of-at-least-32-characters";
 
@@ -100,6 +104,11 @@ export const createBrowser = (
 
       if (secure && url.protocol !== "https:") continue;
 
+      // RFC 6265bis §5.4: a prefixed name promises attributes, and a browser drops the cookie that does not keep it.
+      if (name.startsWith("__Secure-") && !secure) continue;
+
+      if (name.startsWith("__Host-") && (!secure || domainAttribute !== undefined || path !== "/")) continue;
+
       const cookie: StoredCookie = {
         name,
         value: value.join("="),
@@ -140,13 +149,16 @@ export const createBrowser = (
     },
     /** The cookie jar's stored cookies, `Path` and all. */
     stored: (): ReadonlyArray<StoredCookie> => live(),
-    /** `GET` without following redirects. */
+    /** `GET` without following redirects, as a browser does: `Accept: text/html` unless `headers` say otherwise. */
     get: async (url: string, headers: Record<string, string> = {}): Promise<Response> => {
       const target = new URL(url);
       const cookie = header(target);
       const requestHeaders = new Headers(headers);
 
       if (cookie !== "") requestHeaders.set("cookie", cookie);
+
+      // A browser asks for a page this way (a script's `fetch()` sends `Sec-Fetch-Mode: cors`; `curl` sends `*/*`).
+      if (!requestHeaders.has("accept")) requestHeaders.set("accept", "text/html,application/xhtml+xml,*/*;q=0.8");
       const response = await app.request(upstream(target), { headers: requestHeaders });
 
       absorb(response, target);
@@ -221,7 +233,8 @@ export const createRafikiHarness = async (clock: ReturnType<typeof createClock> 
   ): Promise<string> => {
     const start = await Effect.runPromise(server.route(new Request(redirect, { redirect: "manual" })));
     const [interactId = "", nonce = ""] = new URL(redirect).pathname.split("/").slice(-2);
-    const cookie = (start.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+    // Every cookie of the start step (session and interaction binding), as a browser sends them back.
+    const cookie = cookiesOf(start);
 
     await Effect.runPromise(
       server.route(
