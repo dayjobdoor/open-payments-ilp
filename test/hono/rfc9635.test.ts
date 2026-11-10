@@ -673,6 +673,33 @@ describe("front-channel URIs (RFC 9635 §2.5.2, §2.5.2.1, §4.1.1)", () => {
     expect((await proxied.app.request("http://localhost:3000/", { headers: page })).status).toBe(302);
   });
 
+  it.each(["http://localhost:3000/", "http://127.0.0.1:3000/", "http://[::1]:3000/"])(
+    "takes %s for the user's own machine and registers its callback there, without a proxy header",
+    async (origin) => {
+      const h = await createApp({}, { externalUrl: undefined });
+      const response = await h.app.request(origin, { headers: { accept: "text/html" } });
+
+      expect(response.status).toBe(302);
+      expect(h.as.calls[0]?.body).toMatchObject({
+        interact: { finish: { uri: `${new URL(origin).origin}/callback` } },
+      });
+    },
+  );
+
+  it.each([
+    ["http://127.0.0.2:3000/", "another loopback address"],
+    ["http://foo.localhost:3000/", "a name below localhost"],
+    ["http://[::ffff:7f00:1]:3000/", "an IPv4-mapped loopback address"],
+    ["http://0.0.0.0:3000/", "the unspecified address"],
+    ["https://app.test/", "a public host"],
+  ])("does not take %s (%s) for the user's own machine: externalUrl is required", async (origin) => {
+    const h = await createApp({}, { externalUrl: undefined });
+    const response = await h.app.request(origin, { headers: { accept: "text/html" } });
+
+    expect(response.status).toBe(500);
+    expect(h.as.calls).toHaveLength(0);
+  });
+
   it("does not send the user to an interaction URI that is not HTTPS", async () => {
     const h = await createApp();
 
@@ -743,6 +770,21 @@ describe("when the authorisation server cannot be used to start a login", () => 
     const response = await h.visit(`${APP}/`);
 
     expect(response.status).toBe(503);
+  });
+
+  it("gives up on an answer whose body never ends, though the fetch ignores the abort signal", async () => {
+    // The headers arrive at once; the body is a stream nobody ever writes to or closes, and no signal is listened to.
+    const stalled: typeof globalThis.fetch = async () =>
+      new Response(new ReadableStream({ start: () => undefined }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+
+    const h = await createApp({}, { fetch: stalled, requestTimeoutMs: 20 });
+    const response = await h.visit(`${APP}/`);
+
+    expect(response.status).toBe(503);
+    expect(response.headers.getSetCookie()).toEqual([]);
   });
 
   it("refuses an answer that is too large to be a GNAP response", async () => {

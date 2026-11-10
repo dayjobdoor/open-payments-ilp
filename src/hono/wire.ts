@@ -8,7 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import { HTTPException } from "hono/http-exception";
-import type { AccessItem, GrantRequestAccessItem } from "../gnap/index";
+import { formatGnapAuthorization, type AccessItem, type GrantRequestAccessItem } from "../gnap/index";
 import { accessItem } from "../open-payments/schemas";
 import type { JWK } from "../open-payments/types";
 import { signRequest, type SigningKey } from "../http-signatures/index";
@@ -158,7 +158,7 @@ const send = async (
 ): Promise<Response> => {
   const headers = new Headers({ accept: "application/json" });
 
-  if (options.token !== undefined) headers.set("authorization", `GNAP ${options.token}`);
+  if (options.token !== undefined) headers.set("authorization", formatGnapAuthorization(options.token));
 
   if (options.body !== undefined) headers.set("content-type", "application/json");
   const body = options.body === undefined ? null : JSON.stringify(options.body);
@@ -166,7 +166,10 @@ const send = async (
   let response: Response | null;
 
   try {
-    const answer = await wire.fetch(signed, { redirect: "manual", signal: AbortSignal.timeout(wire.timeoutMs) });
+    // One signal for the whole exchange: a `fetch` that ignores it (a wrapper, a stub) must not hold the answer's body
+    // open past the timeout either.
+    const signal = AbortSignal.timeout(wire.timeoutMs);
+    const answer = await wire.fetch(signed, { redirect: "manual", signal });
 
     // A browser-style `fetch` answers `redirect: "manual"` with an opaque redirect (status 0), which cannot be buffered.
     if (answer.type === "opaqueredirect" || answer.status === 0) {
@@ -174,7 +177,7 @@ const send = async (
       throw new GnapAuthError(502, `${method} ${url} redirected`, undefined, true);
     }
 
-    response = await bufferResponse(answer, MAX_RESPONSE_BYTES);
+    response = await bufferResponse(answer, MAX_RESPONSE_BYTES, signal);
   } catch (error) {
     if (error instanceof GnapAuthError) throw error;
 

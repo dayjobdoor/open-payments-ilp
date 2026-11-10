@@ -135,8 +135,32 @@ const expiringAfter =
       : Response.json({ ...body, interact: { ...body.interact, expires_in: seconds } }, { status: response.status });
   };
 
+/**
+ * Replaces `AbortSignal.timeout` so a test fires the request deadline itself instead of waiting for a real timer.
+ * `expire(signal)` aborts the signal that `AbortSignal.timeout` handed out, as the timer would.
+ */
+const controlledTimeouts = () => {
+  const controllers = new Map<AbortSignal, AbortController>();
+
+  vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+    const controller = new AbortController();
+    controllers.set(controller.signal, controller);
+
+    return controller.signal;
+  });
+
+  return (signal: AbortSignal | null | undefined): void => {
+    const controller = signal === null || signal === undefined ? undefined : controllers.get(signal);
+
+    if (controller === undefined) throw new Error("the request was not given a deadline from AbortSignal.timeout");
+
+    controller.abort(new DOMException("The operation timed out.", "TimeoutError"));
+  };
+};
+
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
 });
 
 describe("a signed session cookie (encryptCookies: false)", () => {
@@ -306,6 +330,16 @@ describe("cookie protection", () => {
       expect(deletes(response, "gnap-auth")).toBe(true);
     }
   });
+
+  it.each([["false"], [0], [null], ["no"]])(
+    "keeps the cookies encrypted unless encryptCookies is exactly false: %j does not turn it off",
+    async (malformed) => {
+      // A JavaScript caller (or a value read from somewhere) can pass what the type forbids.
+      const { cookie } = await loginStages({ encryptCookies: malformed as unknown as boolean });
+
+      expect(cookie).toMatch(/^1\.[\w-]+$/);
+    },
+  );
 });
 
 /** The session cookie of a deployment (`own`), of another one (`foreign`), and one signed the old way (`legacy`). */
@@ -623,7 +657,7 @@ describe("rotating the access token", () => {
   }
 
   const failing =
-    (state: Flaky) =>
+    (state: Flaky, expire?: (signal: AbortSignal | null | undefined) => void) =>
     (inner: typeof globalThis.fetch): typeof globalThis.fetch =>
     async (input, init) => {
       const request = new Request(input);
@@ -641,6 +675,7 @@ describe("rotating the access token", () => {
       // Settles only when the middleware aborts the request.
       return new Promise<Response>((_resolve, reject) => {
         init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        expire?.(init?.signal);
       });
     };
 
@@ -767,7 +802,7 @@ describe("rotating the access token", () => {
 
     it("is no lost race when the server is down: the page goes to log in again, with no retry mark", async () => {
       const state: Flaky = { failure: "unavailable" };
-      const h = await createApp({ requestTimeoutMs: 20 }, { wrapFetch: failing(state) });
+      const h = await createApp({}, { wrapFetch: failing(state) });
 
       await login(h);
       h.clock.advance(61);
@@ -786,7 +821,15 @@ describe("rotating the access token", () => {
     async (failure) => {
       const state: Flaky = { failure: undefined };
       const hooked: Array<string> = [];
-      const h = await createApp({ requestTimeoutMs: 20 }, { wrapFetch: failing(state), before: withHook(hooked) });
+      // The silent server never answers; the test fires the request deadline instead of waiting for a timer.
+      const expire = failure === "silent" ? controlledTimeouts() : undefined;
+      const h = await createApp(
+        {},
+        {
+          wrapFetch: failing(state, expire),
+          before: withHook(hooked),
+        },
+      );
 
       await login(h);
       h.clock.advance(61);
@@ -1537,6 +1580,56 @@ describe("the authorisation server named at run time or by its answers (trust)",
 
     expect(back.status).toBe(502);
     expect(await back.text()).toBe("GNAP continue failed");
+  });
+
+  // The state cookie is used up when the callback arrives, so "try again later" (503) is not on offer: the user starts
+  // a login anew. Only the server's own 401 and a timeout keep their status; everything else is a bad gateway.
+  it.each([
+    ["answers 401", () => Response.json({ error: { code: "invalid_request" } }, { status: 401 }), 401],
+    ["answers 403", () => Response.json({ error: { code: "forbidden" } }, { status: 403 }), 502],
+    ["answers 404", () => Response.json({ error: { code: "unknown_request" } }, { status: 404 }), 502],
+    ["is overloaded (429)", () => Response.json({ error: { code: "too_many_requests" } }, { status: 429 }), 502],
+    ["fails (500)", () => new Response("boom", { status: 500 }), 502],
+    ["is down (503)", () => new Response("down", { status: 503 }), 502],
+    ["times out behind a gateway (504)", () => new Response("slow", { status: 504 }), 504],
+    [
+      "cannot be reached",
+      () => {
+        throw new TypeError("network down");
+      },
+      502,
+    ],
+    [
+      "does not answer in time",
+      (init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        }),
+      504,
+    ],
+  ] as const)("answers the callback of a login whose continue call %s", async (name, failure, status) => {
+    const expire = name === "does not answer in time" ? controlledTimeouts() : undefined;
+    const h = await createApp(
+      {},
+      {
+        wrapFetch: (inner) => async (input, init) => {
+          const request = new Request(input);
+
+          if (!new URL(request.url).pathname.startsWith("/gnap/continue/")) return inner(request, init);
+
+          const answer = failure(init);
+          expire?.(init?.signal);
+
+          return answer;
+        },
+      },
+    );
+
+    const first = await h.browser.get(`${APP}/`);
+    const back = await h.browser.get(await h.consent(first.headers.get("location") ?? ""));
+
+    expect(back.status, name).toBe(status);
+    expect(cookieLine(back, "gnap-auth"), name).toBeUndefined();
   });
 
   it("reports a redirect (an opaque one in a browser-like fetch) as a refusal, not as an unreachable server", async () => {

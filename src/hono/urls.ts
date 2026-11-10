@@ -40,7 +40,7 @@ export const publicRedirectUri = (c: Context, config: Resolved): string =>
     : new URL(config.redirectUri).toString();
 
 /** The `Path` of the state cookie: that of the public callback URL, because that is where the browser sends it. */
-export const statePath = (_c: Context, config: Resolved): string => {
+export const statePath = (config: Resolved): string => {
   const uri = config.redirectUri.startsWith("/")
     ? `${(config.externalUrl ?? "https://localhost").replace(/\/$/, "")}${config.redirectUri}`
     : config.redirectUri;
@@ -57,7 +57,7 @@ export const isCallbackRequest = (c: Context, config: Resolved): boolean => {
   const { pathname } = new URL(c.req.url);
 
   return (
-    pathname === statePath(c, config) ||
+    pathname === statePath(config) ||
     // Without `externalUrl` the public and the served path are the same, so the first test already covered it.
     (config.externalUrl !== undefined &&
       config.redirectUri.startsWith("/") &&

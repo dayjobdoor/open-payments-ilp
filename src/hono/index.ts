@@ -280,7 +280,7 @@ const startGrant = async (c: Context, config: Resolved): Promise<Response | unde
     nb: now + 1 + next.wait,
   };
 
-  await savePending(c, config, pending, { redirect: interact.redirect, fingerprint }, statePath(c, config));
+  await savePending(c, config, pending, { redirect: interact.redirect, fingerprint }, statePath(config));
 
   return c.redirect(interact.redirect);
 };
@@ -309,7 +309,7 @@ export const processGnapCallback = async (c: Context): Promise<Response> => {
   }
 
   // The state is single-use from here on, whatever the callback turns out to be.
-  dropStateCookie(c, config, statePath(c, config));
+  dropStateCookie(c, config, statePath(config));
   dropSessionCookie(c, config, pendingCookieName(config));
 
   const result = c.req.query("result");

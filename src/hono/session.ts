@@ -7,7 +7,7 @@ import type { Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { CookieOptions } from "hono/utils/cookie";
 import type { AccessItem, GrantRequestAccessItem } from "../gnap/index";
-import { encodeBase64Url, sha256 } from "../internal/bytes";
+import { encodeBase64Url, sha256, utf8Encode } from "../internal/bytes";
 import { accessItem } from "../open-payments/schemas";
 import { getConfig, httpError, isSecureUri, nowSeconds, resolveWire, type Resolved } from "./config";
 import { openCookie, sealCookie } from "./seal";
@@ -131,7 +131,7 @@ export const pendingCookieName = (config: Resolved): string => `${config.cookieN
 
 // A sealed value is cookie-safe as it is (base64url and dots): what browsers measure is the name and the value.
 const fitsInCookie = (name: string, value: string): boolean =>
-  new TextEncoder().encode(`${name}=${value}`).length <= MAX_COOKIE_BYTES;
+  utf8Encode(`${name}=${value}`).length <= MAX_COOKIE_BYTES;
 
 /** `url` without its query string and fragment. */
 const withoutQuery = (url: string): string => {
@@ -224,8 +224,7 @@ export const grantFingerprint = async (
   endpoint: string,
   access: ReadonlyArray<GrantRequestAccessItem>,
   redirectUri: string,
-): Promise<string> =>
-  encodeBase64Url(await sha256(new TextEncoder().encode(JSON.stringify([endpoint, access, redirectUri]))));
+): Promise<string> => encodeBase64Url(await sha256(utf8Encode(JSON.stringify([endpoint, access, redirectUri]))));
 
 /** Writes the pointer cookie, scoped like the session, until `pointer.stexp`; `false` when it does not fit. */
 const setPointer = async (c: Context, config: Resolved, pointer: PendingPointer): Promise<boolean> => {
@@ -335,7 +334,7 @@ const refusesRotation = (error: GnapAuthError): boolean =>
 const rotations = new Map<string, Promise<IssuedToken>>();
 
 const rotateOnce = async (wire: Wire, manage: Credential): Promise<IssuedToken> => {
-  const key = encodeBase64Url(await sha256(new TextEncoder().encode(`${manage.uri}\n${manage.token}`)));
+  const key = encodeBase64Url(await sha256(utf8Encode(`${manage.uri}\n${manage.token}`)));
   const running = rotations.get(key);
 
   if (running !== undefined) return running;
