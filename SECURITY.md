@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Only the latest `alpha` release (see `npm view open-payments-ilp dist-tags`). Fixes ship as a new prerelease.
+Only the latest `alpha` release (see `npm view open-payments-ilp dist-tags`). Fixes ship as a new prerelease. Install `open-payments-ilp@alpha`: until the first stable version, the `latest` tag stays on `0.1.0-alpha.0`, which is not supported.
 
 ## Reporting a vulnerability
 

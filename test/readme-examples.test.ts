@@ -3,7 +3,7 @@
  * trailing commas aside) with its imports mapped from `open-payments-ilp/<name>` to `src/<name>`, so the
  * README cannot drift from code that type-checks and runs.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { createAuthClient } from "better-auth/client";
@@ -32,11 +32,30 @@ import {
   revokeGnapSession,
   type GnapAuthRefreshErrorHook,
 } from "../src/hono/index";
-import { generateEd25519KeyPair, signRequest, verifyRequest } from "../src/http-signatures/index";
+import {
+  generateEd25519KeyPair,
+  SIGNATURE_REPLAY_WINDOW_SECONDS,
+  signRequest,
+  verifyRequest,
+} from "../src/http-signatures/index";
 import { deserializeIldcpResponse, serializeIldcpRequest, serveIldcp } from "../src/ildcp/index";
-import { deserializePrepare, deserializeReply, postPrepare, serializePrepare, serializeReply } from "../src/ilp/index";
+import {
+  DEFAULT_ILP_HTTP_MAX_REPLY_BYTES,
+  DEFAULT_ILP_HTTP_TIMEOUT_MS,
+  deserializePrepare,
+  deserializeReply,
+  MAX_ILP_DATA_LENGTH,
+  postPrepare,
+  serializePrepare,
+  serializeReply,
+} from "../src/ilp/index";
 import { addAmounts, createUnauthenticatedClient, parseAmountValue } from "../src/open-payments/index";
-import { buildStreamPrepare, createStreamReply, generateStreamCredentials } from "../src/stream/index";
+import {
+  buildStreamPrepare,
+  createStreamReply,
+  generateStreamCredentials,
+  STREAM_ENCRYPTION_OVERHEAD,
+} from "../src/stream/index";
 import { signWebhook, verifyWebhookSignature } from "../src/webhooks/index";
 import { deserializeIlpPrepare, serializeIlpPrepare } from "../src/plain/ilp";
 import { createAuthenticatedClient } from "../src/plain/open-payments";
@@ -379,6 +398,7 @@ describe("README examples", () => {
 describe("README is in sync with this file", () => {
   // Whitespace and a trailing comma before a closing bracket are formatting; everything else must match, token for
   // token (`a b` is not `ab`).
+  // A backtick outside a template literal unbalances the pairing below: write it as `\x60` in a regex.
   const tokens = (text: string): string[] => {
     const all = text.match(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|\w+|[^\s\w]/g) ?? [];
 
@@ -395,7 +415,9 @@ describe("README is in sync with this file", () => {
 
   const blocks = [...readme.matchAll(/```ts\n([\s\S]*?)```/g)].map((match) => match[1]!);
 
-  const manifest: { exports: object } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  const manifest: { exports: object; peerDependencies: Record<string, string> } = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  );
 
   const exported = Object.keys(manifest.exports);
 
@@ -420,6 +442,114 @@ describe("README is in sync with this file", () => {
     );
   });
 
+  const flatReadme = readme.replace(/\s+/g, " ");
+
+  // The `### open-payments-ilp/<subpath>` sections of the README, by subpath.
+  const sections = new Map<string, string>();
+
+  for (const part of readme.split(/\n(?=#{2,3} )/)) {
+    const subpath = /^### \x60open-payments-ilp\/([^\x60]+)\x60/.exec(part)?.[1];
+
+    if (subpath !== undefined) sections.set(subpath, part);
+  }
+
+  // The contract kit has no heading of its own: the `/gnap/server` section describes it.
+  const sectionOf = (subpath: string): string =>
+    sections.get(subpath === "gnap/server/testing" ? "gnap/server" : subpath) ?? "";
+
+  const entries = {
+    ilp: () => import("../src/ilp/index"),
+    ildcp: () => import("../src/ildcp/index"),
+    stream: () => import("../src/stream/index"),
+    "http-signatures": () => import("../src/http-signatures/index"),
+    "open-payments": () => import("../src/open-payments/index"),
+    gnap: () => import("../src/gnap/index"),
+    "gnap/server": () => import("../src/gnap/server/index"),
+    "gnap/server/testing": () => import("../src/gnap/server/testing/index"),
+    webhooks: () => import("../src/webhooks/index"),
+    "better-auth": () => import("../src/better-auth/index"),
+    "better-auth/client": () => import("../src/better-auth/client"),
+    hono: () => import("../src/hono/index"),
+  };
+
+  it("documents every exported subpath", () => {
+    const plainRows = readme
+      .split("\n")
+      .filter((line) => line.startsWith("| `/plain/"))
+      .join("\n");
+
+    for (const key of exported.filter((subpath) => subpath !== "./package.json")) {
+      const name = key.slice(2);
+
+      if (name.startsWith("plain/")) {
+        expect(plainRows, `/${name} in the table of plain entries`).toContain(`\`/${name}\``);
+      } else {
+        expect(sectionOf(name), `a section for open-payments-ilp/${name}`).toContain(`open-payments-ilp/${name}`);
+      }
+    }
+  });
+
+  it("covers every subpath of the package with an entry for the next test", () => {
+    expect(Object.keys(entries).sort()).toEqual(
+      exported
+        .map((subpath) => subpath.slice(2))
+        .filter((name) => name !== "package.json" && !name.startsWith("plain/"))
+        .sort(),
+    );
+  });
+
+  it.each(Object.entries(entries))(
+    "names every runtime export of open-payments-ilp/%s in its section",
+    async (name, load) => {
+      const section = sectionOf(name);
+      const unnamed = Object.keys(await load()).filter(
+        (exportName) => !new RegExp(`\\b${exportName}\\b`).test(section),
+      );
+
+      expect(unnamed).toEqual([]);
+    },
+  );
+
+  it("links to headings and files that exist", () => {
+    // GitHub's anchor of a heading: lower case, punctuation dropped, spaces to hyphens.
+    const prose = readme.replace(/\x60{3}[\s\S]*?\x60{3}/g, "");
+    const anchors = new Set(
+      [...prose.matchAll(/^#{1,6} (.+)$/gm)].map((match) =>
+        match[1]!
+          .toLowerCase()
+          .replace(/[^\w\- ]/g, "")
+          .replaceAll(" ", "-"),
+      ),
+    );
+
+    for (const [, anchor] of prose.matchAll(/\]\(#([^)]+)\)/g)) expect(anchors.has(anchor!), `#${anchor}`).toBe(true);
+
+    for (const [, file] of prose.matchAll(/\]\((?!https?:|#)([^)]+)\)/g)) {
+      expect(existsSync(new URL(`../${file}`, import.meta.url)), file).toBe(true);
+    }
+  });
+
+  it("states the peer dependency ranges of package.json", () => {
+    expect(Object.keys(manifest.peerDependencies).length).toBeGreaterThan(0);
+
+    for (const [name, range] of Object.entries(manifest.peerDependencies)) {
+      expect(flatReadme, name).toContain(`\`${name}\` (\`${range}\`)`);
+    }
+  });
+
+  it("states the exported defaults and limits as the code has them", () => {
+    expect(SIGNATURE_REPLAY_WINDOW_SECONDS).toBe(331);
+    expect(flatReadme).toContain("`SIGNATURE_REPLAY_WINDOW_SECONDS` (331 s");
+    expect(DEFAULT_ILP_HTTP_TIMEOUT_MS).toBe(30_000);
+    expect(flatReadme).toContain("`timeoutMs` defaults to 30 s");
+    expect(DEFAULT_ILP_HTTP_MAX_REPLY_BYTES).toBe(64 * 1024);
+    expect(flatReadme).toContain("`maxReplyBytes`, default 64 KiB");
+    expect(MAX_ILP_DATA_LENGTH).toBe(32_767);
+    expect(flatReadme).toContain("`MAX_ILP_DATA_LENGTH`, 32767");
+    expect(STREAM_ENCRYPTION_OVERHEAD).toBe(28);
+    expect(flatReadme).toContain("`STREAM_ENCRYPTION_OVERHEAD` of 28 bytes");
+  });
+
   it("shows the GnapStore interface that the server declares", () => {
     type Effect<A> = Effect.Effect<A>;
 
@@ -428,7 +558,7 @@ describe("README is in sync with this file", () => {
       findGrant(by: "id" | "continueId" | "interactId", value: string): Effect<GrantRecord | null>;
       /** Compare-and-set: applies `patch`, increments `version`, and returns true only if `version` still matched. */
       updateGrant(id: string, version: number, patch: GrantPatch): Effect<boolean>;
-      createToken(token: TokenRecord): Effect<void>; // `valueHash`, `managementId` unique
+      createToken(token: TokenRecord): Effect<void>; // `id`, `valueHash`, `managementId` unique
       /** A token (revoked or expired too) with its grant: one lookup, as the server needs both. */
       findTokenWithGrant(
         by: "valueHash" | "managementId",
@@ -438,6 +568,10 @@ describe("README is in sync with this file", () => {
       revokeTokens(by: "id" | "grantId", value: string, at: number): Effect<number>;
       /** Replay guard for signature nonces: claims `key` until `expiresAt` unless an unexpired claim exists. Atomic. */
       claimNonce(key: string, expiresAt: number, now: number): Effect<boolean>;
+      /** Set to `true` by a store that persists every optional field of the two records (see **Extended records**). */
+      extendedRecords?: true;
+      /** Set to `true` by a store that persists `GrantRecord.interactBinding` (see **Interaction binding**). */
+      interactionBinding?: true;
     }
 
     // Assignable both ways: a method added, dropped or retyped on either side no longer compiles.

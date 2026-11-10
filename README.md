@@ -45,13 +45,13 @@ are untested. `engines` is not set because the requirement is a runtime feature,
   with `StreamError | IlpCodecError`, `/http-signatures` with `HttpSignatureError`, `/open-payments` with
   `OpenPaymentsError`, `/gnap` with `GnapClientFieldError` (an unusable `client` field only), `/webhooks` with
   `WebhookError`. `/gnap/server` fails with `GnapRouteError` (the HTTP `status` and GNAP `code` of a failed exchange, no
-  `reason`), `/hono` throws `GnapAuthError` (untagged, `status` and `code`), and `/better-auth` throws Better Auth's
+  `reason`; its default client-key lookup, `fetchClientKeys`, fails with `HttpSignatureError`), `/hono` throws `GnapAuthError` (untagged, `status` and `code`), and `/better-auth` throws Better Auth's
   `APIError` from its consent endpoints (the GNAP protocol routes answer with GNAP error bodies). Protocol strings (GNAP error `code`s, ILP error codes) are wire values and keep the protocol's spelling.
 - **Explicit time.** Anything that reads the current time takes `clock?: () => Date` (default `new Date()`):
   `verifyRequest`, `signWebhook`, `verifyWebhookSignature`, `isValidWebhookSignature`, `fetchIldcp`, the Open Payments clients (the
   `created` of their signatures), `createGnapServer`, the `/better-auth` plugin and `/hono`. Pure codecs and helpers take
   the value itself: `expiresAt`, `serveIldcp({ now })`, `currentAccessIntervalStart(anchor, interval, now)` and
-  `SignOptions.created`.
+  `SignOptions.created` (the last two default to the current time).
 - **Tree-shakeable.** `sideEffects: false`; each subpath is its own entry point.
 
 ## Plain Promises and exceptions: `open-payments-ilp/plain/*`
@@ -79,7 +79,8 @@ your code, shaped after `ilp-packet`, `ilp-protocol-ildcp`, `@interledger/http-s
 
 `/hono` and `/better-auth/client` never used Effect in their API, so they have no plain entry. The pure helpers that never
 returned `Effect` or `Result` (wire types, `/gnap` access helpers) are re-exported unchanged; the `/open-payments` amount
-helpers, which return `Result` in the main entry, return their value or throw in `/plain/open-payments`.
+helpers, which return `Result` in the main entry, return their value or throw in `/plain/open-payments`. `revokeUserGrants` (`/better-auth`)
+has no plain entry: import it from the main entry, it already returns a `Promise`.
 
 - I/O and WebCrypto functions return a `Promise` that rejects with the tagged error (`HttpSignatureError`,
   `OpenPaymentsError`, `IlpHttpError`, ...).
@@ -128,9 +129,13 @@ Effect store that dies: the request is answered `500` and `onError` receives the
 
 ### `open-payments-ilp/ilp`
 
-RFC 27 packets (Prepare, Fulfill, Reject), the OER subset of RFC 30, ILP addresses, fulfillment/condition helpers, and a synchronous ILP-over-HTTP client for the peer-to-peer profile of RFC 35 (the reply is the response body; the
-asynchronous `Request-Id` / `Callback-Url` mode is not implemented). `postPrepare` checks `timeoutMs` (finite, at most 2^31-1
-ms) and `maxReplyBytes`; a bad value is `invalid-option`. A Reject `message` over 8191 bytes cannot be serialized.
+RFC 27 packets (Prepare, Fulfill, Reject: `serializePrepare` / `deserializePrepare`, `serializeFulfill` / `deserializeFulfill`,
+`serializeReject` / `deserializeReject`, `serializeReply` / `deserializeReply` for a Fulfill or a Reject, `deserializePacket` for any packet,
+the guards `isFulfill` and `isReject`, `IlpPacketType`, `IlpErrorCode` and `MAX_ILP_DATA_LENGTH`, 32767; the codecs fail with `IlpCodecError`), the OER subset of RFC 30 (`OerReader`, `OerWriter`, `readOer`,
+`writeOer`), ILP addresses (`isValidIlpAddress`), fulfillment/condition helpers (`conditionFromFulfillment`, and
+`fulfillmentMatchesCondition`, which compares in constant time), and a synchronous ILP-over-HTTP client for the peer-to-peer profile of RFC 35 (the reply is the response body; the
+asynchronous `Request-Id` / `Callback-Url` mode is not implemented). `postPrepare` checks `timeoutMs` (finite, from 0 to 2^31-1
+ms; `0` disables the timeout), `maxReplyBytes` (finite, above 0) and `token` (no control characters, nothing above Latin-1); a bad value is `invalid-option` and nothing is sent. A Reject `message` over 8191 bytes cannot be serialized.
 
 ```ts
 import * as Result from "effect/Result";
@@ -148,7 +153,7 @@ if (Result.isFailure(wire)) throw wire.failure;
 const prepare = deserializePrepare(wire.success);
 ```
 
-`postPrepare` POSTs a serialized Prepare to a peer and resolves with the reply bytes (a Fulfill or a Reject; parse them with `deserializeReply`). It fails with `IlpHttpError` (`reason`: `status`, `too-large`, `timeout`, `network`); the reply is capped (`maxReplyBytes`, default 64 KiB) and `timeoutMs` defaults to 30 s.
+`postPrepare` POSTs a serialized Prepare to a peer and resolves with the reply bytes (a Fulfill or a Reject; parse them with `deserializeReply`). `token` is sent as `Authorization: Bearer <token>` and `fetch` replaces the global one. It fails with `IlpHttpError` (`reason`: `status` for a `4xx` or `5xx` answer, `too-large`, `timeout`, `network`, which also covers a redirect, as redirects are not followed, and `invalid-option`); the reply is capped (`maxReplyBytes`, default 64 KiB, `DEFAULT_ILP_HTTP_MAX_REPLY_BYTES`) and `timeoutMs` defaults to 30 s (`DEFAULT_ILP_HTTP_TIMEOUT_MS`).
 
 ```ts
 import * as Effect from "effect/Effect";
@@ -160,7 +165,7 @@ const packet = deserializeReply(reply);
 
 ### `open-payments-ilp/ildcp`
 
-IL-DCP request/response codecs and `serveIldcp`, which answers a request with a Fulfill or an `F00` Reject.
+IL-DCP request/response codecs (`serializeIldcpRequest`, `deserializeIldcpRequest`, `serializeIldcpResponse`, `deserializeIldcpResponse`; the request goes to `ILDCP_DESTINATION`, `peer.config`), `serveIldcp`, which answers a request with a Fulfill or an `F00` Reject (it never fails: an invalid, foreign or expired request, or a `response` that cannot be encoded, is an `F00` too, and so is an Invalid Date `now`), and `fetchIldcp(sendData, { clock, ttlMs })`, which asks an upstream connector for this node's address and asset through your `sendData` function (`ttlMs`, how long the request stays valid, defaults to 30 000 ms).
 
 ```ts
 import * as Result from "effect/Result";
@@ -181,15 +186,20 @@ const config = deserializeIldcpResponse(Result.getOrThrow(serializeReply(reply))
 
 ### `open-payments-ilp/stream`
 
-RFC 29 STREAM: packet and frame codecs, AES-256-GCM packet encryption, SPSP-style credentials (no stored state: the
-connection is re-derived from the destination address), a receiver (`createStreamReply`) and sender helpers
-(`planStreamChunks`, `buildStreamPrepare`). `buildStreamPrepare` takes `minDestinationAmount` (default `amount`) and
+RFC 29 STREAM: packet and frame codecs (`encodeStreamPacket` / `decodeStreamPacket`, `encodeStreamFrame` / `decodeStreamFrame`,
+`StreamFrameType`, `StreamErrorCode`), AES-256-GCM packet encryption (`encryptStreamData` / `decryptStreamData`, with
+`STREAM_ENCRYPTION_OVERHEAD` of 28 bytes, `deriveStreamKeys`, `generateStreamFulfillment` / `generateStreamCondition`), SPSP-style
+credentials (`generateStreamCredentials`; no stored state: the connection is re-derived from the destination address), a receiver
+(`createStreamReply`) and sender helpers (`planStreamChunks`, `buildStreamPrepare`); crypto, credentials, receipts and reply reading fail with `StreamError`, the codecs with `IlpCodecError`. `generateStreamCredentials(server, options)`
+takes `asset` (announced to senders in a `ConnectionAssetDetails` frame), `paymentTag` (ASCII, returned with every accepted packet) and
+`receipt` (`{ nonce, secret }` of 16 and 32 bytes, which enables RFC 39 receipts). `buildStreamPrepare` takes
+`minDestinationAmount` (default `amount`), `additionalData` (an application payload, sent as a `StreamData` frame on stream 1) and
 `unfulfillable` (a rate probe: the receiver answers `F05` with the amount it received); `decryptStreamPacket` reads
 replies (pass `{ expect: { sequence, ilpPacketType } }` to refuse a reply that does not belong to its request: a connector
 can replay an older encrypted reply, `unexpected-packet`), `decodeStreamReceipt` / `verifyStreamReceipt` handle RFC 39 receipts
 (the `secret` lookup may be async), and `decodeStreamPaymentTag` reads the
-payment tag from a destination address. `sourceAddress` of `buildStreamPrepare` may be left out: the Prepare then carries
-the empty `ConnectionNewAddress` that `@interledger/pay` sends for asset probes. `connectionId` of a pending reply is the
+payment tag from a destination address. `sourceAddress` of `buildStreamPrepare` may be left out: the Prepare of sequence 1 then carries
+the empty `ConnectionNewAddress` that `@interledger/pay` sends for asset probes (later sequences carry none). `connectionId` of a pending reply is the
 hash of the whole destination address, so trailing segments or another spelling of the token give another id: do not key
 per-connection state on it without normalising. Imported keys, server-secret derivations and authenticated connection tokens are
 cached in small bounded in-memory maps (only authenticated tokens).
@@ -227,15 +237,24 @@ const fulfill = reply.type === "pending" ? await Effect.runPromise(reply.accept(
 
 ### `open-payments-ilp/http-signatures`
 
-RFC 9421 Ed25519 signatures as profiled by Open Payments and GNAP, RFC 9530 `Content-Digest`, and a strict RFC 8941
-structured-field parser. `verifyRequest` calls `resolveKey` only after every structural check has passed, and reads
-the time from its `clock` option (default `new Date()`). `HttpSignatureError` has an optional `cause`: what actually went wrong underneath a `resolveKey` failure.
-`importEd25519PrivateKeyPem` imports a PKCS#8 PEM, and `exportPublicJwk(key, { keyId })` returns the publishable
-Open Payments JWK (`kid`, `alg: "EdDSA"`, `kty`, `crv`, `x`). A server that enforces once-only `nonce`s must remember
+RFC 9421 Ed25519 signatures as profiled by Open Payments and GNAP, RFC 9530 `Content-Digest` (`createContentDigest`,
+`verifyContentDigest`: sha-256 and sha-512), and a strict RFC 8941 structured-field parser (`parseDictionary`, `serializeItem`,
+`serializeInnerList`; `createSignatureBase` and `serializeSignatureParams` build the RFC 9421 pieces). `signRequest(request, { keyId, privateKey }, options)` covers
+`@method`, `@target-uri`, `authorization` (when present) and, with a body, `content-digest`, `content-length` and `content-type`
+(when present); `options` are `created` (default: now), `tag`, `nonce` and `digest` (`"sha-512"` by default, as the Open Payments
+client does, or `"sha-256"`). `verifyRequest` calls `resolveKey` only after every structural check has passed, and reads
+the time from its `clock` option (default `new Date()`); its other options are `requiredComponents` (default `@method` and
+`@target-uri`), `maxAgeSeconds` (default 300), `label` (default `sig1`), `requireBodyDigest` (default `true`: a non-empty body must be
+covered by a matching `Content-Digest`) and `forbidAlg` (default `false`: refuse an explicit `alg` parameter, as RFC 9635 §7.3.1 does for GNAP).
+`HttpSignatureError` has an optional `cause`: what actually went wrong underneath a `resolveKey` failure.
+`importEd25519PrivateKeyPem` imports a PKCS#8 PEM, `importEd25519PrivateJwk` a private JWK and `importEd25519PublicJwk` a public one;
+`exportPublicJwk(key, { keyId })` returns the publishable
+Open Payments JWK (`kid`, `alg: "EdDSA"`, `kty`, `crv`, `x`) of a public key or of an extractable private key (from `generateEd25519KeyPair`): the two
+private imports are not extractable, so it fails with `malformed` on them, and the JWK of a PEM key has to come from elsewhere. A server that enforces once-only `nonce`s must remember
 each one for `SIGNATURE_REPLAY_WINDOW_SECONDS` (331 s, exported), the longest a signature can still verify with the
 default `maxAgeSeconds`; `VerifiedSignature.replayWindowSeconds` is the window of the options actually used. The body is
-read, capped at `maxBodyBytes` (64 KiB by default), only when a `content-digest` is covered. A verifier option that is not
-a finite number, or a clock that returns an Invalid Date, fails with reason `invalid-config`.
+read, capped at `maxBodyBytes` (64 KiB by default), only when a `content-digest` is covered (otherwise it is not read beyond finding out whether it is empty). A verifier option that is not
+a finite number of at least 0 (`maxAgeSeconds`, `maxBodyBytes`), or a clock that returns an Invalid Date, fails with reason `invalid-config`.
 
 ```ts
 import * as Effect from "effect/Effect";
@@ -255,15 +274,23 @@ const verified = await Effect.runPromise(verifyRequest(signed, { resolveKey: () 
 
 ### `open-payments-ilp/open-payments`
 
-Wire types generated from the Open Payments OpenAPI documents, amount helpers, and `createAuthenticatedClient` /
-`createUnauthenticatedClient`. Pass your own `fetch` to test or to run behind a proxy. Options: `validateResponses`
+Wire types generated from the Open Payments OpenAPI documents, amount helpers (`parseAmountValue`, `isAmountValue`,
+`isPositiveAmountValue`, `isSameAsset`, `compareAmounts`, `addAmounts`, `normalizeAmount`, with the limits `UINT64_MAX` and
+`UINT128_MAX`), the grant guards `isPendingGrant`, `isFinalizedGrantWithAccessToken` and `isFinalizedGrantWithSubject`, the access
+values `AccessType` and `AccessAction`, and `createAuthenticatedClient` / `createUnauthenticatedClient`. The authenticated client has the routes
+`walletAddress` (`get`, `getKeys`, `getDIDDocument`), `incomingPayment` (`get`, `getPublic`, `create`, `complete`, `list`),
+`outgoingPayment` (`get`, `list`, `create`, `getGrantSpentAmounts`), `quote` (`get`, `create`), `grant` (`request`, `continue`,
+`cancel`) and `token` (`rotate`, `revoke`); the unauthenticated one only `walletAddress` and `incomingPayment.get`. A route fails with
+`OpenPaymentsError` (`reason`: `http` for a `4xx` or `5xx` answer, with its `status`, `code` and `description`; `validation`;
+`transport`; `invalid-request`; `signing`), the amount helpers with `invalid-amount`. Pass your own `fetch` to test or to run behind a proxy. Options: `validateResponses`
 (default `true`; bodies are validated and returned unchanged), `requestTimeoutMs` (default 5000), `clock` (the time of the
 signatures' `created`, default `new Date()`) and `maxResponseBytes`
 (default 1 MiB; a longer response, announced or streamed, is a `transport` error). Every request URL must be `https:` (`useHttp: true`,
-for tests and local servers, sends them over `http:`), without credentials or fragment; any other URL fails with
-`invalid-request` before anything is sent, and `urlPolicy: (url) => boolean` can refuse more. A redirect is never followed
+for tests and local servers, sends them over `http:`), without credentials or fragment; a URL that parses but breaks these rules, or that
+`urlPolicy: (url) => boolean` refuses, fails with `invalid-request` before anything is sent, and one that does not parse is a `transport` error. A redirect is never followed
 (`transport`). Retries are opt-in: `retry: { maxAttempts,
-baseDelayMs, maxDelayMs, jitter, retryOn, retryNonIdempotent, sleep, random }` retries network errors, timeouts and
+baseDelayMs, maxDelayMs, jitter, retryOn, retryNonIdempotent, sleep, random }` (`maxAttempts` counts the first attempt and is required;
+`baseDelayMs` defaults to 200, `maxDelayMs` to 5000 and `jitter` to `"full"`) retries network errors, timeouts and
 `408`/`429`/`502`/`503`/`504` of `GET`/`HEAD`/`PUT`/`DELETE` with exponential backoff and jitter, honours `Retry-After`
 of `429` and `503` (a longer wait than `maxDelayMs` ends the retries) and signs every attempt again with a fresh `created` and `nonce`. A `POST` or `PATCH` may already have been
 processed, so it is repeated only with `retryNonIdempotent: true` (client-wide or per request); `token.rotate` and
@@ -296,8 +323,13 @@ const wallet = await Effect.runPromise(client.walletAddress.get({ url: "https://
 
 ### `open-payments-ilp/gnap`
 
-GNAP (RFC 9635) types as profiled by Open Payments, access-item matching and limit checks, error bodies (`gnapErrorBody(code, description)` returns Rafiki's `{ error: { code, description } }`), token helpers,
-and the interaction finish `hash`.
+GNAP (RFC 9635) types as profiled by Open Payments, access-item matching and limit checks (`compareRequestAndGrantAccessItems`,
+`validateOutgoingPaymentAmounts`, `validateOutgoingPaymentReceiver`, `parseAccessIntervalMs`, `currentAccessIntervalStart`), error bodies
+(`gnapErrorBody(code, description)` returns Rafiki's `{ error: { code, description } }`), token helpers (`extractGnapToken`,
+`formatGnapAuthorization`, `hashToken`), the `client` field parsers (`parseClientField`, `getGrantClientIdentity`, `toTokenInfoClient`:
+they fail with `GnapClientFieldError`), the grant guards `isPendingGrant`, `isFinalizedGrantWithAccessToken` and `isFinalizedGrantWithSubject`,
+the access values `AccessType` and `AccessAction`, and the interaction finish `hash` (`computeInteractionHash`, `verifyInteractionHash`,
+`buildFinishUrl`, `buildRejectedFinishUrl`).
 
 ```ts
 import * as Effect from "effect/Effect";
@@ -339,13 +371,28 @@ const response = await Effect.runPromise(
 );
 ```
 
-Routes below the path of `baseUrl` (Rafiki's layout): `POST /` grant request, `POST|DELETE /continue/:id`,
+Beyond `baseUrl` and `store`, the options are `tenants`, `interaction` (`consentUrl`, `expiresInSeconds`, `authorize`), `idpSecret`, `introspection`
+(`authorize`), `policy` (`requiresInteraction`), `resolveClientKeys`, `fetch`, `finishHashEncoding`, `maxBodyBytes`, `onError`, and these, which have defaults:
+`accessTokenExpiresInSeconds` (lifetime of issued access tokens, 600), `waitSeconds` (`continue.wait`, default and minimum 5), `interaction.expiresInSeconds` (lifetime of an
+interaction, 600), `generateToken` (a secret generator, default 256 random bits as base64url) and `clock` (default `new Date()`).
+`interaction.consentUrl` is a string, to which the server adds Rafiki's query parameters, or a function that builds the URL from them
+(`interactId`, `nonce`, `clientName`, the host name of the wallet address, and `clientUri`, the wallet address itself).
+`createGnapServer` throws a `RangeError` for a `baseUrl` that is not an absolute `http(s)` URL without credentials, query or fragment, a
+`maxBodyBytes` or `waitSeconds` that is not a finite number of at least 0, an `accessTokenExpiresInSeconds` or `interaction.expiresInSeconds`
+that is not a finite number above 0, and a `finishHashEncoding` other than `"base64"` and `"base64url"`; a `clock` that returns an Invalid Date
+makes the request fail with `500`. Only `false` from `policy.requiresInteraction` skips the owner: any other answer
+(`undefined`, a Promise) needs consent.
+
+Routes below the path of `baseUrl` (Rafiki's layout): `POST /` grant request, `POST|DELETE /continue/:id` (and `PATCH`, see **Extended records**),
 `POST|DELETE /token/:id`, `GET /interact/:id/:nonce` and `…/finish`, the identity provider API `GET /grant/:id/:nonce`
 and `POST /grant/:id/:nonce/accept|reject` (`x-idp-secret`, only with `idpSecret`, or per tenant), and `POST /introspect` (only with
-`introspection.authorize`). `handlers` has each one separately; `getInteraction` and `decideInteraction` serve a
-consent page that authenticates the owner itself (they return the `/finish` URL to send the browser to). The wire
+`introspection.authorize`). `handlers` has each one separately. `getInteraction({ interactId, nonce })` returns what a
+consent page shows (the interaction `details`) and `decideInteraction({ interactId, nonce, choice, userId?, binding? })` records the
+owner's decision, both for a consent page that authenticates the owner itself; `decideInteraction` returns `{ redirect }`, the `/finish`
+URL to send the browser to. `introspectToken(accessToken, access?)` is the in-process introspection (not tenant-scoped; an active answer also
+carries the grant's `tenantId` and `grantAccess`). The wire
 behaviour is Rafiki's: subjects, `outgoing-payment` and `list-all` access need interaction (`policy.requiresInteraction`
-replaces that), the finish `hash` is padded base64 (`finishHashEncoding: "base64url"` for RFC 9635), accepting or
+replaces that; the default is exported as `defaultRequiresInteraction`), the finish `hash` is padded base64 (`finishHashEncoding: "base64url"` for RFC 9635), accepting or
 rejecting only records the decision and the grant is approved (or rejected) when the browser reaches `/finish`, the
 continue token is not rotated, a grant without interaction is `APPROVED` (so polling it issues a token), introspection
 without `access` reports none, and requests over 64 KiB (`maxBodyBytes`) get `413`.
@@ -353,7 +400,7 @@ without `access` reports none, and requests over 64 KiB (`maxBodyBytes`) get `41
 RFC 9635 / 9767 requirements that Open Payments clients never notice are enforced too: `Cache-Control: no-store` on
 every response, `application/json` request bodies, a required `interact.start`, `finish.uri` without fragment and a
 non-empty `finish.nonce`, `finish.hash_method` (`sha-256|384|512`), `access_token.label` echoed and `flags` checked
-(`invalid_flag`), at most 3 distinct access items and exactly one `sub_ids` entry, `wait` of at least 5 seconds, the
+(`invalid_flag`), at most 3 access items per token (and 10 tokens in an `access_token` array) and exactly one `sub_ids` entry, `wait` of at least 5 seconds (`waitSeconds`), the
 `GNAP` scheme on continuations, `key_rotation_not_supported` for a rotation request that carries a `key`, signatures
 under up to three labels per request, a once-only signature `nonce`, introspection `proof` and `invalid_resource_server`,
 and no decision by a signed-in user unless `interaction.authorize` allows it. An explicit `alg="ed25519"` signature parameter is
@@ -405,7 +452,7 @@ const observed = createGnapServer({
 ```
 
 **Storage.** `GnapStore` has seven methods, all returning an `Effect` that cannot fail (a database error is a defect),
-over two plain JSON-serialisable records (plus the nonce claims), `GrantRecord` and `TokenRecord`:
+over two plain JSON-serialisable records (plus the nonce claims), `GrantRecord` and `TokenRecord`, and two optional capability flags:
 
 ```ts
 interface GnapStore {
@@ -413,7 +460,7 @@ interface GnapStore {
   findGrant(by: "id" | "continueId" | "interactId", value: string): Effect<GrantRecord | null>;
   /** Compare-and-set: applies `patch`, increments `version`, and returns true only if `version` still matched. */
   updateGrant(id: string, version: number, patch: GrantPatch): Effect<boolean>;
-  createToken(token: TokenRecord): Effect<void>; // `valueHash`, `managementId` unique
+  createToken(token: TokenRecord): Effect<void>; // `id`, `valueHash`, `managementId` unique
   /** A token (revoked or expired too) with its grant: one lookup, as the server needs both. */
   findTokenWithGrant(
     by: "valueHash" | "managementId",
@@ -423,15 +470,21 @@ interface GnapStore {
   revokeTokens(by: "id" | "grantId", value: string, at: number): Effect<number>;
   /** Replay guard for signature nonces: claims `key` until `expiresAt` unless an unexpired claim exists. Atomic. */
   claimNonce(key: string, expiresAt: number, now: number): Effect<boolean>;
+  /** Set to `true` by a store that persists every optional field of the two records (see **Extended records**). */
+  extendedRecords?: true;
+  /** Set to `true` by a store that persists `GrantRecord.interactBinding` (see **Interaction binding**). */
+  interactionBinding?: true;
 }
 ```
 
 Times are epoch milliseconds, token values are stored as SHA-256 hashes only, and every multi-step change is ordered so
 that no transaction is needed. `memoryGnapStore()` is the in-process implementation. A new store is verified with the
-contract kit, `storeContract({ describe, it }, name, makeStore)` from `open-payments-ilp/gnap/server/testing`. It is
+contract kit, `storeContract({ describe, it }, name, makeStore, options?)` from `open-payments-ilp/gnap/server/testing`. It is
 framework-neutral: pass the `describe` and `it` of your runner (Vitest, `bun:test`, `node:test`). It checks round trips,
-uniqueness, the compare-and-set race, nonce claims and the revoke semantics, and the memory store and the Better Auth
-store both run it:
+uniqueness, the compare-and-set race, nonce claims and the revoke semantics (and the optional fields of a store that sets
+`extendedRecords` or `interactionBinding`), and the memory store and the Better Auth
+store both run it. `options.userId` is a user id the store accepts when it enforces a foreign key to a users table (default `"user-1"`),
+and `uniqueConstraints: false` skips the insert races for a store that does not enforce unique columns:
 
 ```ts
 import { describe, it } from "vitest";
@@ -444,11 +497,12 @@ storeContract({ describe, it }, "my database", async () => createMyStore(await f
 sets (whose value is that nonce) cannot tell which browser opened the interaction. A store that persists
 `GrantRecord.interactBinding` and sets `interactionBinding: true` (`memoryGnapStore()` and `betterAuthGnapStore()` do; the
 contract kit checks it) gets a stronger check: the first visit to `/interact/:id/:nonce` receives a random secret in the
-`gnap-binding-<interactId>` cookie (HttpOnly, `SameSite=Lax`, scoped to the server's base path) and only its hash is stored;
+`gnap-binding-<interactId>` cookie (HttpOnly, `SameSite=Lax`, `Secure` under an `https` `baseUrl`, scoped to the server's base path) and only its hash is stored;
 a later visit by another browser gets none. `/finish` is refused (`401`) to a browser without that cookie, and
-`decideInteraction` with a `userId` is refused (`403`) without `binding` (`bindingFromRequest(request, interactId)`) once an
+`decideInteraction` with a `userId` is refused (`403`) without `binding` (`bindingFromRequest(request, interactId)`, also
+exported by `/plain/gnap/server`; checked again when the decision is stored) once an
 interaction is bound, so a user who opens the consent URL in another browser cannot approve a grant that browser's owner
-then collects. A replaced interaction (`PATCH`) starts unbound. Not covered: the `x-idp-secret` back channel and
+then collects. A replaced interaction (`PATCH`) starts unbound. The first visitor is the one that is bound, so a link scanner or prefetcher that opens the URL before the user locks the user out of `/finish`: the client has to start a new grant. Not covered: the `x-idp-secret` back channel and
 `decideInteraction` without `userId`, where your consent page vouches for the browser; and a store without the flag keeps
 Rafiki's nonce-cookie check.
 
@@ -462,17 +516,19 @@ unchanged. The server's `fetch` also delivers the push, and `onError` receives a
 Rafiki v2 multi-tenancy: grants are requested at `POST {baseUrl}/{tenantId}` (unknown tenant `404` after the signature
 check), the consent URL and identity-provider secret are per tenant, and the finish `hash` covers the tenant segment.
 A tenant named `introspect` is unreachable: the fixed `POST /introspect` route wins.
-Without `tenants`, `interaction.consentUrl` is required and the route is `POST {baseUrl}`. A store keeps
+Without `tenants`, `interaction.consentUrl` is required to serve any grant that needs interaction, and the route is `POST {baseUrl}`. A store keeps
 `GrantRecord.tenantId` (nullable). `limits.interval` accepts ISO 8601 repeating intervals (`R12/2030-01-01T00:00:00Z/P1M`,
 as Rafiki); a plain duration such as `P1M` is kept as an extension. For a D1/Postgres store, the `GnapStore` JSDoc
 carries the SQL DDL for the tables and the conditional `UPDATE` recipes for compare-and-set.
 
 ### `open-payments-ilp/webhooks`
 
-Rafiki-compatible webhook signatures (HMAC-SHA256 over `<t>.<canonical JSON>`), RFC 8785 canonicalisation, and event
-types generated from Rafiki's webhooks OpenAPI document. The default signature version is `v1`, as in Rafiki;
-verification enforces a 5-minute replay window and 30 s future skew. `signWebhook`, `verifyWebhookSignature` and
-`isValidWebhookSignature` read the time from the `clock` option of their config (default `new Date()`).
+Rafiki-compatible webhook signatures (HMAC-SHA256 over `<t>.<canonical JSON>`, `t` in Unix milliseconds; `signWebhook`
+returns the `Rafiki-Signature` header value `t=<ms>, v1=<hex>`), RFC 8785 canonicalisation (`canonicalizeJson`, a `Result`), and event
+types generated from Rafiki's webhooks OpenAPI document; every failure is a `WebhookError`. The default signature version is `v1`, as in Rafiki (`version` in the config);
+verification enforces a 5-minute replay window (`maxAgeMs`) and 30 s future skew (`futureSkewMs`), each a finite number of at least 0
+or `invalid-config`. `signWebhook`, `verifyWebhookSignature` and
+`isValidWebhookSignature` read the time from the `clock` option of their config (default `new Date()`; an Invalid Date is `invalid-config`).
 
 ```ts
 import * as Effect from "effect/Effect";
@@ -533,30 +589,30 @@ const auth = betterAuth({
 ```
 
 Run the Better Auth CLI migration to create the three tables (`gnapGrant` with a nullable `tenantId` and a nullable
-`interactBinding`, `gnapAccessToken` and `gnapNonce`; unique indexes on every lookup column). A database created by an
+`interactBinding`, `gnapAccessToken` and `gnapNonce`; unique indexes on the lookup columns). A database created by an
 earlier alpha needs the migration for the new `interactBinding` column before the plugin runs. Deleting a user deletes the
-grants they approved and their tokens (`gnapGrant.userId` cascades); a `databaseHooks.user.delete.before` hook of the
+grants they approved and their tokens (`gnapGrant.userId` cascades; a database created by an earlier alpha keeps its old `SET NULL` constraint until you alter that foreign key); a `databaseHooks.user.delete.before` hook of the
 plugin also revokes them on adapters that do not cascade (`revokeUserGrants` is exported). `gnapNonce` gets a row for each signed request that carries a
-`nonce` (every request of this package's own client); `betterAuthGnapStore` deletes the rows whose `expiresAt` has passed itself, at most once a minute per process. It needs `deleteMany` on the adapter for that (every Better Auth adapter has it; a `GnapDb` without it just skips the cleanup).
+`nonce` (the `/hono` middleware always sends one, the Open Payments client only with its `retry` option); `betterAuthGnapStore` deletes the rows whose `expiresAt` has passed itself, at most once a minute per database. It needs `deleteMany` on the adapter for that (every Better Auth adapter has it; a `GnapDb` without it just skips the cleanup).
 Endpoints live under the Better Auth base path (`/api/auth` by default) and delegate to
 [`open-payments-ilp/gnap/server`](#open-payments-ilpgnapserver) with a Better Auth `GnapStore`:
 
-| Endpoint                                                                   | Purpose                                                            |
-| -------------------------------------------------------------------------- | ------------------------------------------------------------------ |
-| `POST /gnap`                                                               | Grant request (HTTP-signed by the client)                          |
-| `POST` / `DELETE /gnap/continue/:id`                                       | Continue / cancel a grant                                          |
-| `POST` / `DELETE /gnap/token/:id`                                          | Rotate / revoke an access token                                    |
-| `GET /gnap/interact/:id/:nonce`, `…/finish`                                | Start interaction (redirects to `consentUrl`) / finish             |
-| `GET /gnap/interaction/:id/:nonce`, `POST …/accept`, `…/reject`            | Consent API for the signed-in resource owner (fresh session)       |
-| `GET /gnap/grant/:id/:nonce`, `POST …/accept`, `…/reject` (`x-idp-secret`) | Rafiki's identity provider API; only with `idpSecret` or `tenants` |
-| `POST /gnap/introspect`                                                    | Token introspection for resource servers (opt-in)                  |
+| Endpoint                                                                   | Purpose                                                                               |
+| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `POST /gnap`                                                               | Grant request (HTTP-signed by the client)                                             |
+| `POST` / `DELETE /gnap/continue/:id`                                       | Continue / cancel a grant                                                             |
+| `POST` / `DELETE /gnap/token/:id`                                          | Rotate / revoke an access token                                                       |
+| `GET /gnap/interact/:id/:nonce`, `…/finish`                                | Start interaction (redirects to `consentUrl`) / finish                                |
+| `GET /gnap/interaction/:id/:nonce`, `POST …/accept`, `…/reject`            | Consent API for the signed-in resource owner (authoritative session, no cookie cache) |
+| `GET /gnap/grant/:id/:nonce`, `POST …/accept`, `…/reject` (`x-idp-secret`) | Rafiki's identity provider API; only with `idpSecret` or `tenants`                    |
+| `POST /gnap/introspect`                                                    | Token introspection for resource servers (opt-in)                                     |
 
 The options of `gnap()` are those of `createGnapServer` without `baseUrl` and `store`: `tenants`, `interaction` (`consentUrl`,
 `expiresInSeconds`, `authorize`), `idpSecret`, `introspection` (`authorize`), `policy` (`requiresInteraction`),
 `waitSeconds`, `accessTokenExpiresInSeconds`, `resolveClientKeys`, `finishHashEncoding` (`"base64"` default, as Rafiki
 sends it; `"base64url"` is the RFC 9635 encoding), `maxBodyBytes`, `fetch`, `clock`, `onError` (as for the core, it
 sees the failures of the GNAP routes, not those of the consent endpoints) and `generateToken`, plus `rateLimit`
-(`{ grantRequest?: { window, max }, continue?: { window, max } }`, or `false` for none). Grant requests
+(`{ grantRequest?: { window, max }, continue?: { window, max } }`, `window` in seconds, or `false` for none). Grant requests
 (20 a minute) and continue requests (30 a minute) by default are limited per client IP and per URL while Better Auth's
 rate limiter is on (by default in production). Without a client IP Better Auth uses one shared bucket per path, so set
 `advanced.ipAddress` (and `trustedProxies`) for a deployment behind a proxy: Better Auth keys the bucket by IP and path, so continue requests are
@@ -585,16 +641,20 @@ as the auth server (a shared parent domain with cross-subdomain cookies), or set
 and cookie attributes for the cross-site case.
 
 Accept and reject also need the browser to be the one that opened `interact.redirect`: that visit sets the `gnap-binding-<interactId>`
-cookie (HttpOnly, scoped to the plugin's base path), and a user who opens the consent URL in another browser gets
+cookie (HttpOnly, scoped to the plugin's endpoints, `/api/auth/gnap` by default), and a user who opens the consent URL in another browser gets
 `403`. `/finish` needs the same cookie. With your own consent endpoint around `decideInteraction`, pass
-`binding: bindingFromRequest(request, interactId)` from `open-payments-ilp/gnap/server`.
+`binding: bindingFromRequest(request, interactId)` from `open-payments-ilp/gnap/server`. The consent API answers with the `GNAP_ERROR_CODES`
+(`unknown_interaction`, `invalid_interaction`, `user_denied`, `request_denied`), which the plugin also exposes as its `$ERROR_CODES`; `gnapSchema` is
+the schema it registers.
 
 ### `open-payments-ilp/better-auth/client`
 
 The client plugin for your consent page: `authClient.gnap.getInteraction(interactId, nonce)`,
 `acceptInteraction(interactId, nonce)` and `rejectInteraction(interactId, nonce)` (both values are on the consent URL
-your server sends the owner to). Accept and reject resolve to `{ data: { redirect } }`: navigate the browser to `redirect`,
-the server's `/finish` step, which approves (or rejects) the grant and sends the browser back to the client.
+your server sends the owner to). `getInteraction` resolves to `{ data: details }` (`grantId`, `client`, `access`, `subject?`, `state`, `finish`,
+`expiresAt`). Accept and reject resolve to `{ data: { redirect } }`: navigate the browser to `redirect`,
+the server's `/finish` step, which approves (or rejects) the grant and sends the browser back to the client. A refused call
+(`403` when `interaction.authorize` does not allow the user) does not throw: it resolves to `{ data: null, error: { status, statusText, code?, message? } }`.
 
 ```ts
 import { createAuthClient } from "better-auth/client";
@@ -625,23 +685,23 @@ Payments authorisation server and against a generic RFC 9635 one. It needs the o
    grant. The middleware keeps no server-side state, so parallel first requests that carry no cookie yet each start
    their own grant. A grant that needs no interaction creates the session at once. A grant answered with `continue` but
    no `interact.finish` is polled by the browser's later navigations (never before `wait`): `302` to `interact.redirect`
-   first (`202` with `Retry-After` when the server offers none), `401` for a denial, the request goes through once approved.
+   first (`202` with `Retry-After` when the server offered no `interact.redirect`), `401` for a denial, the request goes through once approved.
 2. The callback checks the state cookie, rejects a failed interaction (`result=…`, Rafiki's convention), verifies the
    `hash` of the finish redirect, waits out `continue.wait` (five seconds when absent), continues the grant (`POST`
    with the one-time `interact_ref`) and, while the server says pending, waits its `wait` and polls without
-   `interact_ref` a bounded number of times, then stores the session. An RFC 9635 server reports a denial through the
+   `interact_ref` up to three times (then `504`), then stores the session. An RFC 9635 server reports a denial through the
    same finish redirect and answers the continue call with `user_denied` (or `request_denied`): `401`, like Rafiki's
    `result=grant_rejected`. A bearer token that comes with a key and an `access_token` array are refused. An access token already past its
    `expires_in` is accepted at the callback and rotated on the next request, or the session ends when it cannot be.
 3. The session is an AES-256-GCM encrypted value (key derived from `secret` with HKDF; an HS256 JWT with `encryptCookies: false`) in an httpOnly, Secure, `SameSite=Lax` cookie: the access token, its `manage` and
-   `continue` credentials and two times. After the refresh interval (or when the token is about to expire) the
+   `continue` credentials, the granted `access` and its times (`expiresAt`, the next rotation, the end of the session). After the refresh interval (or when the token is about to expire) the
    access token is rotated through its management URI and the cookie re-issued; when the session lifetime is over it is
-   revoked and a new grant is requested. A rotation that fails because the server is unavailable (`429`, `5xx`,
+   revoked and a new grant is requested. A rotation that fails because the server is unavailable (`408`, `429`, `5xx`,
    network, timeout) or because a parallel request rotated first (`401`, `404`) keeps the cookie and serves that request
    without a session; only another refusal (`400`, `403`, …) drops the cookie and calls the refresh error hook.
 
 **Open Payments / Rafiki.** The client is a wallet address; the grant endpoint is the `authServer` of that wallet
-address document (pass a function to look it up). `privateKeyPem` is the text of an unencrypted PKCS #8 PEM
+address document (pass a function to look it up). `privateKey` is the text of an unencrypted PKCS #8 PEM
 (`openssl genpkey -algorithm ed25519`).
 
 ```ts
@@ -709,35 +769,38 @@ app.use("*", gnapAuthMiddleware());
 ```
 
 Everything but `access`, `fetch`, `clock`, `requestTimeoutMs` and `encryptCookies` (default `true`; changing it logs every
-user out) can come from environment variables instead; a value in the config wins over its variable,
+user out) can come from environment variables instead; a value in the config (`GnapAuthConfig`) wins over its variable,
 except that the private key is resolved as a unit (passing `privateKey` or `privateJwk` ignores both `GNAP_PRIVATE_KEY`
-and `GNAP_PRIVATE_JWK`): `GNAP_AUTH_SECRET` (random, at least 32 characters: never this README's placeholders),
-`GNAP_GRANT_ENDPOINT`, `GNAP_KEY_ID`, `GNAP_PRIVATE_KEY` (PEM), `GNAP_PRIVATE_JWK` (JWK as JSON), `GNAP_CLIENT`,
-`GNAP_REDIRECT_URI` (default `/callback`), `GNAP_COOKIE_NAME` (`gnap-auth`), `GNAP_COOKIE_PATH` (`/`),
-`GNAP_COOKIE_DOMAIN`, `GNAP_AUTH_REFRESH_INTERVAL` (seconds, 900), `GNAP_AUTH_EXPIRES` (seconds, 86400, at most
-34 560 000) and `GNAP_AUTH_EXTERNAL_URL` (public origin of this app, may carry a path prefix; required on any host that is not
+and `GNAP_PRIVATE_JWK`, and `privateJwk` wins over `privateKey`): `GNAP_AUTH_SECRET` (`secret`; random, at least 32 characters: never this README's placeholders),
+`GNAP_GRANT_ENDPOINT` (`grantEndpoint`), `GNAP_KEY_ID` (`keyId`), `GNAP_PRIVATE_KEY` (`privateKey`, PEM), `GNAP_PRIVATE_JWK` (`privateJwk`, JWK as JSON),
+`GNAP_CLIENT` (`client`), `GNAP_REDIRECT_URI` (`redirectUri`, default `/callback`), `GNAP_COOKIE_NAME` (`cookieName`, `gnap-auth`; the login-state and
+pending-login cookies add `-state` and `-pending`), `GNAP_COOKIE_PATH` (`cookiePath`, `/`),
+`GNAP_COOKIE_DOMAIN` (`cookieDomain`), `GNAP_AUTH_REFRESH_INTERVAL` (`refreshInterval`, seconds, 900), `GNAP_AUTH_EXPIRES` (`expires`, seconds, 86400, at most
+34 560 000) and `GNAP_AUTH_EXTERNAL_URL` (`externalUrl`, public origin of this app, may carry a path prefix; required on any host that is not
 loopback, also with an absolute `redirectUri`, because the post-login URL is built from it). An empty or blank
 `GNAP_AUTH_REFRESH_INTERVAL` or `GNAP_AUTH_EXPIRES` counts as unset. `access` and `grantEndpoint` may be
 functions of the request context. `fetch`, `clock` and `requestTimeoutMs` (default 10 000 ms: it aborts every call to
 the authorisation server and the read of its answer, which is capped at 64 KiB) are set in the config (tests, Workers).
+`getGnapAuth(c)` resolves to the session, a `GnapAuth` (`accessToken`, `expiresAt?`, `access`, `manage?`, `continue?`, `rtkexp`, `ssnexp`), or `null`.
 
 What you pass to `initGnapAuthMiddleware` is checked when it is called, not on the first request: a session secret of
 fewer than 32 characters, a negative or non-numeric `refreshInterval`, an `expires` that is not positive or exceeds 34 560 000, a
 `requestTimeoutMs` that is not a positive finite number, an `externalUrl` that is no URL, a `redirectUri` that is neither
 path nor URL (or that is known to be neither HTTPS/`localhost` nor free of a fragment), a `grantEndpoint` or `client`
-that is no http(s) URL (a non-loopback `grantEndpoint` must be `https:`), a `__Host-` cookie name with a `GNAP_COOKIE_PATH` other than `/` or with a domain, a `privateKey` that is no unencrypted PKCS #8 PEM and a `privateJwk` that is no Ed25519 key with
-`d` throw an `Error` at once (the message names the option, never the key). Values that come from the environment
+that is no http(s) URL (a non-loopback `grantEndpoint` must be `https:`), a `__Host-` `cookieName` with a `cookiePath` other than `/` or with a `cookieDomain`, a `privateKey` that does not look like an unencrypted PKCS #8 PEM and a `privateJwk` that is no Ed25519 key shape
+(`kty` `OKP`, `crv` `Ed25519`, `x` and `d`) throw an `HTTPException` (`500`) at once (the message names the option, never the key); a key of the right shape that does not import fails with a `500` when the first grant is signed. Values that come from the environment
 are checked by the same code on the first request they are seen in (`500`, same messages), as is a relative callback on a public request host without `externalUrl`. The private key is imported once and reused for every grant, rotation and revocation (an
 environment key again only when its text changes).
 
 The middleware serves the callback itself when mounted on the `redirectUri` path; behind a path-prefixing proxy mount
 `app.get("/callback", processGnapCallback)` yourself. With `externalUrl` the state cookie
 is scoped to the public callback path and the callback is matched on its path alone, so a proxy that strips a prefix
-works. A failing callback throws an `HTTPException` (`400` for a missing, forged or expired state or a failed
-interaction, `401` for a denied one or a wrong `hash`, `502` for a server that fails the continue request, `502` / `503`
-for one that fails or cannot be reached when a login starts; the message never repeats what the callback URL carried);
-handle it with `app.onError`. Set a `gnapAuthRefreshErrorHook` with `c.set` to see why a rotation was refused (only a
-definitive refusal, see 3 above; it receives a `GnapAuthError` with `status` and `code`, runs after the cookie was
+works. A failing callback throws an `HTTPException` (`400` for a missing, forged or expired state, a failed
+interaction or a missing `interact_ref` or `hash`, `401` for a denied one or a wrong `hash`, `502` for a server that fails the
+continue request (its own `401` and `504` pass through, and `504` is also the answer for a grant still pending after the polls), `502` / `503`
+for one that fails or cannot be reached when a login starts; the message never repeats free text or URLs that the callback URL carried, only one of the fixed
+`result` names `grant_rejected`, `request_denied` and `user_denied`); handle it with `app.onError`. Set a `gnapAuthRefreshErrorHook` with `c.set` to see why a rotation was refused (only a
+definitive refusal, see 3 above; it receives a `GnapAuthError` with `status`, `code` and `remote`, whether its `message` quotes the server and so belongs in a log only, runs after the cookie was
 dropped, and may throw to replace the re-login redirect):
 
 ```ts
@@ -785,7 +848,7 @@ Security notes:
   Log out with a `POST` (`SameSite=Lax` sends the cookie on a cross-site `GET` navigation, so a `GET` logout can be
   triggered by any page). `revokeGnapSession` uses the session of the current request, so it can be mounted before or
   after the middleware; it throws when the server refuses the revocation, but the cookie is deleted either way.
-- Cookie names may carry the `__Secure-` or `__Host-` prefix (`__Host-` needs path `/` and no domain); the middleware
+- Cookie names may carry the `__Secure-` or `__Host-` prefix (`__Host-` needs path `/` and no domain, and then the login state cookie is scoped to `/` too); the middleware
   deletes a cookie with the attributes it set it with. The login state cookie that does not fit in 4096 bytes keeps the
   return URL without its query string.
 - Concurrent requests with the same expired session merge into one rotation per process: a page load that still loses
@@ -796,7 +859,7 @@ Security notes:
 
 Differences from `@hono/oidc-auth`: no discovery document (you name the grant endpoint and the access); the signing key
 replaces the client secret; the session holds the GNAP access token and its `manage`/`continue` credentials instead of
-ID token claims, so there is no claims hook; the cookie is `SameSite=Lax`; state is one signed cookie instead of
+ID token claims, so there is no claims hook; the cookie is `SameSite=Lax`; state is one sealed cookie (plus the pending-login pointer) instead of
 `state`, `nonce`, `code_verifier` and `continue` cookies; refresh and logout call the token management API (`POST` / `DELETE`
 the `manage` URI) and cancel the grant (`DELETE` the `continue` URI) instead of OAuth refresh and revocation endpoints.
 
