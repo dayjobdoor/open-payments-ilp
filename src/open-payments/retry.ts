@@ -36,9 +36,9 @@ import type { OpenPaymentsError } from "./errors";
 export interface RetryOptions {
   /** Total number of attempts including the first, a finite integer; below 1 counts as 1 (no retry). */
   readonly maxAttempts: number;
-  /** Wait before the second attempt, doubled for every further one. Defaults to 200. */
+  /** Wait before the second attempt, doubled for every further one. A finite number of at least 0 (else `invalid-request`). Defaults to 200. */
   readonly baseDelayMs?: number;
-  /** Upper bound of every wait; a longer `Retry-After` ends the retries instead. Defaults to 5000. */
+  /** Upper bound of every wait; a longer `Retry-After` ends the retries instead. A finite number of at least 0 (else `invalid-request`). Defaults to 5000. */
   readonly maxDelayMs?: number;
   /** `"full"` (default) waits a random share of the backoff, `"none"` the whole backoff. */
   readonly jitter?: "full" | "none";

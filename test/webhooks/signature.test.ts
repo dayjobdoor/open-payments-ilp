@@ -205,6 +205,22 @@ describe("verifyWebhookSignature", () => {
     ).toBe("ok");
   });
 
+  it("fails closed, with invalid-config, on a version the header could never carry, signing and verifying", async () => {
+    const header = await sign(event, { secret: "s" });
+
+    for (const version of [Number.NaN, -1, 1.5, Number.POSITIVE_INFINITY, 2 ** 53]) {
+      expect(await verifyReason(event, header, { secret: "s", version, ...clock })).toBe("invalid-config");
+
+      const failure = await Effect.runPromise(Effect.flip(signWebhook(event, { secret: "s", version, ...clock })));
+
+      expect(failure).toMatchObject({ _tag: "WebhookError", reason: "invalid-config" });
+    }
+
+    // Zero is a version like any other, and a header with another version still says so.
+    expect(await sign(event, { secret: "s", version: 0 })).toMatch(/^t=\d+, v0=[0-9a-f]{64}$/);
+    expect(await verifyReason(event, header, { secret: "s", version: 0, ...clock })).toBe("version-mismatch");
+  });
+
   it("verifies what Rafiki signs for metadata with a toJSON member, which json-canonicalize leaves unsorted", async () => {
     // SAFETY: deliberately outside JsonValue; metadata is chosen by the sender of the webhook.
     const metadata = { toJSON: 1, b: 1, a: 2 } as never;

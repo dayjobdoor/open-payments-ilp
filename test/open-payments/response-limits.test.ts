@@ -62,7 +62,8 @@ describe("response size limit", () => {
       Effect.flip(getWallet(async () => new Response("x".repeat(20_000), { status: 500 }), 10_000)),
     );
 
-    expect(error.reason).toBe("transport");
+    expect(error).toMatchObject({ reason: "http", status: 500 });
+    expect(error.description).toBe("Response body is longer than 10000 bytes");
   });
 });
 

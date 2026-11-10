@@ -477,3 +477,212 @@ describe("query", () => {
     expect(Object.fromEntries(new URL(calls[0]?.url ?? "").searchParams)).toEqual({ "wallet-address": WALLET });
   });
 });
+
+describe("urlPolicy fails closed", () => {
+  // SAFETY: the policies below are deliberately outside `(url: URL) => boolean`: a JavaScript caller can pass any function.
+  const asPolicy = (policy: () => unknown) => policy as (url: URL) => boolean;
+
+  it.each([
+    [
+      "throws",
+      asPolicy(() => {
+        throw new Error("boom");
+      }),
+    ],
+    ["is async: its Promise is truthy", asPolicy(async () => true)],
+    ["answers with a truthy value that is not true", asPolicy(() => "yes")],
+    ["answers with nothing", asPolicy(() => undefined)],
+  ])("refuses the URL, before anything is sent, when the policy %s", async (_name, urlPolicy) => {
+    const { fetch, calls } = recording();
+    const client = createUnauthenticatedClient({ fetch, urlPolicy });
+
+    const error = await failure(client.walletAddress.get({ url: WALLET }));
+
+    expect(error).toMatchObject({ _tag: "OpenPaymentsError", reason: "invalid-request" });
+    expect(error.description).toContain("URL policy");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("does not retry a refused URL", async () => {
+    const { fetch, calls } = recording();
+
+    const client = createUnauthenticatedClient({
+      fetch,
+      urlPolicy: () => false,
+      retry: { maxAttempts: 3, sleep: () => Effect.void },
+    });
+
+    expect(await failure(client.walletAddress.get({ url: WALLET }))).toMatchObject({ attempts: 1 });
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("numeric options that timers and backoff cannot honour", () => {
+  it.each([2 ** 31, 2 ** 32, Number.MAX_VALUE])(
+    "refuses requestTimeoutMs %s before fetch is called: Node reads such a timer as 1 ms",
+    async (value) => {
+      const { fetch, calls } = recording();
+      const client = createUnauthenticatedClient({ fetch, requestTimeoutMs: value });
+
+      expect(await failure(client.walletAddress.get({ url: WALLET }))).toMatchObject({ reason: "invalid-request" });
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  it("accepts the longest timer, 2^31 - 1 ms", async () => {
+    const client = createUnauthenticatedClient({ ...recording(), requestTimeoutMs: 2 ** 31 - 1 });
+
+    expect((await Effect.runPromise(client.walletAddress.get({ url: WALLET }))).assetCode).toBe("USD");
+  });
+
+  it.each([
+    { baseDelayMs: Number.NaN },
+    { baseDelayMs: -1 },
+    { baseDelayMs: Number.POSITIVE_INFINITY },
+    { maxDelayMs: Number.NaN },
+    { maxDelayMs: -1 },
+    { maxDelayMs: Number.POSITIVE_INFINITY },
+  ])("refuses the retry delays %o before fetch is called", async (delays) => {
+    const { fetch, calls } = recording();
+    const client = createUnauthenticatedClient({
+      fetch,
+      retry: { maxAttempts: 3, sleep: () => Effect.void, ...delays },
+    });
+
+    expect(await failure(client.walletAddress.get({ url: WALLET }))).toMatchObject({
+      reason: "invalid-request",
+      attempts: 1,
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("does not let a Retry-After wait longer than a NaN maxDelayMs would have bounded", async () => {
+    const sleeps: number[] = [];
+    const answer = () => new Response("", { status: 503, headers: { "Retry-After": "99999999" } });
+
+    const client = createUnauthenticatedClient({
+      ...recording(answer),
+      retry: { maxAttempts: 3, maxDelayMs: Number.NaN, sleep: (ms) => Effect.sync(() => void sleeps.push(ms)) },
+    });
+
+    expect(await failure(client.walletAddress.get({ url: WALLET }))).toMatchObject({ reason: "invalid-request" });
+    expect(sleeps).toEqual([]);
+  });
+});
+
+describe("an access token that is no HTTP header value", () => {
+  it.each([
+    ["a line break", "abc\r\nX-Injected: 1"],
+    ["a NUL", "a\u0000b"],
+    ["a character above U+00FF", "t\u20ACken"],
+    ["nothing at all", ""],
+  ])("is refused with invalid-request, not raised as a defect, when it holds %s", async (_name, accessToken) => {
+    const { fetch, calls } = recording();
+    const client = authenticated({ fetch, retry: { maxAttempts: 3, sleep: () => Effect.void } });
+
+    const error = await failure(client.incomingPayment.get({ url: `${ORIGIN}/rs/incoming-payments/1`, accessToken }));
+
+    expect(error).toMatchObject({ _tag: "OpenPaymentsError", reason: "invalid-request", attempts: 1 });
+    expect(error.description).toContain("access token");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("an error body nested deeper than the stack can walk", () => {
+  const nest = (depth: number) => `${'{"a":'.repeat(depth)}1${"}".repeat(depth)}`;
+
+  it.each([
+    ["an object", nest(100_000)],
+    ["error.details", `{"error":{"code":"bad","details":${nest(100_000)}}}`],
+  ])("is an http error carrying the raw text, not a defect: %s", async (_name, body) => {
+    const { fetch } = recording(() => new Response(body, { status: 502 }));
+    const client = createUnauthenticatedClient({ fetch });
+
+    const error = await failure(client.walletAddress.get({ url: WALLET }));
+
+    expect(error).toMatchObject({ _tag: "OpenPaymentsError", reason: "http", status: 502, description: body });
+  });
+});
+
+describe("the deadline of a request", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it("cuts off a peer that stalls mid-body and cancels the stream", async () => {
+    let cancelled = false;
+
+    const body = new ReadableStream<Uint8Array>({
+      start: (controller) => controller.enqueue(new TextEncoder().encode('{"id":')),
+      cancel: () => void (cancelled = true),
+    });
+
+    const client = createUnauthenticatedClient({ ...recording(() => new Response(body)), requestTimeoutMs: 20 });
+    const error = await failure(client.walletAddress.get({ url: WALLET }));
+
+    expect(error).toMatchObject({ reason: "transport" });
+    expect(error.cause).toMatchObject({ name: "TimeoutError" });
+    expect(cancelled).toBe(true);
+  });
+
+  it("covers the whole body, not each read: a slow drip is cut off too", async () => {
+    let cancelled = false;
+
+    const body = new ReadableStream<Uint8Array>({
+      pull: async (controller) => {
+        await sleep(5);
+        controller.enqueue(new TextEncoder().encode(" "));
+      },
+      cancel: () => void (cancelled = true),
+    });
+
+    const client = createUnauthenticatedClient({ ...recording(() => new Response(body)), requestTimeoutMs: 40 });
+
+    expect(await failure(client.walletAddress.get({ url: WALLET }))).toMatchObject({ reason: "transport" });
+    expect(cancelled).toBe(true);
+  });
+
+  it("holds for a fetch that ignores its signal, and releases the response that arrives too late", async () => {
+    let answer: (response: Response) => void = () => undefined;
+    let cancelled = false;
+
+    const fetch: typeof globalThis.fetch = () =>
+      new Promise<Response>((resolve) => {
+        answer = resolve;
+      });
+
+    const client = createUnauthenticatedClient({ fetch, requestTimeoutMs: 10 });
+    const error = await failure(client.walletAddress.get({ url: WALLET }));
+
+    expect(error).toMatchObject({ reason: "transport" });
+    expect(error.cause).toMatchObject({ name: "TimeoutError" });
+
+    answer(new Response(new ReadableStream({ cancel: () => void (cancelled = true) })));
+    await sleep(0);
+    expect(cancelled).toBe(true);
+  });
+});
+
+describe("ilp payment methods follow the OpenAPI document", () => {
+  const method = { type: "ilp", ilpAddress: "test.rafiki.alice", sharedSecret: "Zm9v_-9" };
+
+  const get = (methods: unknown[]) =>
+    authenticated({ fetch: recording(() => Response.json({ ...incomingBody, methods })).fetch }).incomingPayment.get({
+      url: `${ORIGIN}/rs/incoming-payments/1`,
+      accessToken: "t",
+    });
+
+  it("accepts an ILP address and a base64url shared secret, the address at its longest", async () => {
+    const longest = { ...method, ilpAddress: `test.${"a".repeat(1018)}` };
+
+    expect((await Effect.runPromise(get([method, longest]))).methods).toHaveLength(2);
+  });
+
+  it.each([
+    ["an address without an ILP allocation scheme", { ilpAddress: "mars.alice" }],
+    ["an address with a space", { ilpAddress: "test.al ice" }],
+    ["an address of 1024 characters", { ilpAddress: `test.${"a".repeat(1019)}` }],
+    ["an empty shared secret", { sharedSecret: "" }],
+    ["a shared secret in plain base64", { sharedSecret: "a+b/c=" }],
+  ])("refuses %s as a validation failure", async (_name, bad) => {
+    expect(await failure(get([{ ...method, ...bad }]))).toMatchObject({ reason: "validation" });
+  });
+});

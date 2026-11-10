@@ -6,7 +6,7 @@ import type { JsonObject } from "effect/Schema";
 export type OpenPaymentsErrorReason =
   /**
    * The server answered with a 4xx or 5xx status (a 3xx is not followed and fails as `transport`). `status` and
-   * `description` are always set; `code` and `details` when the `{ error: { code, description, details } }` body carries them.
+   * `description` are always set (the description says so when the body was longer than `maxResponseBytes`); `code` and `details` when the `{ error: { code, description, details } }` body carries them.
    */
   | "http"
   /**
@@ -17,14 +17,17 @@ export type OpenPaymentsErrorReason =
   | "validation"
   /**
    * No usable response: `fetch` rejected (network failure, abort, timeout), the URL does not parse, the server
-   * redirected (redirects are not followed), the body exceeded `maxResponseBytes`, or reading it failed or stalled
-   * past `requestTimeoutMs`. `status` is not set.
+   * redirected (redirects are not followed), a successful response's body exceeded `maxResponseBytes`, or reading
+   * a body failed or stalled past `requestTimeoutMs`. `status` is not set. (An error response whose body is too long is
+   * an `http` error with its `status`.)
    */
   | "transport"
   /**
-   * The request was refused before being sent: a grant request without `access_token` or `subject`, a request URL
-   * that is not `https:` (`http:` with `useHttp`) or has credentials or a fragment or is refused by `urlPolicy`, or a
-   * `requestTimeoutMs` / `maxResponseBytes` that is not a finite number of at least 0.
+   * The request was refused before being sent: a grant request without `access_token` or `subject` or with both a
+   * `debitAmount` and a `receiveAmount` limit, a request URL that is not `https:` (`http:` with `useHttp`) or has
+   * credentials or a fragment or is refused by `urlPolicy` (which includes a policy that throws), an access token that
+   * cannot be sent as an HTTP header value, a `requestTimeoutMs` that is not a finite number from 0 to 2147483647, or
+   * a `maxResponseBytes`, `retry.baseDelayMs` or `retry.maxDelayMs` that is not a finite number of at least 0.
    */
   | "invalid-request"
   /** Returned by the amount helpers (`parseAmountValue`, `compareAmounts`, `addAmounts`, …): a value out of range or malformed, or assets differ. */

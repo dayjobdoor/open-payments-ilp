@@ -27,11 +27,14 @@ const readClock = (config: WebhookClock): Effect.Effect<number, WebhookError> =>
 const isDuration = (value: number | undefined): boolean =>
   value === undefined || (Number.isFinite(value) && value >= 0);
 
+/** `v<N>` of the header is digits only, so a version that is not a non-negative safe integer could never verify. */
+const isVersion = (value: number): boolean => Number.isSafeInteger(value) && value >= 0;
+
 /** How webhooks are signed and verified. */
 export interface WebhookSignatureConfig {
   /** Shared HMAC secret. */
   readonly secret: string;
-  /** Signature version `N` of `v<N>=…`; defaults to 1, Rafiki's own default (its `SIGNATURE_VERSION`). */
+  /** Signature version `N` of `v<N>=…`, a non-negative safe integer (else `invalid-config`); defaults to 1, Rafiki's own default (its `SIGNATURE_VERSION`). */
   readonly version?: number;
   /** Replay window in ms, a finite number of at least 0; defaults to 300000. Anything else fails with `invalid-config`. */
   readonly maxAgeMs?: number;
@@ -53,7 +56,8 @@ const digest = (body: JsonValue, secret: string, timestamp: number): Effect.Effe
  * Signs a webhook the way Rafiki does: HMAC-SHA256 (hex) over `<t>.<canonical JSON body>` with `t` in Unix
  * milliseconds, returned as the `Rafiki-Signature` header value `t=<ms>, v<N>=<hex>`.
  * Fails with `WebhookError`: `unsupported-value` when the body cannot be canonicalised, `missing` for an empty
- * secret (which HMAC cannot key), `invalid-config` when `config.clock` returns an Invalid Date.
+ * secret (which HMAC cannot key), `invalid-config` when `config.version` is not a non-negative safe integer or
+ * `config.clock` returns an Invalid Date.
  *
  * The signing time is read from `config.clock` when the effect runs.
  * @see https://rafiki.dev/integration/webhooks/#signature-verification
@@ -66,6 +70,8 @@ export function signWebhook(
 
   return Effect.suspend(() => {
     if (!config.secret) return fail("missing", "Signing secret is empty");
+
+    if (!isVersion(version)) return invalidConfig("version must be a non-negative safe integer");
 
     return Effect.flatMap(readClock(config), (signedAt) =>
       Effect.map(digest(body, config.secret, signedAt), (hex) => `t=${signedAt}, v${version}=${hex}`),
@@ -87,8 +93,11 @@ const verify = (
 
   if (!Number.isSafeInteger(timestamp)) return fail("malformed", "Signature timestamp is out of range");
 
-  if (version !== (config.version ?? DEFAULT_VERSION))
-    return fail("version-mismatch", `Unexpected signature version v${version}`);
+  const expectedVersion = config.version ?? DEFAULT_VERSION;
+
+  if (!isVersion(expectedVersion)) return invalidConfig("version must be a non-negative safe integer");
+
+  if (version !== expectedVersion) return fail("version-mismatch", `Unexpected signature version v${version}`);
 
   if (!isDuration(config.maxAgeMs) || !isDuration(config.futureSkewMs)) {
     return invalidConfig("maxAgeMs and futureSkewMs must be finite numbers of at least 0");
@@ -117,9 +126,14 @@ const verify = (
  * Verifies a `Rafiki-Signature` header against the body: header form, version, replay window and digest
  * (compared in constant time). Succeeds with `void`; fails with `WebhookError` whose `reason` is `missing`
  * (no header or no secret), `malformed`, `version-mismatch`, `expired`, `future`, `mismatch`,
- * `unsupported-value` (body not canonicalisable), or `invalid-config` (`maxAgeMs` or `futureSkewMs` not a finite
- * number of at least 0, or a clock returning an Invalid Date: a NaN would otherwise switch the window checks off).
+ * `unsupported-value` (body not canonicalisable), or `invalid-config` (`version` not a non-negative safe integer,
+ * `maxAgeMs` or `futureSkewMs` not a finite number of at least 0, or a clock returning an Invalid Date: a NaN would
+ * otherwise switch the window checks off).
  * Leading and trailing whitespace of the header is ignored. The clock is read when the effect runs.
+ *
+ * `body` is the parsed JSON of the request (`await request.json()`), not its text: a string is canonicalised as a JSON
+ * string, which no Rafiki delivery (an object) matches. The replay window bounds a replayed delivery but keeps no
+ * state, so the same delivery verifies again inside it: de-duplicate on the event `id`.
  *
  * @see https://rafiki.dev/integration/webhooks/#signature-verification
  */

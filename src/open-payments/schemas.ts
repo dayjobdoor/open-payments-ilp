@@ -91,10 +91,14 @@ const incomingPaymentFields = {
 
 export const incomingPayment: Schema.Codec<IncomingPayment> = Schema.Struct(incomingPaymentFields);
 
+/** `ilp-payment-method` in the OpenAPI document: a `maxLength` of 1023 and an ILP address pattern, a base64url secret. */
 export const ilpPaymentMethod: Schema.Codec<IlpPaymentMethod> = Schema.Struct({
   type: Schema.Literal("ilp"),
-  ilpAddress: Schema.String,
-  sharedSecret: Schema.String,
+  ilpAddress: Schema.String.check(
+    Schema.isMaxLength(1023),
+    Schema.isPattern(/^(g|private|example|peer|self|test[1-3]?|local)([.][a-zA-Z0-9_~-]+)+$/),
+  ),
+  sharedSecret: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_-]+$/)),
 });
 
 export const incomingPaymentWithMethods: Schema.Codec<IncomingPaymentWithPaymentMethods> = Schema.Struct({

@@ -161,6 +161,21 @@ describe("what is retried", () => {
     expect(error).toMatchObject({ reason: "transport", attempts: 1 });
   });
 
+  it("reports an error response longer than maxResponseBytes as an http error and retries it by its status", async () => {
+    const { fetch, seen } = scripted([
+      new Response("x".repeat(100), { status: 503 }),
+      new Response("y".repeat(100), { status: 404 }),
+    ]);
+
+    const error = await failure(
+      getWallet(createUnauthenticatedClient({ fetch, maxResponseBytes: 10, retry: instant().retry })),
+    );
+
+    expect(seen).toHaveLength(2);
+    expect(error).toMatchObject({ reason: "http", status: 404, attempts: 2 });
+    expect(error.description).toContain("longer than 10 bytes");
+  });
+
   it("does not retry a response that fails validation", async () => {
     const { fetch, seen } = scripted([Response.json({ nope: true })]);
     const error = await failure(getWallet(createUnauthenticatedClient({ fetch, retry: instant().retry })));

@@ -7,7 +7,7 @@ export type WebhookErrorReason =
   | "unsupported-value"
   /** The signature header or the signing secret is absent (an empty secret counts as absent when signing too). */
   | "missing"
-  /** The configuration is unusable: a replay window that is not a finite number of at least 0, or a clock returning an Invalid Date. */
+  /** The configuration is unusable: a `version` that is not a non-negative safe integer, a replay window that is not a finite number of at least 0, or a clock returning an Invalid Date. */
   | "invalid-config"
   /** The signature header does not have the `t=<ms>, v<N>=<hex>` form. */
   | "malformed"

@@ -82,12 +82,17 @@ export interface ClientOptions {
   /**
    * Further restriction of request URLs, e.g. to refuse private or loopback hosts: called with every final request
    * URL (after the `useHttp` rewrite and the query) once the scheme, credential and fragment rules have passed.
-   * Returning `false` fails the request with `invalid-request` before anything is sent. Must not throw.
+   * Anything but `true` (`false`, a thrown error, the `Promise` of an async policy) fails the request with
+   * `invalid-request` before anything is sent. Without a policy every `https:` host is requested, loopback, private
+   * and link-local addresses included: a caller that requests URLs it does not control needs one. The policy sees the
+   * host name, not the addresses it resolves to.
    */
   readonly urlPolicy?: (url: URL) => boolean;
   /**
-   * Abort a request after this many milliseconds, a finite number of at least 0. Defaults to 5000, like the reference
-   * client. Anything else (NaN, Infinity, negative) fails with `invalid-request` before anything is sent.
+   * Abort a request after this many milliseconds, a finite number from 0 to 2147483647 (about 24.8 days: Node reads a
+   * longer timer as 1 ms). Defaults to 5000, like the reference client. The deadline covers the response headers and
+   * the body, and holds even for a `fetch` that ignores its `signal`. Anything else (NaN, Infinity, negative, longer)
+   * fails with `invalid-request` before anything is sent.
    */
   readonly requestTimeoutMs?: number;
   /**
@@ -305,22 +310,31 @@ const decodeErrorBody = Schema.decodeUnknownResult(Schema.fromJsonString(errorBo
 
 const decodeJsonObject = Schema.decodeUnknownResult(Schema.fromJsonString(Schema.Record(Schema.String, Schema.Json)));
 
+/** Runs `run`; a body nested deeper than the stack can walk (tens of KB of `{"a":` suffice) throws, and then there is no result. */
+const orUndefined = <A>(run: () => A): A | undefined => {
+  try {
+    return run();
+  } catch {
+    return undefined;
+  }
+};
+
 /**
  * Builds the `http` error from a non-2xx response with the reference client's rules: `error.code`, `error.details`
  * and a non-empty `error.description` of an Open Payments error body; otherwise the JSON object body re-serialised,
- * the raw text, or, when the body is empty, the status line.
+ * the raw text (also for a body too deeply nested to re-serialise), or, when the body is empty, the status line.
  */
 const httpError = (call: Call, response: Response, text: string, url: string): OpenPaymentsError => {
-  const body = decodeErrorBody(text);
-  const detail = Result.isSuccess(body) ? body.success.error : undefined;
-  const object = decodeJsonObject(text);
+  const body = orUndefined(() => decodeErrorBody(text));
+  const detail = body !== undefined && Result.isSuccess(body) ? body.success.error : undefined;
+  const object = orUndefined(() => decodeJsonObject(text));
+
+  const reserialised =
+    object !== undefined && Result.isSuccess(object) ? orUndefined(() => JSON.stringify(object.success)) : undefined;
   const status = `${response.status} ${response.statusText}`.trim();
 
   const description =
-    detail?.description ||
-    (Result.isSuccess(object)
-      ? JSON.stringify(object.success)
-      : text || `Request failed with status code ${status}: ${call.method} ${url}`);
+    detail?.description || reserialised || text || `Request failed with status code ${status}: ${call.method} ${url}`;
 
   return new OpenPaymentsError({
     reason: "http",
@@ -359,12 +373,28 @@ const requestUrl = (transport: Transport, call: Call): string => {
     if (value) url.searchParams.set(name, String(value));
   }
 
-  if (urlPolicy && !urlPolicy(new URL(url.href))) throw new RefusedUrl("the URL policy refuses it");
+  if (urlPolicy) {
+    let accepted: unknown;
+
+    try {
+      accepted = urlPolicy(new URL(url.href));
+    } catch (cause) {
+      throw new RefusedUrl(`the URL policy threw: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+
+    // Only `true` lets a URL through: the `Promise` of an async policy is truthy and would admit everything.
+    if (accepted !== true) throw new RefusedUrl("the URL policy refuses it");
+  }
 
   return url.href;
 };
 
 const isLimit = (value: number | undefined): boolean => value === undefined || (Number.isFinite(value) && value >= 0);
+
+/** The longest timer Node honours is 2^31 - 1 ms; it reads a longer one as 1 ms, which would abort every request. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+const isTimeout = (value: number | undefined): boolean => isLimit(value) && (value ?? 0) <= MAX_TIMER_MS;
 
 const toError = (cause: unknown): Error => (cause instanceof Error ? cause : new Error(String(cause)));
 
@@ -380,10 +410,38 @@ interface AttemptFailure {
 const permanent = (error: OpenPaymentsError): AttemptFailure => ({ error, transient: false, retryAfter: null });
 
 /** Thrown inside an attempt when the body exceeds `maxResponseBytes`: repeating cannot help. */
-class ResponseTooLarge extends Error {}
+class ResponseTooLarge extends Error {
+  /** The 4xx or 5xx response whose body was too long: its status still tells whether to repeat. */
+  constructor(
+    message: string,
+    readonly errorResponse?: Response,
+  ) {
+    super(message);
+  }
+}
 
 /** Thrown inside an attempt when the peer redirects: repeating the same URL cannot help. */
 class RedirectRefused extends Error {}
+
+/**
+ * `pending`, or the reason of `signal` as soon as it aborts, whether or not the `fetch` behind `pending` honours the
+ * signal it was given: the deadline of a request must not depend on the injected `fetch`.
+ */
+const untilAborted = <T extends Response>(pending: Promise<T>, signal: AbortSignal): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const abort = (): void => {
+      reject(signal.reason);
+      // A `fetch` that ignored the signal may still answer: release the connection of that late response.
+      void pending.then(
+        (late) => late.body?.cancel().catch(() => undefined),
+        () => undefined,
+      );
+    };
+
+    if (signal.aborted) return abort();
+    signal.addEventListener("abort", abort, { once: true });
+    void pending.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
 
 /** One request/response exchange; a fresh signature, timeout and `fetch` every time it runs. */
 const attempt = (transport: Transport, call: Call): Effect.Effect<Response, AttemptFailure> =>
@@ -398,14 +456,22 @@ const attempt = (transport: Transport, call: Call): Effect.Effect<Response, Atte
         ),
     });
 
-    // NaN and Infinity would make `AbortSignal.timeout` throw, or switch the size limit off.
-    if (!isLimit(transport.options.requestTimeoutMs) || !isLimit(transport.options.maxResponseBytes)) {
+    const { requestTimeoutMs, maxResponseBytes, retry } = transport.options;
+
+    // NaN and Infinity would make `AbortSignal.timeout` throw, switch the size limit off, or (as the longest wait) let
+    // a `Retry-After` stall the client for good; a NaN or negative base delay would make the backoff vanish.
+    if (
+      !isTimeout(requestTimeoutMs) ||
+      !isLimit(maxResponseBytes) ||
+      !isLimit(retry?.baseDelayMs) ||
+      !isLimit(retry?.maxDelayMs)
+    ) {
       return yield* Effect.fail(
         permanent(
           invalidRequestError(
             call,
             "Invalid option",
-            "requestTimeoutMs and maxResponseBytes must be finite numbers of at least 0",
+            "requestTimeoutMs must be a finite number from 0 to 2147483647; maxResponseBytes, retry.baseDelayMs and retry.maxDelayMs finite numbers of at least 0",
           ),
         ),
       );
@@ -414,12 +480,26 @@ const attempt = (transport: Transport, call: Call): Effect.Effect<Response, Atte
     const headers = new Headers({ Accept: "application/json" });
     const body = call.body === undefined ? undefined : JSON.stringify(call.body);
 
-    if (call.accessToken) headers.set("Authorization", `GNAP ${call.accessToken}`);
+    // The token comes from a server's document: `Headers` refuses a CR, LF, NUL or a character above U+00FF in it,
+    // which must not surface as a defect.
+    if (call.accessToken === "") {
+      return yield* Effect.fail(
+        permanent(invalidRequestError(call, "Invalid access token", "an access token cannot be empty")),
+      );
+    }
+
+    if (call.accessToken !== undefined) {
+      yield* Effect.try({
+        try: () => headers.set("Authorization", `GNAP ${call.accessToken}`),
+        catch: () =>
+          permanent(invalidRequestError(call, "Invalid access token", "it cannot be sent as an HTTP header value")),
+      });
+    }
 
     if (body !== undefined) headers.set("Content-Type", "application/json");
 
     // Mirrors the reference client: POSTs and anything carrying an Authorization header are signed.
-    if (transport.key && (call.method === "POST" || call.accessToken)) {
+    if (transport.key && (call.method === "POST" || call.accessToken !== undefined)) {
       yield* signHeaders(
         { method: call.method, url, headers },
         body === undefined ? undefined : utf8Encode(body),
@@ -441,13 +521,16 @@ const attempt = (transport: Transport, call: Call): Effect.Effect<Response, Atte
       try: async (signal) => {
         const timeoutSignal = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
 
-        const received = await fetchImpl(url, {
-          method: call.method,
-          headers,
-          ...(body !== undefined && { body }),
-          redirect: "manual",
-          signal: timeoutSignal,
-        });
+        const received = await untilAborted(
+          fetchImpl(url, {
+            method: call.method,
+            headers,
+            ...(body !== undefined && { body }),
+            redirect: "manual",
+            signal: timeoutSignal,
+          }),
+          timeoutSignal,
+        );
 
         if (received.type === "opaqueredirect" || (received.status >= 300 && received.status < 400)) {
           await received.body?.cancel().catch(() => undefined);
@@ -457,15 +540,31 @@ const attempt = (transport: Transport, call: Call): Effect.Effect<Response, Atte
         // The body is read under the same timeout: a peer that stalls mid-body is cut off like one that never answers.
         const buffered = await bufferResponse(received, maxBytes, timeoutSignal);
 
-        if (buffered === null) throw new ResponseTooLarge(`Response body is longer than ${maxBytes} bytes`);
+        if (buffered === null) {
+          throw new ResponseTooLarge(
+            `Response body is longer than ${maxBytes} bytes`,
+            received.ok ? undefined : received,
+          );
+        }
 
         return buffered;
       },
-      catch: (cause): AttemptFailure => ({
-        error: transportError(call, toError(cause)),
-        transient: !(cause instanceof ResponseTooLarge || cause instanceof RedirectRefused),
-        retryAfter: null,
-      }),
+      catch: (cause): AttemptFailure => {
+        // An error response is an `http` error with its status even when its body is cut: a 429 or 503 is still retried.
+        if (cause instanceof ResponseTooLarge && cause.errorResponse !== undefined) {
+          return {
+            error: httpError(call, cause.errorResponse, cause.message, url),
+            transient: isTransientStatus(cause.errorResponse.status),
+            retryAfter: cause.errorResponse.headers.get("retry-after"),
+          };
+        }
+
+        return {
+          error: transportError(call, toError(cause)),
+          transient: !(cause instanceof ResponseTooLarge || cause instanceof RedirectRefused),
+          retryAfter: null,
+        };
+      },
     });
 
     if (response.ok) return response;
