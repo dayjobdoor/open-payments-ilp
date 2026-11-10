@@ -1,12 +1,13 @@
 import * as Effect from "effect/Effect";
 import type { GnapStore, GrantRecord, TokenRecord } from "./store";
 
+/** Past this many claimed nonces, a claim also drops the expired ones. */
+const NONCE_SWEEP_SIZE = 1024;
+
 /**
  * A {@link GnapStore} in process memory, for tests and local development. Nothing survives a restart and lookups
  * scan every record (O(n)); use a database-backed store in production.
  */
-const NONCE_SWEEP_SIZE = 1024;
-
 export function memoryGnapStore(): GnapStore {
   const grants = new Map<string, GrantRecord>();
   const tokens = new Map<string, TokenRecord>();

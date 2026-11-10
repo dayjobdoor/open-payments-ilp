@@ -12,13 +12,16 @@ import { attemptResolver } from "./plain";
 
 type EffectConfig = server.GnapServerConfig;
 
-/** Lifts a Promise store to the Effect `GnapStore` the server runs on. A rejecting method is a defect, as in the Effect store. */
+/**
+ * Lifts a Promise store to the Effect `GnapStore` the server runs on. A rejecting method is a defect, as in the Effect
+ * store. A lookup that resolves `undefined` (an ORM's `get()`) means "none", like `null`: the server tests `=== null`.
+ */
 export const toEffectStore = (store: GnapStore): server.GnapStore => ({
   createGrant: (grant) => Effect.promise(async () => store.createGrant(grant)),
-  findGrant: (by, value) => Effect.promise(async () => store.findGrant(by, value)),
+  findGrant: (by, value) => Effect.promise(async () => (await store.findGrant(by, value)) ?? null),
   updateGrant: (id, version, patch) => Effect.promise(async () => store.updateGrant(id, version, patch)),
   createToken: (token) => Effect.promise(async () => store.createToken(token)),
-  findTokenWithGrant: (by, value) => Effect.promise(async () => store.findTokenWithGrant(by, value)),
+  findTokenWithGrant: (by, value) => Effect.promise(async () => (await store.findTokenWithGrant(by, value)) ?? null),
   revokeTokens: (by, value, at) => Effect.promise(async () => store.revokeTokens(by, value, at)),
   claimNonce: (key, expiresAt, now) => Effect.promise(async () => store.claimNonce(key, expiresAt, now)),
   ...(store.extendedRecords === undefined ? {} : { extendedRecords: store.extendedRecords }),

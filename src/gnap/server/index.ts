@@ -178,23 +178,29 @@ export function createGnapServer(config: GnapServerConfig): GnapServer {
     return params;
   };
 
-  const route: RequestHandler = (request) => {
-    const rest = relativePath(core, request);
-
+  /** The decoded segments of a path below the base path, or `null` for a malformed percent-encoding (no route). */
+  const segmentsOf = (rest: string): ReadonlyArray<string> | null => {
     try {
       // `""` and `"/"` are the root; below it a trailing slash is a different (unknown) path.
-      const segments = (rest === "/" || rest === "" || rest === null ? "" : rest.slice(1))
+      return (rest === "/" ? "" : rest.slice(1))
         .split("/")
         .filter((segment, index, all) => all.length > 1 || segment !== "")
         .map(decodeURIComponent);
+    } catch {
+      return null;
+    }
+  };
 
-      for (const candidate of rest === null ? [] : routes) {
+  const route: RequestHandler = (request) => {
+    const rest = relativePath(core, request);
+    const segments = rest === null ? null : segmentsOf(rest);
+
+    if (segments !== null) {
+      for (const candidate of routes) {
         const params = candidate.method === request.method ? match(candidate.path, segments) : null;
 
         if (params !== null) return candidate.handle(request, params);
       }
-    } catch {
-      // Malformed percent-encoding: no route.
     }
 
     return respond(core, fail(404, "invalid_request", "not found"));

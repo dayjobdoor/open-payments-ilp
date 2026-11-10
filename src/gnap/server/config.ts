@@ -75,11 +75,15 @@ export interface TenantConfig {
   readonly idpSecret?: string;
 }
 
-/** Configuration of {@link createGnapServer}. All hooks are plain data or Effect-returning functions. */
+/**
+ * Configuration of {@link createGnapServer}. All hooks are plain data or Effect-returning functions. A `baseUrl`,
+ * number or `finishHashEncoding` outside the range documented below makes `createGnapServer` throw a `RangeError`: a
+ * limit that cannot be applied (`NaN`, infinite) must not silently turn into no limit.
+ */
 export interface GnapServerConfig {
   /**
    * Public URL of the authorisation server: the `authServer` of the clients' wallet addresses, where grant requests
-   * are POSTed. No trailing slash. Its path is the base path {@link GnapServer.route} serves under, and the string
+   * are POSTed. An absolute `http(s)` URL without credentials, query or fragment, and no trailing slash. Its path is the base path {@link GnapServer.route} serves under, and the string
    * every URL in the responses and every signature base is built from, whatever proxy sits in front.
    */
   readonly baseUrl: string;
@@ -95,7 +99,10 @@ export interface GnapServerConfig {
    * route wins. Omit for the single-tenant layout (`POST {baseUrl}`).
    */
   readonly tenants?: (tenantId: string) => Effect.Effect<TenantConfig | null>;
-  /** Clock for expiry, `wait` and signature freshness. Default: `new Date()`. */
+  /**
+   * Clock for expiry, `wait` and signature freshness. Default: `new Date()`. One that returns an Invalid Date fails
+   * the request with `500` (reported to {@link GnapServerConfig.onError}): nothing would expire.
+   */
   readonly clock?: () => Date;
   /** Secret generator for continue/access tokens, nonces and references. Default: 256 random bits, base64url. */
   readonly generateToken?: () => string;
@@ -106,8 +113,8 @@ export interface GnapServerConfig {
    * The default is `GET {walletAddress}/jwks.json` with {@link GnapServerConfig.fetch}, hardened against SSRF: it
    * refuses wallet addresses that are not `https`, carry credentials, a query or a fragment, or whose host is an IP
    * literal, `localhost` or `*.localhost`, `*.local`, `*.internal`, `*.lan`, `*.corp`, `*.intranet`, `*.private`,
-   * `*.home.arpa`, `*.svc`, a single label, or has a trailing dot; it never follows redirects
-   * and rejects responses over 64 KiB. DNS rebinding is NOT covered (Web Standards give no way to inspect the
+   * `*.home.arpa`, `*.svc`, a single label, or has a trailing dot; it never follows redirects, gives up after 10
+   * seconds and rejects responses over 64 KiB. DNS rebinding is NOT covered (Web Standards give no way to inspect the
    * resolved address): where clients must not reach private networks, resolve keys here yourself, with an egress
    * policy, a pinned allow-list or a cache.
    *
@@ -126,7 +133,7 @@ export interface GnapServerConfig {
     /**
      * Whether a grant needs the resource owner's consent. Default (Rafiki's): a subject is requested, or any
      * `outgoing-payment` item, or any item with the `list-all` action; plain `incoming-payment` and `quote` access
-     * is granted immediately.
+     * is granted immediately. Only `false` skips the owner: any other answer (`undefined`, a Promise) needs consent.
      */
     readonly requiresInteraction?: (request: GnapGrantRequest) => boolean;
   };
@@ -138,7 +145,7 @@ export interface GnapServerConfig {
      * unless {@link GnapServerConfig.tenants} supplies it per tenant.
      */
     readonly consentUrl?: TenantConfig["consentUrl"];
-    /** Lifetime of an interaction, from the grant request. Default 600 seconds. */
+    /** Lifetime of an interaction, from the grant request: a finite number above 0. Default 600 seconds. */
     readonly expiresInSeconds?: number;
     /**
      * Required for {@link GnapServer.decideInteraction} with an authenticated `userId` (and so for the Better Auth
@@ -170,9 +177,12 @@ export interface GnapServerConfig {
   readonly introspection?: {
     readonly authorize: (request: Request) => Effect.Effect<boolean | { readonly tenantId: string }>;
   };
-  /** Lifetime of issued access tokens. Default 600 seconds. */
+  /** Lifetime of issued access tokens: a finite number above 0. Default 600 seconds. */
   readonly accessTokenExpiresInSeconds?: number;
-  /** Minimum seconds between continuation requests (`continue.wait`). Default and floor 5 (RFC 9635 §3.1). */
+  /**
+   * Minimum seconds between continuation requests (`continue.wait`): a finite number of at least 0. Default and floor 5
+   * (RFC 9635 §3.1), so a smaller one is raised to 5.
+   */
   readonly waitSeconds?: number;
   /**
    * Digest encoding of the finish `hash`. Default `base64`, padded, as Rafiki sends it; RFC 9635 and the Open
@@ -180,8 +190,9 @@ export interface GnapServerConfig {
    */
   readonly finishHashEncoding?: "base64" | "base64url";
   /**
-   * Largest request body read, in bytes. Larger ones are answered with `413` before anything else happens (no key
-   * fetch, no parsing); the body is read as a stream and abandoned once past the cap. Default 64 KiB.
+   * Largest request body read, in bytes: a finite number of at least 0. Larger ones are answered with `413` before
+   * anything else happens (no key fetch, no parsing); the body is read as a stream and abandoned once past the cap.
+   * Default 64 KiB.
    */
   readonly maxBodyBytes?: number;
   /**

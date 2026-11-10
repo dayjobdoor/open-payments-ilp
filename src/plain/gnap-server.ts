@@ -12,7 +12,7 @@ import * as server from "../gnap/server/index";
  * `decideInteraction` reject with `GnapRouteError`.
  */
 
-export { defaultRequiresInteraction, GnapRouteError } from "../gnap/server/index";
+export { bindingFromRequest, defaultRequiresInteraction, GnapRouteError } from "../gnap/server/index";
 export type {
   ConsentUrlParams,
   GnapGrantRequest,

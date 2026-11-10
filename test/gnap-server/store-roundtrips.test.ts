@@ -2,14 +2,33 @@
  * What a request costs a database-backed store: every `GnapStore` call is a round trip on D1 or Postgres, so the
  * hot operations have a budget. Counted on calls, not on timing.
  */
+import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vite-plus/test";
-import { memoryGnapStore, type GnapStore } from "../../src/gnap/server/index";
-import { SEED, createServerHarness, idp, json, seedGrant, withToken, type ServerHarness } from "./support";
+import { hashToken } from "../../src/gnap/index";
+import { memoryGnapStore, type GnapStore, type GrantRecord } from "../../src/gnap/server/index";
+import {
+  SEED,
+  browserFinish,
+  createServerHarness,
+  idp,
+  json,
+  seedGrant,
+  seedToken,
+  withToken,
+  type ServerHarness,
+} from "./support";
 
-/** Store calls spent by `act` alone (setup excluded) and the status it answered. */
+/** Runs `run` without its store calls being counted: the setup of an `act` that needs more than the seeded grant. */
+type Setup = <Result>(run: () => Promise<Result>) => Promise<Result>;
+
+/**
+ * Store calls spent by `act` alone (the grant it is seeded with and what it sets up are excluded) and the status it
+ * answered. The store has no optional capability unless `interactionBinding` says so.
+ */
 const cost = async (
   seed: Parameters<typeof seedGrant>[1],
-  act: (h: ServerHarness) => Promise<Response>,
+  act: (h: ServerHarness, setup: Setup, grant: GrantRecord) => Promise<Response>,
+  { interactionBinding = false }: { readonly interactionBinding?: boolean } = {},
 ): Promise<{ readonly status: number; readonly calls: number }> => {
   const inner = memoryGnapStore();
   let counting = false;
@@ -24,6 +43,7 @@ const cost = async (
     };
 
   const store: GnapStore = {
+    ...(interactionBinding && { interactionBinding: true as const }),
     createGrant: tap(inner.createGrant),
     findGrant: tap(inner.findGrant),
     updateGrant: tap(inner.updateGrant),
@@ -35,9 +55,21 @@ const cost = async (
 
   const h = await createServerHarness({ store });
 
-  await seedGrant(h, seed);
+  const { grant } = await seedGrant(h, seed);
+
   counting = true;
-  const response = await act(h);
+
+  const setup: Setup = async (run) => {
+    counting = false;
+
+    try {
+      return await run();
+    } finally {
+      counting = true;
+    }
+  };
+
+  const response = await act(h, setup, grant);
 
   return { status: response.status, calls };
 };
@@ -62,6 +94,68 @@ describe("store round trips per request", () => {
 
     expect(result.status).toBe(204);
     expect(result.calls).toBeLessThanOrEqual(3);
+  });
+
+  it("introspecting a token costs one read", async () => {
+    const result = await cost(approved, async (h, setup, grant) => {
+      const token = await setup(() => seedToken(h, grant));
+      const answer = await Effect.runPromise(h.server.introspectToken(token.value));
+
+      return new Response(null, { status: answer.active ? 200 : 404 });
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.calls).toBe(1);
+  });
+
+  it("rotating a token costs at most one read, the new token and one conditional write", async () => {
+    const result = await cost(approved, async (h, setup, grant) => {
+      const token = await setup(() => seedToken(h, grant));
+
+      return h.signedCall(token.manage, withToken(json("POST"), token.value));
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.calls).toBeLessThanOrEqual(3);
+  });
+
+  it.each([
+    ["without a binding", false, undefined],
+    ["with a binding", true, "binding-secret"],
+  ])(
+    "the owner's browser reaching /finish %s costs at most one read and one conditional write",
+    async (_name, binding, secret) => {
+      const interactBinding =
+        secret === undefined ? {} : { interactBinding: await Effect.runPromise(hashToken(secret)) };
+
+      const result = await cost(
+        { state: "ACCEPTED", ...interactBinding },
+        (h) =>
+          browserFinish(
+            h,
+            { interactId: SEED.interactId, nonce: SEED.nonce, interactUrl: "", continueUri: "", continueToken: "" },
+            `gnap-interaction-${SEED.interactId}=${SEED.nonce}; gnap-binding-${SEED.interactId}=${secret ?? ""}`,
+          ),
+        { interactionBinding: binding },
+      );
+
+      expect(result.status).toBe(302);
+      expect(result.calls).toBeLessThanOrEqual(2);
+    },
+  );
+
+  it.each([
+    ["without a binding", false, 1],
+    ["with a binding", true, 2],
+  ])("opening the interaction %s costs at most %i store calls", async (_name, binding, calls) => {
+    const result = await cost(
+      {},
+      (h) => h.call(new Request(`${h.baseUrl}/interact/${SEED.interactId}/${SEED.nonce}`, { redirect: "manual" })),
+      { interactionBinding: binding },
+    );
+
+    expect(result.status).toBe(302);
+    expect(result.calls).toBeLessThanOrEqual(calls);
   });
 
   it("the identity provider's decision costs at most one read and one conditional write", async () => {

@@ -61,12 +61,26 @@ describe("interaction binding", () => {
     expect(secret).not.toBe(pending.nonce);
     expect(setCookie).toContain("HttpOnly");
     expect(setCookie).toContain("SameSite=Lax");
+    expect(setCookie).toContain("Secure");
     expect(setCookie).toContain("Path=/gnap;");
 
     const stored = await Effect.runPromise(h.store.findGrant("interactId", pending.interactId));
 
     expect(stored?.interactBinding).toBe(await Effect.runPromise(hashToken(secret ?? "")));
     expect(JSON.stringify(stored)).not.toContain(secret ?? "-");
+  });
+
+  it.each([
+    ["https://as.test/gnap", true],
+    ["http://localhost:3000/gnap", false],
+  ])("marks the cookies Secure under an https base URL only: %s", async (baseUrl, secure) => {
+    const h = await createServerHarness({ unvalidated: true, baseUrl });
+    const pending = await startGrant(h);
+    const lines = (await browserStart(h, pending)).response.headers.getSetCookie();
+
+    expect(lines).toHaveLength(2);
+
+    for (const line of lines) expect(line.split("; ").includes("Secure")).toBe(secure);
   });
 
   it("keeps the first binding: a second browser gets none, and the first one keeps its own on a reload", async () => {
@@ -81,6 +95,23 @@ describe("interaction binding", () => {
     expect(second.response.status).toBe(302);
     expect(bindingOf(second.cookie, pending.interactId)).toBeUndefined();
     expect(bindingOf(cookiesOf(reload), pending.interactId)).toBe(bindingOf(first.cookie, pending.interactId));
+  });
+
+  it("binds one of several browsers that open the interaction at the same moment, and only that one finishes", async () => {
+    const h = await createServerHarness({ unvalidated: true });
+    const pending = await startGrant(h);
+    const visits = await Promise.all(Array.from({ length: 4 }, () => browserStart(h, pending)));
+    const secrets = visits.flatMap((visit) => bindingOf(visit.cookie, pending.interactId) ?? []);
+    const stored = await Effect.runPromise(h.store.findGrant("interactId", pending.interactId));
+
+    expect(secrets).toHaveLength(1);
+    expect(stored?.interactBinding).toBe(await Effect.runPromise(hashToken(secrets[0] ?? "")));
+
+    expect((await idp(h, pending, "accept")).status).toBe(202);
+
+    const finishes = await Promise.all(visits.map((visit) => browserFinish(h, pending, visit.cookie)));
+
+    expect(finishes.map((finish) => finish.status).toSorted()).toEqual([302, 401, 401, 401]);
   });
 
   it("refuses /finish to a browser that only knows the nonce, even after the owner approved", async () => {
@@ -139,6 +170,61 @@ describe("interaction binding", () => {
     expect((await decide(h, pending, "wrong-secret"))._tag).toBe("Failure");
     expect((await decide(h, pending, binding))._tag).toBe("Success");
     expect((await browserFinish(h, pending, start.cookie)).status).toBe(302);
+  });
+
+  it("does not store a signed-in decision that was checked while nobody had opened the interaction, once another browser bound it", async () => {
+    let open: (() => Promise<unknown>) | undefined;
+
+    const h = await createServerHarness({
+      unvalidated: true,
+      // The hook runs after the binding check and before the decision is stored: the window of the race.
+      interaction: {
+        consentUrl: CONSENT_URL,
+        authorize: () => Effect.promise(async () => (await open?.(), true)),
+      },
+    });
+
+    const pending = await startGrant(h);
+    let attacker: Awaited<ReturnType<typeof browserStart>> | undefined;
+
+    open = async () => {
+      attacker = await browserStart(h, pending);
+    };
+
+    // The victim opened the consent URL directly, so their request carries no binding: nobody had bound the interaction yet.
+    const decision = await decide(h, pending);
+    const stored = await Effect.runPromise(h.store.findGrant("interactId", pending.interactId));
+
+    expect(attacker).toBeDefined();
+    expect(bindingOf(attacker?.cookie ?? "", pending.interactId)).toBeDefined();
+    expect(decision._tag).toBe("Failure");
+    expect(stored).toMatchObject({ state: "PENDING", userId: null });
+
+    // Nothing was approved, so the browser that bound it is sent back without an `interact_ref`.
+    const finish = new URL((await browserFinish(h, pending, attacker?.cookie ?? "")).headers.get("location") ?? "");
+
+    expect(finish.searchParams.get("result")).toBe("grant_invalid");
+    expect(finish.searchParams.get("interact_ref")).toBeNull();
+  });
+
+  it("does not ask interaction.authorize about a decision from another browser", async () => {
+    const asked: string[] = [];
+
+    const h = await createServerHarness({
+      unvalidated: true,
+      interaction: {
+        consentUrl: CONSENT_URL,
+        authorize: ({ userId }) => Effect.sync(() => (asked.push(userId), true)),
+      },
+    });
+
+    const pending = await startGrant(h);
+    const start = await browserStart(h, pending);
+
+    expect((await decide(h, pending, "wrong-secret"))._tag).toBe("Failure");
+    expect(asked).toEqual([]);
+    expect((await decide(h, pending, bindingOf(start.cookie, pending.interactId)))._tag).toBe("Success");
+    expect(asked).toEqual(["victim"]);
   });
 
   it("starts a replaced interaction unbound", async () => {

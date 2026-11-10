@@ -1,7 +1,7 @@
 /** Hardening: request body cap, SSRF-safe key fetch, concurrency of the single-use steps. */
 import * as Effect from "effect/Effect";
-import { describe, expect, it } from "vite-plus/test";
-import { memoryGnapStore } from "../../src/gnap/server/index";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { fetchClientKeys, memoryGnapStore } from "../../src/gnap/server/index";
 import {
   KEY_ID,
   WALLET,
@@ -211,6 +211,10 @@ describe("request body cap", () => {
 });
 
 describe("default client key fetch", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("never fetches http, credentialed, IP-literal, local, single-label or trailing-dot wallet addresses", async () => {
     const wallet = recordingFetch(() => new Response("unreachable", { status: 500 }));
     const h = await createServerHarness({ fetch: wallet.fetch });
@@ -232,6 +236,8 @@ describe("default client key fetch", () => {
       "https://wiki.corp/alice",
       "https://nas.home.arpa/alice",
       "https://api.default.svc/alice",
+      "https://portal.intranet/alice",
+      "https://vault.private/alice",
       "https://intranet/alice",
       "https://wallet.test./alice",
     ]) {
@@ -257,13 +263,39 @@ describe("default client key fetch", () => {
     const wallet = recordingFetch((url) => walletFetch([])(url));
     const h = await createServerHarness({ fetch: wallet.fetch });
 
-    for (const client of [`${WALLET}?x=`, `${WALLET}#x`]) {
+    // `URL.search` and `URL.hash` are `""` for a bare `?` or `#`: the address text decides.
+    for (const client of [`${WALLET}?x=`, `${WALLET}#x`, `${WALLET}?`, `${WALLET}#`]) {
       expect(await errorOf(await grantRequest(h, client))).toMatchObject({ status: 400, code: "invalid_client" });
     }
 
     expect(wallet.calls).toEqual([]);
     await grantRequest(h, `${WALLET}/`);
     expect(wallet.calls.map((call) => call.url)).toEqual([`${WALLET}/jwks.json`]);
+  });
+
+  it("gives up after 10 seconds", async () => {
+    const deadline = new AbortController();
+    const timeouts: number[] = [];
+    const timedOut = new DOMException("The operation timed out", "TimeoutError");
+
+    // The deadline of every `AbortSignal.timeout` is the one this test fires, when the fetch is under way.
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+      timeouts.push(milliseconds);
+
+      return deadline.signal;
+    });
+
+    const stalled: typeof globalThis.fetch = (_input, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+        deadline.abort(timedOut);
+      });
+
+    const failure = await Effect.runPromise(Effect.flip(fetchClientKeys(stalled)(WALLET)));
+
+    expect(timeouts).toEqual([10_000]);
+    expect(failure.reason).toBe("unknown-key");
+    expect(failure.cause).toBe(timedOut);
   });
 
   it("treats a redirect as a failure", async () => {

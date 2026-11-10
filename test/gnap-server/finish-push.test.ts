@@ -2,7 +2,7 @@
 /** RFC 9635 §2.5.2.2 / §4.2.2: with `finish.method: "push"` the server POSTs `hash` and `interact_ref` to the client. */
 import * as Effect from "effect/Effect";
 import * as Cause from "effect/Cause";
-import { describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { verifyInteractionHash } from "../../src/gnap/index";
 import {
   BASE_URL,
@@ -72,6 +72,10 @@ const withPush = async (options: HarnessOptions = {}) => {
 };
 
 describe("interact.finish.method push (RFC 9635 §4.2.2)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("POSTs the interact_ref and a hash the client verifies, then the client continues with them", async () => {
     const { h, pending, client } = await withPush();
 
@@ -237,6 +241,45 @@ describe("interact.finish.method push (RFC 9635 §4.2.2)", () => {
     expect(text).not.toContain("client.test");
 
     expect(await Effect.runPromise(h.server.getInteraction(pending))).toMatchObject({ state: "APPROVED" });
+  });
+
+  it("gives up on a client that does not answer within 5 seconds, and tells onError", async () => {
+    const deadline = new AbortController();
+    const timeouts: number[] = [];
+
+    // The deadline of every `AbortSignal.timeout` is the one this test fires, when the push is under way.
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+      timeouts.push(milliseconds);
+
+      return deadline.signal;
+    });
+
+    const client = pushingClient(
+      ({ init }) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+          deadline.abort(new DOMException("The operation timed out", "TimeoutError"));
+        }),
+    );
+
+    const causes: Cause.Cause<never>[] = [];
+
+    const h = await createServerHarness({
+      unvalidated: true,
+      outbound: client.outbound,
+      onError: (cause) =>
+        Effect.sync(() => {
+          causes.push(cause);
+        }),
+    });
+
+    const pending = await startGrant(h, grantBody([outgoing], { interact: pushInteract() }));
+    const finish = await decideAndFinish(h, pending);
+
+    expect(finish.status).toBe(202);
+    expect(timeouts.at(-1)).toBe(5000);
+    expect(causes).toHaveLength(1);
+    expect(Cause.pretty(causes[0] ?? Cause.die("none"))).toContain("timed out");
   });
 
   it("is not made for a URL the server must not contact: refused at the grant request", async () => {

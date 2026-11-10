@@ -38,13 +38,14 @@ const PRIVATE_SUFFIXES: ReadonlyArray<string> = [
  */
 export const isPublicHttpsUrl = (candidate: string): boolean => {
   if (!URL.canParse(candidate)) return false;
-  const { protocol, username, password, hostname, hash } = new URL(candidate);
+  const { protocol, username, password, hostname } = new URL(candidate);
 
+  // `URL.hash` is `""` for a bare `#` as well: look at the text.
   return (
     protocol === "https:" &&
     username === "" &&
     password === "" &&
-    hash === "" &&
+    !candidate.includes("#") &&
     hostname.includes(".") &&
     !hostname.endsWith(".") &&
     !hostname.startsWith("[") &&
@@ -53,9 +54,9 @@ export const isPublicHttpsUrl = (candidate: string): boolean => {
   );
 };
 
-/** A wallet address the default key fetch may contact: {@link isPublicHttpsUrl} without a query. */
+/** A wallet address the default key fetch may contact: {@link isPublicHttpsUrl} without a query (`URL.search` is `""` for a bare `?`). */
 const isFetchableWalletAddress = (walletAddress: string): boolean =>
-  isPublicHttpsUrl(walletAddress) && new URL(walletAddress).search === "";
+  isPublicHttpsUrl(walletAddress) && !walletAddress.includes("?");
 
 /** `fetch` that refuses redirects and responses over 64 KiB (announced or streamed). */
 const guardedFetch =

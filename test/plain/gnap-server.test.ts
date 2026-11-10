@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import { generateEd25519KeyPair, signRequest, HttpSignatureError } from "../../src/plain/http-signatures";
 import {
+  bindingFromRequest,
   createGnapServer,
   fetchClientKeys,
   GnapRouteError,
@@ -8,6 +9,7 @@ import {
   type GnapStore,
 } from "../../src/plain/gnap-server";
 import { storeContract } from "../../src/plain/gnap-server-testing";
+import { cookiesOf } from "../support/cookies";
 
 const BASE_URL = "https://as.test/gnap";
 const WALLET = "https://wallet.test/alice";
@@ -149,6 +151,58 @@ describe("plain gnap server", () => {
       }),
     ).toHaveProperty("redirect");
     await expect(server.getInteraction({ interactId: "nope", nonce: "nope" })).rejects.toBeInstanceOf(GnapRouteError);
+  });
+
+  it("lets a signed-in user decide only in the browser that opened the interaction: the facade keeps the binding", async () => {
+    const { server, grantRequest } = await setup();
+
+    const response = await grantRequest([{ type: "outgoing-payment", actions: ["create"], identifier: WALLET }], {
+      interact: { start: ["redirect"], finish: { method: "redirect", uri: "https://client.test/finish", nonce: "n" } },
+    });
+
+    const pending = (await response.json()) as { interact: { redirect: string } };
+    const [nonce = "", interactId = ""] = new URL(pending.interact.redirect).pathname.split("/").reverse();
+    const opened = await server.route(new Request(pending.interact.redirect, { redirect: "manual" }));
+    const cookie = cookiesOf(opened);
+    const binding =
+      bindingFromRequest(new Request(pending.interact.redirect, { headers: { cookie } }), interactId) ?? "";
+
+    expect(binding).toMatch(/^[\w-]{20,}$/);
+    expect(bindingFromRequest(new Request(pending.interact.redirect), interactId)).toBeUndefined();
+
+    const decision = { interactId, nonce, choice: "accept", userId: "u1" };
+
+    await expect(server.decideInteraction(decision)).rejects.toMatchObject({ status: 403, code: "request_denied" });
+    await expect(server.decideInteraction({ ...decision, binding: "not-the-secret" })).rejects.toBeInstanceOf(
+      GnapRouteError,
+    );
+    await expect(server.decideInteraction({ ...decision, binding })).resolves.toHaveProperty("redirect");
+
+    const finish = await server.route(
+      new Request(`${BASE_URL}/interact/${interactId}/${nonce}/finish`, { redirect: "manual", headers: { cookie } }),
+    );
+
+    expect(finish.status).toBe(302);
+  });
+
+  it("reads an undefined answer of a store lookup as not found, like null: no 500, an inactive token", async () => {
+    const reported: unknown[] = [];
+    const inner = memoryGnapStore();
+
+    // What an ORM's `get()` does for a missing row; the declared type says `null`, plain JavaScript stores say this.
+    const store = {
+      ...inner,
+      findGrant: async (...args: Parameters<GnapStore["findGrant"]>) => (await inner.findGrant(...args)) ?? undefined,
+      findTokenWithGrant: async (...args: Parameters<GnapStore["findTokenWithGrant"]>) =>
+        (await inner.findTokenWithGrant(...args)) ?? undefined,
+    } as never;
+
+    const { server } = await setup({ store, onError: (error) => void reported.push(error) });
+    const opened = await server.route(new Request(`${BASE_URL}/interact/nope/nope`, { redirect: "manual" }));
+
+    expect(opened.status).toBe(400);
+    expect(await server.introspectToken("unknown")).toEqual({ active: false });
+    expect(reported).toEqual([]);
   });
 
   it("reports a failing store to onError with the original error and answers 500", async () => {

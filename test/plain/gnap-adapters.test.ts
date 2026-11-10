@@ -81,6 +81,33 @@ describe("plain gnap adapters (internal)", () => {
     expect("interactionBinding" in toEffectStore(bare)).toBe(false);
   });
 
+  it.each([
+    ["extendedRecords", { extendedRecords: true }],
+    ["interactionBinding", { interactionBinding: true }],
+  ] as const)("copies %s alone, in both directions, without inventing the other flag", (name, flags) => {
+    const inner = server.memoryGnapStore();
+
+    const effectStore: EffectStore = {
+      createGrant: inner.createGrant,
+      findGrant: inner.findGrant,
+      updateGrant: inner.updateGrant,
+      createToken: inner.createToken,
+      findTokenWithGrant: inner.findTokenWithGrant,
+      revokeTokens: inner.revokeTokens,
+      claimNonce: inner.claimNonce,
+      ...flags,
+    };
+
+    const other = name === "extendedRecords" ? "interactionBinding" : "extendedRecords";
+    const promiseStore = toPromiseStore(effectStore);
+    const effectAgain = toEffectStore(promiseStore);
+
+    for (const store of [promiseStore, effectAgain]) {
+      expect(store[name]).toBe(true);
+      expect(other in store).toBe(false);
+    }
+  });
+
   it("toEffectStore round-trips through toPromiseStore", async () => {
     const store = toEffectStore(plainServer.memoryGnapStore());
 
@@ -95,6 +122,14 @@ describe("plain gnap adapters (internal)", () => {
 
     expect(Effect.isEffect(options.tenants?.("t"))).toBe(true);
     expect(options.resolveClientKeys).toBeUndefined();
+  });
+});
+
+describe("the plain server entry keeps up with the Effect one", () => {
+  it("exports every runtime name of /gnap/server, as the very same function", () => {
+    // A consent endpoint of a Promise-only application builds its decision from `bindingFromRequest`.
+    expect(Object.keys(server).filter((name) => !(name in plainServer))).toEqual([]);
+    expect(plainServer.bindingFromRequest).toBe(server.bindingFromRequest);
   });
 });
 
@@ -120,3 +155,8 @@ describe("public plain gnap entries do not expose the Effect adapters", () => {
     expect(true).toBe(true);
   });
 });
+
+// Every method, not a sample: one that is called off its instance throws here, and the flags of the store drive the extended cases.
+plainTesting.storeContract({ describe, it }, "a class-based Effect store lowered to the Promise port", () =>
+  toPromiseStore(new ClassStore()),
+);

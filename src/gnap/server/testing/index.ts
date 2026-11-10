@@ -16,7 +16,7 @@
  * @module
  */
 import * as Effect from "effect/Effect";
-import type { GnapStore, GrantRecord, TokenRecord } from "../store";
+import type { GnapStore, GrantPatch, GrantRecord, TokenRecord } from "../store";
 
 /** The two functions of the host test runner that the kit needs. */
 export interface StoreContractHost {
@@ -174,13 +174,14 @@ export function storeContract(
       });
 
       if (uniqueConstraints) {
-        it("refuses a second grant with the same continueId or interactId", async () => {
+        it("refuses a second grant with the same id, continueId or interactId", async () => {
           const store = await makeStore();
 
           await run(store.createGrant(grant("g1")));
 
           await rejects(run(store.createGrant(grant("g2", { continueId: "continue-g1" }))));
           await rejects(run(store.createGrant(grant("g3", { interactId: "interact-g1" }))));
+          await rejects(run(store.createGrant(grant("g1", { continueId: "continue-g4", interactId: "interact-g4" }))));
         });
       }
 
@@ -221,10 +222,10 @@ export function storeContract(
         await run(store.createGrant(grant("g1")));
         await run(store.updateGrant("g1", 0, { state: "APPROVED" }));
 
-        equal(await run(store.updateGrant("g1", 0, { state: "REJECTED" })), false);
+        equal(await run(store.updateGrant("g1", 0, { state: "REJECTED", userId, updatedAt: T0 + 9 })), false);
         equal(await run(store.updateGrant("missing", 0, { state: "REJECTED" })), false);
-        equal((await run(store.findGrant("id", "g1")))?.state, "APPROVED");
-        equal((await run(store.findGrant("id", "g1")))?.version, 1);
+        equal(await run(store.findGrant("id", "g1")), grant("g1", { version: 1, state: "APPROVED" }));
+        equal(await run(store.findGrant("id", "missing")), null);
       });
 
       it("updateGrant can set nullable fields to null and replace the continue token hash", async () => {
@@ -240,6 +241,46 @@ export function storeContract(
         equal(found?.userId, null);
         equal(found?.continueTokenHash, "rotated");
         equal(found?.lastContinuedAt, T0 + 5000);
+      });
+
+      it("updateGrant replaces and clears the request and interaction columns that a grant modification writes", async () => {
+        const store = await makeStore();
+
+        const changes: GrantPatch = {
+          access: [{ type: "incoming-payment", actions: ["read"] }],
+          subject: { sub_ids: [{ id: "https://wallet.example/bob", format: "uri" }] },
+          label: "renamed",
+          interactId: "interact-new",
+          interactNonce: "nonce-new",
+          interactRef: "ref-new",
+          interactExpiresAt: T0 + 900_000,
+          finishUri: "https://client.example/other",
+          clientNonce: "client-nonce-2",
+          finishHashMethod: "sha-512",
+        };
+
+        const cleared: GrantPatch = {
+          subject: null,
+          label: null,
+          interactId: null,
+          interactNonce: null,
+          interactRef: null,
+          interactExpiresAt: null,
+          finishUri: null,
+          clientNonce: null,
+          finishHashMethod: null,
+        };
+
+        await run(store.createGrant(grant("g1")));
+
+        equal(await run(store.updateGrant("g1", 0, changes)), true);
+        equal(await run(store.findGrant("id", "g1")), grant("g1", { version: 1, ...changes }));
+        equal((await run(store.findGrant("interactId", "interact-new")))?.id, "g1");
+        equal(await run(store.findGrant("interactId", "interact-g1")), null);
+
+        equal(await run(store.updateGrant("g1", 1, cleared)), true);
+        equal(await run(store.findGrant("id", "g1")), grant("g1", { version: 2, ...changes, ...cleared }));
+        equal(await run(store.findGrant("interactId", "interact-new")), null);
       });
 
       it("of concurrent updateGrant calls with the same version exactly one wins", async () => {
@@ -263,6 +304,7 @@ export function storeContract(
         await run(store.createGrant(grant("g1")));
         await run(store.createToken(token("t1", "g1")));
         await run(store.createToken(token("t2", "g1", { revokedAt: T0 + 1 })));
+        await run(store.createToken(token("t3", "g1", { expiresAt: T0 - 1 })));
 
         equal(await run(store.findTokenWithGrant("valueHash", "value-t1")), {
           token: token("t1", "g1"),
@@ -280,12 +322,18 @@ export function storeContract(
           grant: grant("g1"),
         });
 
+        // So are expired ones: the token's lifetime is the server's to judge, not the store's.
+        equal(await run(store.findTokenWithGrant("valueHash", "value-t3")), {
+          token: token("t3", "g1", { expiresAt: T0 - 1 }),
+          grant: grant("g1"),
+        });
+
         equal(await run(store.findTokenWithGrant("valueHash", "nope")), null);
         equal(await run(store.findTokenWithGrant("managementId", "nope")), null);
       });
 
       if (uniqueConstraints) {
-        it("refuses a second token with the same valueHash or managementId", async () => {
+        it("refuses a second token with the same id, valueHash or managementId", async () => {
           const store = await makeStore();
 
           await run(store.createGrant(grant("g1")));
@@ -293,6 +341,9 @@ export function storeContract(
 
           await rejects(run(store.createToken(token("t2", "g1", { valueHash: "value-t1" }))));
           await rejects(run(store.createToken(token("t3", "g1", { managementId: "manage-t1" }))));
+          await rejects(
+            run(store.createToken(token("t1", "g1", { valueHash: "value-t4", managementId: "manage-t4" }))),
+          );
         });
       }
 
@@ -336,6 +387,23 @@ export function storeContract(
         equal(
           results.reduce((sum, count) => sum + count, 0),
           1,
+        );
+      });
+
+      it("of concurrent revokeTokens calls for the same grant every token is revoked exactly once", async () => {
+        const store = await makeStore();
+
+        await run(store.createGrant(grant("g1")));
+        await run(store.createToken(token("t1", "g1")));
+        await run(store.createToken(token("t2", "g1")));
+
+        const results = await Promise.all(
+          Array.from({ length: 8 }, () => run(store.revokeTokens("grantId", "g1", T0 + 10))),
+        );
+
+        equal(
+          results.reduce((sum, count) => sum + count, 0),
+          2,
         );
       });
     });
@@ -383,6 +451,19 @@ export function storeContract(
         equal(without?.token.access ?? null, null);
         equal(without?.token.label ?? null, null);
       });
+
+      it("keeps a token that has no label as one without, on a grant that has one", async () => {
+        const store = await makeStore();
+
+        if (store.extendedRecords !== true) return;
+        await run(store.createGrant(grant("g1", { label: "of-the-grant" })));
+        await run(store.createToken(token("t1", "g1", { access: first.access, label: null })));
+        await run(store.createToken(token("t2", "g1", { access: first.access, label: "own" })));
+
+        // `null` is not "absent": absent means the grant's label, `null` means this token has none.
+        equal((await run(store.findTokenWithGrant("valueHash", "value-t1")))?.token.label, null);
+        equal((await run(store.findTokenWithGrant("valueHash", "value-t2")))?.token.label, "own");
+      });
     });
 
     describe("interaction binding", () => {
@@ -426,6 +507,18 @@ export function storeContract(
 
           const results = await Promise.all(
             Array.from({ length: 8 }, () => run(store.claimNonce("k1", T0 + 1000, T0))),
+          );
+
+          equal(results.filter(Boolean).length, 1);
+        });
+
+        it("of concurrent claims for an expired key exactly one wins", async () => {
+          const store = await makeStore();
+
+          equal(await run(store.claimNonce("k1", T0 + 1000, T0)), true);
+
+          const results = await Promise.all(
+            Array.from({ length: 8 }, () => run(store.claimNonce("k1", T0 + 5000, T0 + 2000))),
           );
 
           equal(results.filter(Boolean).length, 1);

@@ -152,7 +152,8 @@ export interface TokenRecord {
  *   union: map it through a fixed table, never interpolate it from outside.
  * - `findTokenWithGrant`: the same for a token, joined to its grant in ONE statement:
  *   `SELECT … FROM gnap_access_token t JOIN gnap_grant g ON g.id = t.grant_id WHERE t.<column> = ?`.
- * - `updateGrant`: set the columns of the keys present in `patch` (a key is only present when it changes) and bump
+ * - `updateGrant`: set the columns of the keys present in `patch` (a key that is absent leaves its column alone, a
+ *   `null` clears it) and bump
  *   the counter in the same statement, then return whether a row changed. The `version` guard is the whole
  *   concurrency control of the server:
  *   `UPDATE gnap_grant SET state = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?`.

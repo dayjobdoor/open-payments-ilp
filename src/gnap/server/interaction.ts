@@ -7,7 +7,7 @@ import type { ConsentUrlParams, InteractionDetails } from "./config";
 import { grantEndpoint, hasInteractionBinding, tenantConfig, updateGrant, type Core } from "./core";
 import { fail, redirect, respond, type GnapRouteError, type ParamHandler } from "./http";
 import { postFinish } from "./push";
-import type { GrantRecord, GrantState } from "./store";
+import type { GrantPatch, GrantRecord, GrantState } from "./store";
 
 interface InteractionParams {
   readonly id: string;
@@ -358,6 +358,21 @@ export const getInteraction = (
     return detailsOf(grant);
   });
 
+const MAY_NOT_DECIDE = "the user may not decide on this interaction";
+
+/**
+ * Whether the decision of `args` may be stored on `grant`. Only a signed-in user is bound to a browser (the identity
+ * provider's back channel and a `userId`-less call are vouched for by their caller): once a browser opened the
+ * interaction, only that one decides.
+ */
+const mayDecide = (core: Core, grant: GrantRecord, args: { readonly userId?: string; readonly binding?: string }) =>
+  Effect.gen(function* () {
+    if (args.userId === undefined || !hasInteractionBinding(core)) return true;
+    if (grant.interactBinding === undefined || grant.interactBinding === null) return true;
+
+    return yield* matchesBinding(grant, args.binding);
+  });
+
 /** Records a decision on an interaction already looked up (one store read less than {@link decideInteraction}). */
 const decide = (
   core: Core,
@@ -378,32 +393,33 @@ const decide = (
     }
 
     // A signed-in user decides in the browser that opened the interaction, or not at all: the consent URL is not secret.
-    if (
-      args.userId !== undefined &&
-      hasInteractionBinding(core) &&
-      grant.interactBinding !== undefined &&
-      grant.interactBinding !== null &&
-      !(yield* matchesBinding(grant, args.binding))
-    ) {
-      return yield* fail(403, "request_denied", "the user may not decide on this interaction");
-    }
+    if (!(yield* mayDecide(core, grant, args))) return yield* fail(403, "request_denied", MAY_NOT_DECIDE);
 
     const authorize = core.config.interaction?.authorize;
 
     // A signed-in user owns nothing the grant names (a wallet, a subject) until the hook says so: no hook, no decision.
     if (args.userId !== undefined) {
       if (authorize === undefined || (yield* authorize({ userId: args.userId, details: detailsOf(grant) })) !== true) {
-        return yield* fail(403, "request_denied", "the user may not decide on this interaction");
+        return yield* fail(403, "request_denied", MAY_NOT_DECIDE);
       }
     }
 
     yield* updateGrant(core, grant, (current) =>
-      current.state === "PENDING" && sameInteraction(current, grant)
-        ? Effect.succeed({
-            state: args.choice === "accept" ? ("ACCEPTED" as const) : ("DENIED" as const),
-            userId: args.userId ?? null,
-          })
-        : fail(400, "invalid_interaction", "invalid interaction"),
+      Effect.gen(function* () {
+        if (current.state !== "PENDING" || !sameInteraction(current, grant)) {
+          return yield* fail(400, "invalid_interaction", "invalid interaction");
+        }
+
+        // A first visit may have bound the interaction after the check above: the write re-checks what it was computed from.
+        if (!(yield* mayDecide(core, current, args))) return yield* fail(403, "request_denied", MAY_NOT_DECIDE);
+
+        const patch: GrantPatch = {
+          state: args.choice === "accept" ? "ACCEPTED" : "DENIED",
+          userId: args.userId ?? null,
+        };
+
+        return patch;
+      }),
     );
 
     return { redirect: `${core.baseUrl}/interact/${grant.interactId ?? ""}/${grant.interactNonce ?? ""}/finish` };

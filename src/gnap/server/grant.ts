@@ -78,8 +78,8 @@ const isFinishUri = (uri: string): boolean => {
   if (!URL.canParse(uri)) return false;
   const { protocol, hostname } = new URL(uri);
 
-  // RFC 9635 §2.5.2: absolute, and no fragment.
-  return new URL(uri).hash === "" && (protocol === "https:" || (protocol === "http:" && isLoopbackHost(hostname)));
+  // RFC 9635 §2.5.2: absolute, and no fragment (`URL.hash` is `""` for a bare `#`, so the text is checked).
+  return !uri.includes("#") && (protocol === "https:" || (protocol === "http:" && isLoopbackHost(hostname)));
 };
 
 /** A usable `interact.finish`: a nonce, and a URI the method may reach (a push also has to pass the SSRF rule). */
@@ -104,6 +104,11 @@ const hasBothAmounts = Schema.is(
 );
 
 const isString = Schema.is(Schema.String);
+
+/** auth-server.yaml `receiver`: `format: uri` and this pattern; Rafiki's OpenAPI validator answers `400` for anything else. */
+const RECEIVER_PATTERN = /^(https|http):\/\/(.+)\/incoming-payments\/(.+)$/;
+
+const isValidReceiver = (receiver: string): boolean => URL.canParse(receiver) && RECEIVER_PATTERN.test(receiver);
 
 /** Most tokens one `access_token` array may ask for. */
 const MAX_ACCESS_TOKENS = 10;
@@ -132,6 +137,11 @@ const parseAccessItems = (token: TokenBody) =>
 
       if (Result.isFailure(item)) return yield* fail(400, "invalid_request", "invalid access item");
       const parsed = item.success;
+
+      if (parsed.type === "outgoing-payment" && parsed.limits?.receiver !== undefined) {
+        if (!isValidReceiver(parsed.limits.receiver))
+          return yield* fail(400, "invalid_request", "invalid receiver limit");
+      }
 
       if (itemNeedsInteraction(parsed) && (!("identifier" in parsed) || !parsed.identifier)) {
         return yield* fail(400, "invalid_request", "access identifier required");
@@ -198,6 +208,7 @@ const checkSubject = (subject: typeof schemas.subject.Type | undefined) =>
 const usableInteract = (interact: typeof interactBody.Type | undefined) =>
   interact?.start.includes("redirect") === false ? undefined : interact;
 
+/** The `interact` the policy is shown: what {@link usableInteract} kept, so nothing the server will not act on. */
 const interactRequestOf = (interact: typeof interactBody.Type | undefined): { interact?: GnapInteractRequest } =>
   interact === undefined
     ? {}
@@ -233,7 +244,7 @@ const parseGrantRequest = (bytes: Uint8Array<ArrayBuffer>) =>
       client: client.success,
       access,
       ...(subject !== undefined && { subject }),
-      ...interactRequestOf(body.interact),
+      ...interactRequestOf(interact),
     };
 
     return { request, finish: interact?.finish, label, tokens, hasInteract: interact !== undefined };
@@ -259,7 +270,9 @@ export const grantIdentity = (grant: GrantRecord): Effect.Effect<ParsedClientFie
  */
 const requireRules = (core: Core, request: GnapGrantRequest, tenant: TenantConfig, canInteract: boolean) =>
   Effect.gen(function* () {
-    const interactive = (core.config.policy?.requiresInteraction ?? defaultRequiresInteraction)(request);
+    // Only an explicit `false` skips the owner: a policy that forgets to return (`undefined`) or answers with a
+    // Promise must not decide to grant access without consent.
+    const interactive = (core.config.policy?.requiresInteraction ?? defaultRequiresInteraction)(request) !== false;
 
     if (interactive) {
       if (!canInteract) return yield* fail(400, "invalid_request", "missing required request field 'interact'");
@@ -414,18 +427,30 @@ const stillWaiting = (core: Core, grant: GrantRecord): boolean =>
   core.now() < grant.lastContinuedAt + core.waitSeconds * 1000;
 
 /**
+ * Whether `current` still holds the request `seen` was read with. What is computed from a grant as read (a
+ * modification, which replaces `access`, `subject`, `label` and `tokenRequests` as a whole, and the tokens a
+ * continuation issues for them) must not be applied to a grant that another modification changed in the meantime: it
+ * would write back stale members, or approve what is no longer requested.
+ */
+const sameRequest = (current: GrantRecord, seen: GrantRecord): boolean =>
+  JSON.stringify([current.access, current.subject, current.label, current.tokenRequests ?? null]) ===
+  JSON.stringify([seen.access, seen.subject, seen.label, seen.tokenRequests ?? null]);
+
+/**
  * Issues the access token(s) of an approved grant. Order: tokens first, then the claim that the grant is still
- * `APPROVED`; a lost race revokes the tokens again, a crash leaves unreferenced tokens and a grant the client can
- * still continue. As in Rafiki the continue token stays the same.
+ * `APPROVED` and still asks for what the tokens carry; a lost race revokes the tokens again, a crash leaves
+ * unreferenced tokens and a grant the client can still continue. As in Rafiki the continue token stays the same.
  */
 const finalizeGrant = (core: Core, grant: GrantRecord, continueToken: string) =>
   Effect.gen(function* () {
     const issued = yield* issueGrantTokens(core, grant);
 
     const finalized = yield* updateGrant(core, grant, (current) =>
-      current.state === "APPROVED"
-        ? Effect.succeed({ state: "FINALIZED" as const })
-        : fail(404, "invalid_continuation", "grant not found"),
+      current.state !== "APPROVED"
+        ? fail(404, "invalid_continuation", "grant not found")
+        : sameRequest(current, grant)
+          ? Effect.succeed({ state: "FINALIZED" as const })
+          : fail(401, "request_denied", "grant was modified"),
     ).pipe(Effect.tapError(() => revokeIssued(core, issued)));
 
     return Response.json({
@@ -488,15 +513,6 @@ const continueGrant = (core: Core, request: Request, continueId: string) =>
 
 /** RFC 9635 §5.3: only a grant request that is pending or approved can be modified. */
 const isModifiable = (grant: GrantRecord): boolean => grant.state === "PENDING" || grant.state === "APPROVED";
-
-/**
- * Whether `current` still holds the request `seen` was read with. A modification is computed from the grant as read
- * and replaces `access`, `subject`, `label` and `tokenRequests` as a whole: applied to a grant that another
- * modification changed in the meantime it would write back stale members.
- */
-const sameRequest = (current: GrantRecord, seen: GrantRecord): boolean =>
-  JSON.stringify([current.access, current.subject, current.label, current.tokenRequests ?? null]) ===
-  JSON.stringify([seen.access, seen.subject, seen.label, seen.tokenRequests ?? null]);
 
 /** Fields an owner-less grant carries once nothing is left to decide. */
 const NO_INTERACTION = {
@@ -568,7 +584,7 @@ const modifyGrant = (core: Core, request: Request, continueId: string) =>
         client: yield* grantIdentity(grant),
         access,
         ...(subject !== undefined && { subject }),
-        ...interactRequestOf(body.interact),
+        ...interactRequestOf(interact),
       },
       tenant,
       interact !== undefined,

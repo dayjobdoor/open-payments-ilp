@@ -300,7 +300,6 @@ const expectStatus = (response: Response, status: number): void => {
 export const continueWith = (h: ServerHarness, pending: Pending, body?: Body, token = pending.continueToken) =>
   h.signedCall(pending.continueUri, withToken(json("POST", body), token));
 
-/** Rafiki's `generateBaseGrant`: a stored grant in any state, with its secrets known to the test. */
 /** The fixed secrets and ids of {@link seedGrant}'s defaults (one seeded grant per harness). */
 export const SEED = {
   id: "grant-1",
@@ -311,6 +310,7 @@ export const SEED = {
   continueToken: "continue-token-1",
 } as const;
 
+/** Rafiki's `generateBaseGrant`: a stored grant in any state, with its secrets known to the test. */
 export const seedGrant = async (h: ServerHarness, overrides: Partial<GrantRecord> = {}) => {
   const now = h.clock.now().getTime();
 
@@ -372,5 +372,5 @@ export const seedToken = async (h: ServerHarness, grant: GrantRecord, overrides:
 
   await Effect.runPromise(h.store.createToken(record));
 
-  return { value, record, manage: `${BASE_URL}/token/${record.managementId}` };
+  return { value, record, manage: `${h.baseUrl}/token/${record.managementId}` };
 };

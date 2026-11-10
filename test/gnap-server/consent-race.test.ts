@@ -2,11 +2,12 @@
 /** The owner's decision applies to the request the owner was shown, even when the client replaces it meanwhile. */
 import * as Effect from "effect/Effect";
 import { describe, expect, it } from "vite-plus/test";
-import type { GnapStore } from "../../src/gnap/server/index";
+import type { GnapStore, TokenRecord } from "../../src/gnap/server/index";
 import { memoryGnapStore } from "../../src/gnap/server/index";
 import {
   CONSENT_URL,
   createServerHarness,
+  errorOf,
   grantBody,
   idp,
   incoming,
@@ -162,5 +163,62 @@ describe("two modifications of one grant race", () => {
     );
 
     expect(stored?.access).toEqual([{ type: "quote", actions: ["create"] }]);
+  });
+});
+
+describe("a continuation races with a modification", () => {
+  it("does not hand out the tokens of the request the client has just replaced", async () => {
+    const inner = memoryGnapStore();
+    const issued: TokenRecord[] = [];
+    let harness: ServerHarness | undefined;
+    let first: { continueUri: string; continueToken: string } | undefined;
+
+    // The poll issues its tokens for the incoming-payment request; before it claims the grant, the client replaces
+    // that request with a quote request, which needs no consent and so is approved at once.
+    const racing = racingStore(inner, ["FINALIZED"], async () => {
+      if (harness === undefined || first === undefined) throw new Error("race fired before the grant was granted");
+
+      await harness.signedCall(
+        first.continueUri,
+        withToken(
+          json("PATCH", { access_token: { access: [{ type: "quote", actions: ["create"] }] } }),
+          first.continueToken,
+        ),
+      );
+    });
+
+    const store: GnapStore = {
+      ...racing,
+      createToken: (record) => {
+        issued.push(record);
+
+        return racing.createToken(record);
+      },
+    };
+
+    harness = await createServerHarness({ store, unvalidated: true });
+
+    const granted = await jsonBody<{ continue: { uri: string; access_token: { value: string } } }>(
+      await harness.signedCall(harness.baseUrl, json("POST", grantBody([incoming]))),
+    );
+
+    first = { continueUri: granted.continue.uri, continueToken: granted.continue.access_token.value };
+    harness.clock.advance(6);
+
+    const polled = await harness.signedCall(first.continueUri, withToken(json("POST"), first.continueToken));
+
+    // The incoming-payment token (the grant's, then the poll's) was issued for a request that no longer stands.
+    expect(await errorOf(polled)).toMatchObject({ status: 401, code: "request_denied" });
+    expect(issued).toHaveLength(3);
+
+    const [creation, polledToken, replacement] = await Promise.all(
+      issued.map((record) => Effect.runPromise(inner.findTokenWithGrant("valueHash", record.valueHash))),
+    );
+
+    expect(creation?.token.revokedAt).toBeNull();
+    expect(polledToken?.token.revokedAt).not.toBeNull();
+    expect(replacement?.token.revokedAt).toBeNull();
+    expect(replacement?.token.access).toEqual([{ type: "quote", actions: ["create"] }]);
+    expect(replacement?.grant.state).toBe("APPROVED");
   });
 });

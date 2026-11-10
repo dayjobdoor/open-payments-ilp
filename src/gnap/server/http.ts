@@ -25,7 +25,7 @@ export class GnapRouteError extends Base {}
 export const fail = (status: number, code: GnapErrorCode, description: string): Effect.Effect<never, GnapRouteError> =>
   Effect.fail(new GnapRouteError({ status, code, description }));
 
-export const errorResponse = ({ status, code, description }: GnapRouteErrorFields): Response =>
+const errorResponse = ({ status, code, description }: GnapRouteErrorFields): Response =>
   Response.json(gnapErrorBody(code, description), { status });
 
 /** Tells `config.onError` (whose own failure never reaches the client). */

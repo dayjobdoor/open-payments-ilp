@@ -32,7 +32,54 @@ export interface Core {
 /** 256 random bits as base64url. */
 const randomToken = (): string => encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)));
 
+/** Absent (the default applies), or a finite number that `accepts`: NaN compares false with everything and Infinity never ends, so either switches a check off. */
+const isFiniteOption = (value: number | undefined, accepts: (value: number) => boolean): boolean =>
+  value === undefined || (Number.isFinite(value) && accepts(value));
+
+/** An absolute `http(s)` URL that can be extended with a path: no credentials, query or fragment. */
+const isBaseUrl = (baseUrl: string): boolean => {
+  if (!URL.canParse(baseUrl) || /[?#]/.test(baseUrl)) return false;
+  const { protocol, username, password } = new URL(baseUrl);
+
+  return (protocol === "https:" || protocol === "http:") && username === "" && password === "";
+};
+
+const invalid = (option: string, requirement: string): RangeError =>
+  new RangeError(`GnapServerConfig.${option} must be ${requirement}`);
+
+/**
+ * Refuses a configuration that would switch a protection off (a body cap, the `wait` throttle, token and interaction
+ * expiry) or build wrong URLs, when the server is created rather than on the first request.
+ */
+const validateConfig = (config: GnapServerConfig): void => {
+  if (!isBaseUrl(config.baseUrl)) {
+    throw invalid("baseUrl", "an absolute http(s) URL without credentials, query or fragment");
+  }
+
+  if (!isFiniteOption(config.maxBodyBytes, (value) => value >= 0)) {
+    throw invalid("maxBodyBytes", "a finite number of at least 0");
+  }
+
+  if (!isFiniteOption(config.waitSeconds, (value) => value >= 0)) {
+    throw invalid("waitSeconds", "a finite number of at least 0");
+  }
+
+  if (!isFiniteOption(config.accessTokenExpiresInSeconds, (value) => value > 0)) {
+    throw invalid("accessTokenExpiresInSeconds", "a finite number above 0");
+  }
+
+  if (!isFiniteOption(config.interaction?.expiresInSeconds, (value) => value > 0)) {
+    throw invalid("interaction.expiresInSeconds", "a finite number above 0");
+  }
+
+  if (config.finishHashEncoding !== undefined && !["base64", "base64url"].includes(config.finishHashEncoding)) {
+    throw invalid("finishHashEncoding", '"base64" or "base64url"');
+  }
+};
+
+/** The configuration with defaults applied; throws a `RangeError` for one that {@link validateConfig} refuses. */
 export const createCore = (config: GnapServerConfig): Core => {
+  validateConfig(config);
   const baseUrl = config.baseUrl.replace(/\/+$/, "");
 
   return {
@@ -40,7 +87,14 @@ export const createCore = (config: GnapServerConfig): Core => {
     store: config.store,
     baseUrl,
     basePath: new URL(baseUrl).pathname.replace(/\/+$/, ""),
-    now: () => (config.clock ?? (() => new Date()))().getTime(),
+    now: () => {
+      const time = (config.clock ?? (() => new Date()))().getTime();
+
+      // An Invalid Date would make every expiry and `wait` comparison false, so nothing would expire: refuse the request.
+      if (!Number.isFinite(time)) throw new RangeError("GnapServerConfig.clock returned an Invalid Date");
+
+      return time;
+    },
     generateToken: config.generateToken ?? randomToken,
     // RFC 9635 §3.1: `wait` SHOULD NOT be less than five seconds.
     waitSeconds: Math.max(5, config.waitSeconds ?? 5),
@@ -64,7 +118,7 @@ export const relativePath = (core: Core, request: Request): string | null => {
  * The URL the client addressed, rebuilt from `baseUrl`: signature bases use what the server told the client, not
  * whatever proxy-rewritten URL reached the handler.
  */
-export const publicUrl = (core: Core, request: Request): string => {
+const publicUrl = (core: Core, request: Request): string => {
   const rest = relativePath(core, request);
 
   return rest === null ? request.url : `${core.baseUrl}${rest}${new URL(request.url).search}`;
@@ -219,7 +273,7 @@ export interface IssuedToken {
 }
 
 /** What a token carries: its access items and its `label` (`null`: none). */
-export interface TokenSpec {
+interface TokenSpec {
   readonly access: ReadonlyArray<AccessItem>;
   readonly label: string | null;
 }
