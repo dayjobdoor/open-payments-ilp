@@ -140,9 +140,9 @@
     "@interledger/stream-receiver": "^0.3.3-alpha.4",
     "@types/node": "^26.6.6",
     "@types/pg": "^8.23.1",
-    "better-auth": "^1.7.17",
+    "better-auth": "^1.7.18",
     "effect": "^4.1.2",
-    "hono": "^4.13.16",
+    "hono": "^4.13.17",
     "ilp-packet": "^3.1.4-alpha.2",
     "ilp-protocol-ildcp": "^2.2.4-alpha.2",
     "ilp-protocol-stream": "^2.7.2-alpha.3",
@@ -168,6 +168,7 @@
     }
   },
   "overrides": {
+    "uuid": "^11.1.1",
     "vite": "npm:@voidzero-dev/vite-plus-core@1.5.0"
   }
 }
