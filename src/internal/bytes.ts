@@ -7,6 +7,7 @@ const encoder = new TextEncoder();
 
 // `ignoreBOM: true` keeps a leading U+FEFF, so decoding then re-encoding is the identity.
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const lossyDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
 
 export function utf8Encode(text: string): Uint8Array<ArrayBuffer> {
   return encoder.encode(text);
@@ -15,6 +16,14 @@ export function utf8Encode(text: string): Uint8Array<ArrayBuffer> {
 /** Throws a `TypeError` on invalid UTF-8. */
 export function utf8Decode(bytes: Uint8Array): string {
   return decoder.decode(bytes);
+}
+
+/**
+ * Decodes UTF-8 without failing: malformed sequences become U+FFFD. For text a peer sends that is only displayed (an
+ * error message), never one that is compared or signed. `ignoreBOM: true` keeps a leading U+FEFF.
+ */
+export function utf8DecodeLossy(bytes: Uint8Array): string {
+  return lossyDecoder.decode(bytes);
 }
 
 export function concatBytes(...parts: ReadonlyArray<Uint8Array>): Uint8Array<ArrayBuffer> {

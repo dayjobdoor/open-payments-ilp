@@ -158,7 +158,8 @@ describe("importEd25519PublicJwk", () => {
 
   it("refuses the all-zero 'universal' signature that an identity public key would accept on Bun", async () => {
     const identity: JsonWebKey = { kty: "OKP", crv: "Ed25519", x: encodeBase64Url(hex(`01${"00".repeat(31)}`)) };
-    const created = Math.floor(Date.now() / 1000);
+    const now = new Date("2030-01-01T00:00:00Z");
+    const created = Math.floor(now.getTime() / 1000);
     const zeroSignature = encodeBase64(hex(`01${"00".repeat(63)}`));
 
     const request = new Request("https://rs.example.com/quotes", {
@@ -168,7 +169,9 @@ describe("importEd25519PublicJwk", () => {
       },
     });
 
-    const error = await run(Effect.flip(verifyRequest(request, { resolveKey: () => Effect.succeed(identity) })));
+    const error = await run(
+      Effect.flip(verifyRequest(request, { resolveKey: () => Effect.succeed(identity), clock: () => now })),
+    );
 
     expect(error.reason).toBe("malformed");
   });

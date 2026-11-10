@@ -47,13 +47,13 @@ export function decodeStreamReceipt(bytes: Uint8Array): Result<StreamReceipt, Il
 
 /**
  * Authenticates a STREAM receipt (RFC 39) against the receipt secret issued with the credentials and returns it decoded.
- * `secret` is either the 32-byte secret itself or, when secrets are per nonce, a function from the (still
- * unauthenticated) receipt to its secret, synchronous or returning a promise (a database lookup, say). The HMAC is
- * compared in constant time.
+ * `secret` is either the secret itself (32 bytes as `generateStreamCredentials` issues it; any non-empty length
+ * authenticates) or, when secrets are per nonce, a function from the (still unauthenticated) receipt to its secret,
+ * synchronous or returning a promise (a database lookup, say). The HMAC is compared in constant time.
  *
  * Fails with `StreamError`: `invalid-receipt` when `receipt` is not 58 bytes or has a version other than 1,
- * `invalid-key` for an empty secret or when the `secret` function throws or rejects (an unknown nonce),
- * `receipt-hmac-mismatch` when the HMAC does not match (forged or wrong secret).
+ * `invalid-key` for an empty secret, when the `secret` function throws or rejects, or when it answers with anything
+ * but bytes (an unknown nonce), `receipt-hmac-mismatch` when the HMAC does not match (forged or wrong secret).
  */
 export function verifyStreamReceipt(
   receipt: Uint8Array,
@@ -89,8 +89,9 @@ export function verifyStreamReceipt(
         });
 
   return Effect.flatMap(lookup, (key) => {
-    if (key.length === 0) {
-      return Effect.fail(new StreamError({ reason: "invalid-key", message: "receipt secret must not be empty" }));
+    // A lookup written without types may answer an unknown nonce with `undefined`.
+    if (!(key instanceof Uint8Array) || key.length === 0) {
+      return Effect.fail(new StreamError({ reason: "invalid-key", message: "receipt secret must be non-empty bytes" }));
     }
 
     return Effect.flatMap(

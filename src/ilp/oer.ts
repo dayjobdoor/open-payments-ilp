@@ -1,4 +1,5 @@
 import * as Result from "effect/Result";
+import { utf8Decode } from "../internal/bytes";
 import { codecFail, IlpCodecError } from "./errors";
 
 const MAX_UINT64 = (1n << 64n) - 1n;
@@ -42,13 +43,10 @@ export function asciiBytes(text: string, what: string): Uint8Array {
   return out;
 }
 
-// `ignoreBOM: true` keeps a leading U+FEFF, so decoding then re-encoding is the identity.
-const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-
 /** Decodes UTF-8 bytes; malformed input is a codec failure rather than a `TypeError`. */
 export function utf8String(bytes: Uint8Array, what: string): string {
   try {
-    return strictUtf8.decode(bytes);
+    return utf8Decode(bytes);
   } catch {
     return codecFail("invalid-field", `${what} is not valid UTF-8`);
   }

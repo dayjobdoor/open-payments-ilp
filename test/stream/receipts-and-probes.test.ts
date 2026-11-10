@@ -123,6 +123,18 @@ describe("STREAM receipts (RFC 39) interoperate with ilp-protocol-stream", () =>
       expect((await failure(verifyStreamReceipt(receipt, () => bytes(32))))?.reason).toBe("receipt-hmac-mismatch");
     });
 
+    it.each([
+      ["undefined", () => undefined],
+      ["null", async () => null],
+      ["a string", () => "secret"],
+    ])("that returns %s (an unknown nonce) fails as invalid-key, not as a defect", async (_what, lookup) => {
+      // SAFETY: simulates a lookup written without types, which answers an unknown nonce with no bytes.
+      const error = await failure(verifyStreamReceipt(receipt, lookup as never));
+
+      expect(error).toBeInstanceOf(StreamError);
+      expect(error).toMatchObject({ reason: "invalid-key" });
+    });
+
     it("is not called for a receipt that is malformed or of another version", async () => {
       let calls = 0;
 

@@ -164,6 +164,23 @@ describe("serveIldcp", () => {
     expect(isFulfill(serveIldcp({ requestPacket: request, serverAddress, response, now: NOW }))).toBe(true);
   });
 
+  it("fails closed with F00 when the clock is an Invalid Date, instead of skipping the expiry check", () => {
+    // Every comparison with a NaN `now` is false: an expired request must not pass because of it.
+    const request = Result.getOrThrow(serializeIldcpRequest({ expiresAt: LONG_PAST }));
+    const reply = serveIldcp({ requestPacket: request, serverAddress, response, now: new Date(Number.NaN) });
+
+    expect(isReject(reply) && reply.code).toBe(IlpErrorCode.F00_BAD_REQUEST);
+    expect(isReject(reply) && reply.triggeredBy).toBe(serverAddress);
+    expect(isReject(reply) && reply.message).toBe("IL-DCP server clock is not a valid date.");
+
+    // A request that has not expired is refused too: the server cannot tell.
+    const fresh = Result.getOrThrow(serializeIldcpRequest({ expiresAt: FAR_FUTURE }));
+
+    expect(isReject(serveIldcp({ requestPacket: fresh, serverAddress, response, now: new Date(Number.NaN) }))).toBe(
+      true,
+    );
+  });
+
   it.each([
     ["garbage", Uint8Array.of(1, 2, 3)],
     ["a Fulfill", Result.getOrThrow(serializeIldcpResponse(responses[0]!))],

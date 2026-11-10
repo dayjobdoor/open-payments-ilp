@@ -2,10 +2,7 @@ import type { Result } from "effect/Result";
 import { isValidIlpAddress } from "../ilp/address";
 import { codecFail, type IlpCodecError } from "../ilp/errors";
 import { asciiBytes, OerReader, OerWriter, readOer, writeOer } from "../ilp/oer";
-import { utf8Encode } from "../internal/bytes";
-
-// `ignoreBOM: true` keeps a leading U+FEFF so strings survive decode then encode.
-const lenientUtf8 = new TextDecoder("utf-8", { ignoreBOM: true });
+import { utf8DecodeLossy, utf8Encode } from "../internal/bytes";
 
 /** STREAM frame type bytes (RFC 29 §5.3; `StreamReceipt` 0x17 is RFC 39). */
 export const StreamFrameType = {
@@ -49,7 +46,10 @@ export interface ConnectionCloseFrame {
 /** The sender announces the ILP address it can be reached on. */
 export interface ConnectionNewAddressFrame {
   readonly type: "ConnectionNewAddress";
-  /** A valid ILP address, or `""` (no address; a request for the receiver's asset details). */
+  /**
+   * Encoding needs a valid ILP address, or `""` (no address; a request for the receiver's asset details). Decoding
+   * returns what the peer sent, unchecked, as `ilp-protocol-stream` does.
+   */
   readonly sourceAccount: string;
 }
 
@@ -140,7 +140,7 @@ export interface StreamDataBlockedFrame {
   readonly maxOffset: bigint;
 }
 
-/** A 58-byte STREAM receipt (RFC 39) for a stream. */
+/** A STREAM receipt (RFC 39) for a stream: 58 bytes, a length only `verifyStreamReceipt` checks. */
 export interface StreamReceiptFrame {
   readonly type: "StreamReceipt";
   readonly streamId: bigint;
@@ -184,19 +184,19 @@ export function readFrame(reader: OerReader): StreamFrame | undefined {
       return {
         type: "ConnectionClose",
         errorCode: contents.readUInt8(),
-        errorMessage: lenientUtf8.decode(contents.readVarOctetString()),
+        errorMessage: utf8DecodeLossy(contents.readVarOctetString()),
       };
 
     case StreamFrameType.ConnectionNewAddress:
       return {
         type: "ConnectionNewAddress",
-        sourceAccount: lenientUtf8.decode(contents.readVarOctetString()),
+        sourceAccount: utf8DecodeLossy(contents.readVarOctetString()),
       };
 
     case StreamFrameType.ConnectionAssetDetails:
       return {
         type: "ConnectionAssetDetails",
-        sourceAssetCode: lenientUtf8.decode(contents.readVarOctetString()),
+        sourceAssetCode: utf8DecodeLossy(contents.readVarOctetString()),
         sourceAssetScale: contents.readUInt8(),
       };
 
@@ -217,7 +217,7 @@ export function readFrame(reader: OerReader): StreamFrame | undefined {
         type: "StreamClose",
         streamId: contents.readVarUInt(),
         errorCode: contents.readUInt8(),
-        errorMessage: lenientUtf8.decode(contents.readVarOctetString()),
+        errorMessage: utf8DecodeLossy(contents.readVarOctetString()),
       };
 
     case StreamFrameType.StreamMoney:

@@ -121,7 +121,9 @@ export function deserializeIldcpResponse(bytes: Uint8Array): Result.Result<Ildcp
  * triggered by `serverAddress`, a valid one yields the Fulfill carrying `response`. A `response` that cannot be
  * encoded (an invalid address or an out-of-range scale: server misconfiguration) yields the same `F00` Reject.
  *
- * `now` is explicit; the request is expired when `now` is later than its `expiresAt`.
+ * `now` is explicit; the request is expired when `now` is later than its `expiresAt`. An Invalid Date `now` (server
+ * misconfiguration) cannot be compared with anything, so it yields the same `F00` Reject instead of switching the
+ * expiry check off.
  */
 export function serveIldcp(options: {
   readonly requestPacket: Uint8Array;
@@ -140,7 +142,11 @@ export function serveIldcp(options: {
 
   if (Result.isFailure(request)) return reject(request.failure.message);
 
-  if (options.now.getTime() > request.success.expiresAt.getTime()) return reject("IL-DCP request packet is expired.");
+  const now = options.now.getTime();
+
+  if (Number.isNaN(now)) return reject("IL-DCP server clock is not a valid date.");
+
+  if (now > request.success.expiresAt.getTime()) return reject("IL-DCP request packet is expired.");
   const data = encodeResponseData(options.response);
 
   if (Result.isFailure(data)) return reject(data.failure.message);

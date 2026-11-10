@@ -24,7 +24,7 @@ export type IlpHttpErrorReason =
    * (redirects are not followed; no `status`).
    */
   | "network"
-  /** `timeoutMs` or `maxReplyBytes` is not usable (NaN, infinite, out of range); nothing was sent. */
+  /** `timeoutMs`, `maxReplyBytes` or `token` is not usable (NaN, infinite, out of range, control characters); nothing was sent. */
   | "invalid-option";
 
 interface IlpHttpErrorFields {
@@ -55,7 +55,11 @@ const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 export interface PostPrepareOptions {
   /** The peer's ILP-over-HTTP endpoint. */
   readonly url: string;
-  /** Sent as `Authorization: Bearer <token>`; omitted when not given. */
+  /**
+   * Sent as `Authorization: Bearer <token>`; omitted when not given. Printable ASCII or Latin-1 only (no control
+   * characters, so it can be a header value), else the call fails with `invalid-option`. A secret: no error message
+   * quotes it.
+   */
   readonly token?: string;
   /** Defaults to the global `fetch`. */
   readonly fetch?: typeof fetch;
@@ -70,14 +74,20 @@ export interface PostPrepareOptions {
 
 const isTimeout = (cause: unknown): boolean => cause instanceof DOMException && cause.name === "TimeoutError";
 
+/**
+ * A field value of RFC 9110 (visible ASCII, space, obs-text). Checked here because `fetch` rejects anything else with
+ * a `TypeError` that, on some runtimes, quotes the whole value, and the token is a credential.
+ */
+const isHeaderValue = (value: string): boolean => !/[^\x20-\x7e\x80-\xff]/.test(value);
+
 const invalidOption = (message: string): Effect.Effect<never, IlpHttpError> =>
   Effect.fail(new IlpHttpError({ reason: "invalid-option", message }));
 
 /**
  * Sends the serialized `prepare` to `options.url` and resolves with the reply bytes (a Fulfill or a Reject).
  * Fails with {@link IlpHttpError} on a 4xx/5xx status, a redirect, an oversized reply, a timeout, a network error
- * or an unusable `timeoutMs`/`maxReplyBytes`. The timeout timer is cleared when the exchange ends, and interrupting
- * the effect aborts the request.
+ * or an unusable `timeoutMs`/`maxReplyBytes`/`token`. The timeout timer is cleared when the exchange ends, and
+ * interrupting the effect aborts the request.
  */
 export function postPrepare(
   prepare: Uint8Array<ArrayBuffer> | ArrayBuffer,
@@ -92,6 +102,10 @@ export function postPrepare(
 
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > MAX_TIMEOUT_MS) {
     return invalidOption(`timeoutMs must be between 0 and ${MAX_TIMEOUT_MS}, got ${timeoutMs}`);
+  }
+
+  if (token !== undefined && !isHeaderValue(token)) {
+    return invalidOption("token must be printable ASCII or Latin-1 without control characters");
   }
 
   if (!Number.isFinite(maxReplyBytes) || maxReplyBytes <= 0) {

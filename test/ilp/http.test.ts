@@ -13,7 +13,7 @@ const url = "https://peer.example/ilp";
 /** The failure of `postPrepare`, or fails the test when it succeeded. */
 const failure = async (
   fetch: typeof globalThis.fetch,
-  options: { timeoutMs?: number; maxReplyBytes?: number } = {},
+  options: { timeoutMs?: number; maxReplyBytes?: number; token?: string } = {},
 ) => {
   const exit = await Effect.runPromiseExit(postPrepare(prepare, { url, fetch, ...options }));
 
@@ -195,6 +195,39 @@ describe("postPrepare options", () => {
 
     expect(error).toMatchObject({ reason: "invalid-option" });
     expect(error.message).toContain("maxReplyBytes");
+  });
+
+  it.each([
+    ["a line break", "secret\nvalue"],
+    ["a NUL", "secret\0value"],
+    ["a tab", "secret\tvalue"],
+    ["DEL", "secret\x7fvalue"],
+    ["a character above Latin-1", "secret€value"],
+  ])("refuses a token with %s as invalid-option, sends nothing and never quotes it", async (_name, token) => {
+    const error = await failure(never, { token });
+
+    expect(error).toMatchObject({ reason: "invalid-option" });
+    expect(error.message).toContain("token");
+    expect(error.message).not.toContain("secret");
+    expect(error.cause).toBeUndefined();
+  });
+
+  it("sends a token made of visible ASCII and Latin-1 characters", async () => {
+    const sent: HeadersInit[] = [];
+
+    await Effect.runPromise(
+      postPrepare(prepare, {
+        url,
+        token: "aZ09 !~\u00e9\u00ff",
+        fetch: async (_input, init) => {
+          sent.push(init?.headers ?? {});
+
+          return new Response(new Uint8Array([1]));
+        },
+      }),
+    );
+
+    expect(sent).toEqual([{ "Content-Type": "application/octet-stream", Authorization: "Bearer aZ09 !~\u00e9\u00ff" }]);
   });
 
   it("still enforces a numeric maxReplyBytes cap (NaN used to remove it)", async () => {

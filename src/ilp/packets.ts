@@ -3,7 +3,7 @@ import { isValidIlpAddress } from "./address";
 import { IlpPacketType } from "./codes";
 import { codecFail, type IlpCodecError } from "./errors";
 import { asciiBytes, asciiString, type OerReader, readOer, writeOer } from "./oer";
-import { utf8Encode } from "../internal/bytes";
+import { utf8DecodeLossy, utf8Encode } from "../internal/bytes";
 
 /** Maximum `data` length of any ILP packet (RFC 27). */
 export const MAX_ILP_DATA_LENGTH = 32767;
@@ -53,9 +53,6 @@ export type IlpPacket =
   | { readonly type: typeof IlpPacketType.Reject; readonly data: IlpReject };
 
 const CONDITION_LENGTH = 32;
-
-// `ignoreBOM: true` keeps a leading U+FEFF so the message survives decode then encode.
-const lenientUtf8 = new TextDecoder("utf-8", { ignoreBOM: true });
 
 /** Type guard: `reply` is a Fulfill. */
 export function isFulfill(reply: IlpReply): reply is IlpFulfill {
@@ -255,7 +252,7 @@ function readReject(reader: OerReader): IlpReject {
     codecFail("invalid-address", "triggeredBy is not a valid ILP address");
   }
 
-  const message = lenientUtf8.decode(body.readVarOctetString());
+  const message = utf8DecodeLossy(body.readVarOctetString());
 
   return { code: asciiString(codeBytes, "code"), triggeredBy, message, data: readData(body) };
 }

@@ -36,7 +36,7 @@ export {
   type StreamMoneyFrame,
   type StreamReceiptFrame,
 } from "../stream/frames";
-export { type StreamPacket } from "../stream/packet";
+export { type DecryptStreamPacketOptions, type ExpectedStreamPacket, type StreamPacket } from "../stream/packet";
 export { type StreamReceipt } from "../stream/receipt";
 export { planStreamChunks, type BuildStreamPrepareOptions, type StreamChunk } from "../stream/sender";
 
