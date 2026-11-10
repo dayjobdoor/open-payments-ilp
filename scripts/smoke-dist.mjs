@@ -5,9 +5,11 @@
 //    Node process: entries without optional peers must load and expose their named exports; `/better-auth`, `/hono`
 //    and `/plain/better-auth` must fail with nothing but a clean "Cannot find package" for their own peer. Then one
 //    real call per plain entry runs against the packed code, so a wrapper wired to the wrong function fails here.
-// 2. With the peers present, type-checks a consumer file against the built declarations (the `declare module "hono"`
-//    augmentation must survive declaration bundling, and one typed call per plain entry must resolve to a plain
-//    value, not a Result, an Effect or `never`). Any tsc error line outside the peers' own declarations fails.
+// 2. With the peers present, imports `/better-auth`, `/hono` and `/plain/better-auth` for real (they must load and
+//    expose their named exports), then type-checks a consumer file against the built declarations (the
+//    `declare module "hono"` augmentation must survive declaration bundling, and one typed call per plain entry must
+//    resolve to a plain value, not a Result, an Effect or `never`). Any tsc error line outside the peers' own
+//    declarations fails.
 import { execFileSync } from "node:child_process";
 import {
   cpSync,
@@ -237,9 +239,37 @@ try {
     );
   }
 
-  // 2. Types: a consumer with the optional peers present, against the built declarations.
+  // 2. With the optional peers present: the entries that need them load from the packed code and expose their names.
   const typed = project("typed", ["effect", "hono", "better-auth"]);
+  const peerEntries = entries.filter((entry) => expected[entry].peer !== undefined);
 
+  const peerProbe = `
+    const result = {};
+    for (const entry of ${JSON.stringify(peerEntries)}) {
+      try {
+        result[entry] = { names: Object.keys(await import("open-payments-ilp" + entry.slice(1))) };
+      } catch (error) {
+        result[entry] = { message: String(error.stack ?? error.message).split("\\n").slice(0, 3).join(" | ") };
+      }
+    }
+    console.log(JSON.stringify(result));
+  `;
+
+  const withPeers = JSON.parse(
+    execFileSync(process.execPath, ["--input-type=module", "-e", peerProbe], { cwd: typed, encoding: "utf8" }),
+  );
+
+  for (const entry of peerEntries) {
+    const { names, peer } = expected[entry];
+    const got = withPeers[entry];
+    const missing = got.names === undefined ? names : names.filter((name) => !got.names.includes(name));
+
+    if (missing.length > 0)
+      failures.push(`${entry}: with ${peer} installed, ${got.message ?? `missing exports ${missing.join(", ")}`}`);
+    else console.log(`ok   ${entry}: loads with ${peer} installed (${got.names.length} exports)`);
+  }
+
+  // 3. Types: a consumer with the optional peers present, against the built declarations.
   writeFileSync(
     join(typed, "consumer.ts"),
     [

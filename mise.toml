@@ -16,6 +16,10 @@ run = [
 ]
 
 [tasks.dryrun]
-description = "What `npm publish` would upload (no login, no upload)"
-depends = ["check"]
-run = "npm publish --dry-run"
+description = "What `npm publish` would upload (no login, no upload); the `prepublishOnly` script runs the checks first"
+# npm refuses a prerelease version without `--tag`; the name is irrelevant for a dry run.
+run = "npm publish --dry-run --tag dryrun"
+
+[tasks.generated]
+description = "Fail when src/open-payments/generated/ is stale relative to openapi/ (needs network: bunx fetches TypeScript 5)"
+run = "bun scripts/generate-types.ts --check"

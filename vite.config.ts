@@ -55,6 +55,8 @@ export default defineConfig({
   },
   lint: {
     ignorePatterns: ["dist/**", "src/open-payments/generated/**"],
+    // scripts/check-casts.mjs finds assertions by their `as`; an angle-bracket assertion (`<T>x`) would slip past it.
+    rules: { "typescript/consistent-type-assertions": ["error", { assertionStyle: "as" }] },
   },
   test: {
     include: ["test/**/*.test.ts"],

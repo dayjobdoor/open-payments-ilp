@@ -3,3 +3,5 @@ dist/
 *.tsbuildinfo
 !bun.lock
 .vitest/
+coverage/
+*.tgz

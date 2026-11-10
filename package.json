@@ -129,8 +129,8 @@
   "scripts": {
     "build": "vp pack",
     "generate:types": "bun scripts/generate-types.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "prepublishOnly": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json && vp test run && vp pack"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "prepublishOnly": "vp fmt --check && vp lint --deny-warnings && node scripts/check-casts.mjs && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json && vp test run && vp pack && node scripts/smoke-dist.mjs"
   },
   "devDependencies": {
     "@arethetypeswrong/core": "^0.18.5",
