@@ -3,7 +3,7 @@ import {
   betterAuthGnapStore as effectBetterAuthGnapStore,
   type GnapDb,
 } from "../better-auth/index";
-import type { GnapPlugin } from "../better-auth/index";
+import type { GnapPlugin, GnapRateLimit } from "../better-auth/index";
 import { toEffectOptions, toPromiseStore } from "../internal/plain-gnap";
 import type { GnapServerOptions, GnapStore } from "./gnap-server";
 
@@ -20,14 +20,20 @@ export {
   type GnapEndpoints,
   type GnapIntrospectEndpoint,
   type GnapPlugin,
+  type GnapRateLimit,
+  type GnapRateLimitRule,
   type IntrospectionInput,
 } from "../better-auth/index";
 export type { GnapRouteError, InteractionDetails } from "../gnap/server/index";
 
-export type GnapOptions = GnapServerOptions;
+/** The plain server options plus the plugin's `rateLimit` (see `open-payments-ilp/better-auth`). */
+export type GnapOptions = GnapServerOptions & { readonly rateLimit?: GnapRateLimit | false };
 
 /** The Better Auth plugin serving the GNAP authorisation server under `{baseURL}/gnap`. */
-export const gnap = (options: GnapOptions = {}): GnapPlugin => effectGnap(toEffectOptions(options));
+export const gnap = (options: GnapOptions = {}): GnapPlugin => {
+  const { rateLimit, ...serverOptions } = options;
+  return effectGnap({ ...toEffectOptions(serverOptions), ...(rateLimit === undefined ? {} : { rateLimit }) });
+};
 
 /** A {@link GnapStore} on Better Auth's database adapter. */
 export const betterAuthGnapStore = (db: GnapDb): GnapStore => toPromiseStore(effectBetterAuthGnapStore(db));

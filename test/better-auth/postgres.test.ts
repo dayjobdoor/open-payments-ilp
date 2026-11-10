@@ -105,7 +105,8 @@ if (url === undefined) {
       });
       await seedApprovedGrant(store, "owner");
 
-      await context.internalAdapter.deleteUser("owner");
+      // The raw adapter skips the plugin's `user.delete.before` hook: only the foreign key can take the grants along.
+      await context.adapter.delete({ model: "user", where: [{ field: "id", value: "owner" }] });
 
       expect(await Effect.runPromise(store.findTokenWithGrant("valueHash", "v1"))).toBeNull();
     });

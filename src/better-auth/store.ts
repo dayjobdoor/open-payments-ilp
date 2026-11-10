@@ -136,43 +136,76 @@ export const betterAuthGnapStore = (db: GnapDb): GnapStore => {
   };
 };
 
-/** Housekeeping at most once a minute per process: claims whose `expiresAt` passed can never block anything again. */
+/**
+ * Housekeeping at most once a minute per database: claims whose `expiresAt` passed can never block anything again. The
+ * marker belongs to the adapter object, not to the process: a process that serves several Better Auth instances (a
+ * database per tenant) must clean each of them, however much busier one is than the others.
+ */
 const SWEEP_EVERY_MS = 60_000;
 
-let lastSweepAt = 0;
+const lastSweepAt = new WeakMap<GnapDb, number>();
 
 const sweepExpiredNonces = async (db: GnapDb, now: number): Promise<void> => {
-  if (now >= lastSweepAt && now - lastSweepAt < SWEEP_EVERY_MS) return;
-  lastSweepAt = now;
+  const last = lastSweepAt.get(db);
 
-  // Best effort: a failed cleanup must not turn a claim that succeeded into an error.
-  await Promise.resolve(
-    db.deleteMany?.({ model: "gnapNonce", where: [{ field: "expiresAt", value: new Date(now), operator: "lt" }] }),
-  ).catch(() => 0);
+  // A clock that went backwards sweeps again: the marker is no longer a time to measure from.
+  if (last !== undefined && now >= last && now - last < SWEEP_EVERY_MS) return;
+  lastSweepAt.set(db, now);
+
+  // Best effort: a failed cleanup, a throw before a promise exists included, must not turn a claim that succeeded into
+  // an error.
+  try {
+    await db.deleteMany?.({
+      model: "gnapNonce",
+      where: [{ field: "expiresAt", value: new Date(now), operator: "lt" }],
+    });
+  } catch {
+    // The next claim a minute on tries again.
+  }
 };
+
+/** Grants read per round trip: without a `limit`, Better Auth's `findMany` returns at most 100 rows. */
+const GRANTS_PER_PAGE = 100;
 
 /**
  * Revokes every grant `userId` approved and their live tokens, in statements that need no foreign key: the deletion of
  * a user must end what the user authorised on adapters that do not cascade (the memory adapter, MongoDB).
+ *
+ * A grant goes to `REVOKED` first, with `version + 1`: the server treats the tokens of a revoked grant as inactive, and
+ * an `updateGrant` that read the grant before loses the version guard instead of writing its state over `REVOKED`.
+ * The tokens' own `revokedAt` follows.
  */
 export const revokeUserGrants = async (
-  db: Pick<DBTransactionAdapter, "findMany" | "updateMany">,
+  db: Pick<DBTransactionAdapter, "findMany" | "incrementOne" | "updateMany">,
   userId: string,
   now: number,
 ): Promise<void> => {
-  const grants = await db.findMany<{ id: string }>({ model: "gnapGrant", where: [equals("userId", userId)] });
+  const at = new Date(now);
 
-  for (const { id } of grants) {
-    await db.updateMany({
-      model: "gnapAccessToken",
-      where: [equals("grantId", id), equals("revokedAt", null)],
-      update: { revokedAt: new Date(now) },
+  for (let offset = 0; ; offset += GRANTS_PER_PAGE) {
+    // Ordered by `id`, and `userId` is not what the loop changes: the pages do not shift under the offset.
+    const page = await db.findMany<{ id: string }>({
+      model: "gnapGrant",
+      where: [equals("userId", userId)],
+      sortBy: { field: "id", direction: "asc" },
+      limit: GRANTS_PER_PAGE,
+      offset,
     });
-  }
 
-  await db.updateMany({
-    model: "gnapGrant",
-    where: [equals("userId", userId)],
-    update: { state: "REVOKED", updatedAt: new Date(now) },
-  });
+    for (const { id } of page) {
+      await db.incrementOne({
+        model: "gnapGrant",
+        where: [equals("id", id)],
+        increment: { version: 1 },
+        set: { state: "REVOKED", updatedAt: at },
+      });
+      await db.updateMany({
+        model: "gnapAccessToken",
+        where: [equals("grantId", id), equals("revokedAt", null)],
+        update: { revokedAt: at },
+      });
+    }
+
+    if (page.length < GRANTS_PER_PAGE) return;
+  }
 };

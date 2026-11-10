@@ -71,4 +71,13 @@ describe("plain better-auth plugin", () => {
     expect(lookups).toEqual([WALLET]);
     expect(await response.json()).toHaveProperty("access_token.value");
   });
+
+  it("accepts the plugin's rateLimit option", () => {
+    expect(gnap({ rateLimit: false }).rateLimit).toEqual([]);
+    expect(gnap({ rateLimit: { grantRequest: { window: 10, max: 2 } } }).rateLimit?.[0]).toMatchObject({
+      window: 10,
+      max: 2,
+    });
+    expect(gnap().rateLimit).toHaveLength(2);
+  });
 });
