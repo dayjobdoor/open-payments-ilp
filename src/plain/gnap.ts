@@ -60,9 +60,9 @@ export {
   isPendingGrant,
 } from "../open-payments/types";
 
-/** Parses a grant request's `client` field; throws `GnapClientFieldError` when it is not a wallet address or a key reference. */
+/** Parses a grant request's `client` field; throws `GnapClientFieldError` unless it is a wallet address string, `{ walletAddress }` or `{ jwk }` alone. */
 export const parseClientField: Sync<typeof clientField.parseClientField> = sync(clientField.parseClientField);
-/** The client identity of a grant request; throws `GnapClientFieldError` when its `client` field is invalid. */
+/** The client identity of a persisted grant (its inline JWK, else its wallet address); throws `GnapClientFieldError` (`client-missing-identity`) when it has neither. */
 export const getGrantClientIdentity: Sync<typeof clientField.getGrantClientIdentity> = sync(
   clientField.getGrantClientIdentity,
 );

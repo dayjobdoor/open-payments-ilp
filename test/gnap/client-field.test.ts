@@ -58,6 +58,20 @@ describe("parseClientField", () => {
     expect(error).toBeInstanceOf(GnapClientFieldError);
     expect(error).toMatchObject({ _tag: "GnapClientFieldError", reason, message: "Invalid client field" });
   });
+
+  // auth-server.yaml: the two objects are mutually exclusive and `additionalProperties: false`. A member that is
+  // dropped on the way would let a client believe a `jwk` or a typo was honoured.
+  it.each([
+    ["both members", { walletAddress: WALLET, jwk: JWK }],
+    ["an unknown member next to walletAddress", { walletAddress: WALLET, walletAdress: WALLET }],
+    ["an unknown member next to jwk", { jwk: JWK, label: "x" }],
+    ["a null jwk next to walletAddress", { walletAddress: WALLET, jwk: null }],
+  ])("rejects %s as client-invalid-shape", (_name, input) => {
+    expect(failure(parseClientField(input))).toMatchObject({
+      _tag: "GnapClientFieldError",
+      reason: "client-invalid-shape",
+    });
+  });
 });
 
 describe("getGrantClientIdentity", () => {

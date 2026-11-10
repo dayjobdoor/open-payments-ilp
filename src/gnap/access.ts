@@ -72,11 +72,19 @@ function durationMs(parts: AccessIntervalParts): number | null {
   return Number.isSafeInteger(Math.trunc(milliseconds)) && milliseconds > 0 ? milliseconds : null;
 }
 
+/**
+ * `date` moved by `parts`: whole years and months on the UTC calendar (the day clamped to the month's length), the rest
+ * as elapsed time. A fractional year or month is elapsed time as well (365 and 30 days, as in {@link durationMs}; whether luxon, which
+ * Rafiki uses, agrees is unverified), so `P1.5M` is one calendar month and 15 days. It is never dropped: the window it makes must agree
+ * with the length {@link parseAccessIntervalMs} reports.
+ */
 function addAccessInterval(date: Date, parts: AccessIntervalParts): Date {
   const next = new Date(date);
-  const monthDelta = parts.years * 12 + parts.months;
+  const wholeYears = Math.trunc(parts.years);
+  const wholeMonths = Math.trunc(parts.months);
+  const monthDelta = wholeYears * 12 + wholeMonths;
 
-  if (Number.isInteger(monthDelta) && monthDelta !== 0) {
+  if (monthDelta !== 0) {
     const day = next.getUTCDate();
 
     next.setUTCDate(1);
@@ -88,6 +96,8 @@ function addAccessInterval(date: Date, parts: AccessIntervalParts): Date {
 
   next.setTime(
     next.getTime() +
+      (parts.years - wholeYears) * 365 * DAY +
+      (parts.months - wholeMonths) * 30 * DAY +
       parts.weeks * WEEK +
       parts.days * DAY +
       parts.hours * HOUR +
@@ -96,6 +106,11 @@ function addAccessInterval(date: Date, parts: AccessIntervalParts): Date {
   );
 
   return next;
+}
+
+/** Whether `parts` always span the same time: no whole year or month, whose lengths differ. */
+function isFixedLength(parts: AccessIntervalParts): boolean {
+  return Math.trunc(parts.years) === 0 && Math.trunc(parts.months) === 0;
 }
 
 /** `ms` moved by `parts` on the UTC calendar, forward or backward. */
@@ -126,11 +141,25 @@ interface RepeatingInterval {
   readonly forward: boolean;
 }
 
-const INSTANT = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?)?$/;
+const INSTANT = /^(\d{4})-(\d{2})-(\d{2})(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?)?$/;
 
-/** An ISO 8601 date or date-time; without an offset it is UTC (as Rafiki's `Settings.defaultZone`). */
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+
+  return month === 4 || month === 6 || month === 9 || month === 11 ? 30 : 31;
+}
+
+/**
+ * An ISO 8601 date or date-time; without an offset it is UTC (as Rafiki's `Settings.defaultZone`). A day that the month
+ * does not have (`2026-02-30`) is not an instant: `Date.parse` would roll it over to the next month.
+ */
 function parseInstant(text: string): number | null {
-  if (!INSTANT.test(text)) return null;
+  const match = INSTANT.exec(text);
+
+  if (match === null) return null;
+  const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
+
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) return null;
   const time = Date.parse(text.includes("T") && !/(Z|[+-]\d{2}:\d{2})$/.test(text) ? `${text}Z` : text);
 
   return Number.isNaN(time) ? null : time;
@@ -178,7 +207,7 @@ function repeatingWindowStart(interval: RepeatingInterval, now: number): Date | 
 
   // Before the first window of a forward series, after the first of a backward one: no window ever contains `now`.
   if (forward ? start > now : end <= now) return null;
-  const fixedMs = step === null ? end - start : step.years === 0 && step.months === 0 ? durationMs(step) : null;
+  const fixedMs = step === null ? end - start : isFixedLength(step) ? durationMs(step) : null;
 
   if (fixedMs !== null) {
     // Equal-length windows: jump to the right one instead of walking.
@@ -237,6 +266,9 @@ export function parseAccessIntervalMs(value: string): number | null {
  * @see https://openpayments.dev/guides/outgoing-grant-future-payments/
  */
 export function currentAccessIntervalStart(anchor: Date, interval: string, now: Date = new Date()): Date | null {
+  // An invalid `now` is no window at all; comparisons with NaN would otherwise yield an invalid `Date` that no limit check can use.
+  if (!Number.isFinite(now.getTime())) return null;
+
   if (interval.startsWith("R")) {
     const repeating = parseRepeating(interval);
 
@@ -248,7 +280,7 @@ export function currentAccessIntervalStart(anchor: Date, interval: string, now: 
 
   if (!parts || !duration || !Number.isFinite(anchor.getTime()) || anchor.getTime() > now.getTime()) return null;
 
-  if (parts.years === 0 && parts.months === 0) {
+  if (isFixedLength(parts)) {
     const cycles = Math.floor((now.getTime() - anchor.getTime()) / duration);
 
     return new Date(anchor.getTime() + cycles * duration);
@@ -278,10 +310,12 @@ function withinCap(cap: Amount | undefined, amount: Amount): boolean {
 
 /**
  * Whether an outgoing payment's amounts fit the `debitAmount` / `receiveAmount` limits of the matched access
- * items. An item without the relevant limit does not constrain; with no limits at all the payment is allowed, but
- * with no matched item nothing authorizes it. A limit in another asset code or scale cannot be compared and rejects
- * the payment, as does a malformed value. A payment without a `receive` amount is rejected when an item limits
- * `receiveAmount`: the limit cannot be checked, so it is not treated as met.
+ * items. Every matched item has to be satisfied (the strictest wins), where {@link validateOutgoingPaymentReceiver}
+ * needs only one; with the usual single matched item the two agree. An item without the relevant limit does not
+ * constrain; with no limits at all the payment is allowed, but with no matched item nothing authorizes it. A limit in
+ * another asset code or scale cannot be compared and rejects the payment, as does a malformed value. A payment without
+ * a `receive` amount is rejected when an item limits `receiveAmount`: the limit cannot be checked, so it is not
+ * treated as met.
  */
 export function validateOutgoingPaymentAmounts(
   matchedAccess: AccessMatchItem[],
@@ -334,7 +368,7 @@ const ENCODED_PATH_CHARACTER = /%(?:2e|2f|5c)/i;
  * without encoded `.`, `/` or `\`). `fetch` resolves URLs after WHATWG normalisation, so a receiver that is not
  * already in canonical form (dot segments, `%2e%2e`, credentials, fragments, upper-case host, …) could resolve to
  * another resource while passing a string comparison; such receivers are rejected. An item without a receiver limit
- * allows any receiver.
+ * allows any receiver; one whose limit is not a usable URL (an empty string included) allows none.
  */
 export function validateOutgoingPaymentReceiver(matchedAccess: AccessMatchItem[], receiverUrl: string): boolean {
   if (matchedAccess.length === 0) return false;
@@ -343,7 +377,7 @@ export function validateOutgoingPaymentReceiver(matchedAccess: AccessMatchItem[]
   for (const access of matchedAccess) {
     const limit = access.limits?.receiver;
 
-    if (!limit) return true;
+    if (limit === undefined) return true;
 
     if (receiver === null || receiver !== receiverUrl) continue;
     const allowed = canonicalUrl(limit);

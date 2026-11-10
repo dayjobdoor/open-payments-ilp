@@ -16,7 +16,11 @@ export type GrantContinue = ASComponents["schemas"]["continue"];
 /** GNAP access token as issued by the Open Payments authorisation server. */
 export type GrantAccessToken = ASComponents["schemas"]["access_token"] & { readonly label?: string };
 
-/** Error response of the Open Payments authorisation server API. */
+/**
+ * Error response of the Open Payments authorisation server API (`auth-server.yaml`). The server of `/gnap/server` also
+ * answers other registry codes (`invalid_interaction`, `unknown_interaction`, `user_denied`, `invalid_flag`, ...,
+ * see `GnapErrorCode`), so a client must not treat this union as exhaustive.
+ */
 export type AuthServerError =
   | ASComponents["schemas"]["error-invalid-client"]
   | ASComponents["schemas"]["error-invalid-request"]

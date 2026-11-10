@@ -14,7 +14,9 @@ const rawClient = Schema.Union([
   Schema.Struct({ jwk: schemas.jwk }),
 ]);
 
-const decodeRawClient = Schema.decodeUnknownResult(rawClient);
+// `additionalProperties: false` and "mutually exclusive" in auth-server.yaml: `{ walletAddress, jwk }` or a misspelt
+// member is a malformed field, not one whose extra member is silently dropped (the server does the same for access items).
+const decodeRawClient = Schema.decodeUnknownResult(rawClient, { onExcessProperty: "error" });
 
 const decodeJwk = Schema.decodeUnknownResult(schemas.jwk);
 
@@ -35,7 +37,8 @@ function rawClientReason<Input>(input: Input): GnapClientFieldErrorReason {
 
 /**
  * Parses the `client` field of a GNAP grant request: a wallet address string, `{ walletAddress }`, or `{ jwk }`.
- * Fails with {@link GnapClientFieldError} (`client-missing`, `client-invalid-type`, `client-invalid-shape`).
+ * The two objects are exclusive and take no other member (as in auth-server.yaml); a JWK keeps its own additional
+ * members. Fails with {@link GnapClientFieldError} (`client-missing`, `client-invalid-type`, `client-invalid-shape`).
  *
  * @see https://openpayments.dev/apis/auth-server/operations/post-request/
  */

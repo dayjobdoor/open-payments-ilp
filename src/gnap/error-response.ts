@@ -19,7 +19,10 @@ export type GnapErrorCode =
   | "invalid_resource_server"
   | "invalid_access";
 
-/** Error body of auth-server.yaml: `{ error: { code, description } }`. */
+/**
+ * Error body of auth-server.yaml: `{ error: { code, description } }`. RFC 9635 §3.6 also allows `{ error: "code" }`
+ * and an omitted `description`; this is the shape a server built here sends, not what a client may receive from another one.
+ */
 export interface GnapErrorResponse {
   readonly error: { readonly code: string; readonly description: string };
 }

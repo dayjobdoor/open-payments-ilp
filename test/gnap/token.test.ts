@@ -26,3 +26,28 @@ describe("hashToken", () => {
     }
   });
 });
+
+describe("extractGnapToken on malformed headers", () => {
+  // RFC 9110 §11.4: `auth-scheme 1*SP token68`: one credential, separated by spaces only.
+  it.each([
+    ["a second token", "GNAP abc def"],
+    ["a list of credentials", "GNAP abc, GNAP def"],
+    ["another scheme first", "Bearer abc GNAP def"],
+    ["a tab as separator", "GNAP\tabc"],
+    ["no separator", "GNAPabc"],
+    ["a scheme that only starts with GNAP", "GNAPX abc"],
+    ["leading whitespace", " GNAP abc"],
+  ])("returns null for %s", (_name, header) => {
+    expect(extractGnapToken(header)).toBeNull();
+  });
+
+  it("keeps the punctuation of the token as it is", () => {
+    expect(extractGnapToken("GNAP a-b_c.d~e+f/g=")).toBe("a-b_c.d~e+f/g=");
+  });
+});
+
+describe("formatGnapAuthorization", () => {
+  it("is the GNAP scheme, one space, the token", () => {
+    expect(formatGnapAuthorization("8N6BW7OZB8CDFONP219RP1LT0OS9M2PU")).toBe("GNAP 8N6BW7OZB8CDFONP219RP1LT0OS9M2PU");
+  });
+});
